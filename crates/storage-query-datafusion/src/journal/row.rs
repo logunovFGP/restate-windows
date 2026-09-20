@@ -80,49 +80,45 @@ pub(crate) fn append_journal_row(
                 }
                 EnrichedEntryHeader::GetPromise { .. }
                 | EnrichedEntryHeader::PeekPromise { .. }
-                | EnrichedEntryHeader::CompletePromise { .. } => {
-                    if row.is_promise_name_defined() {
-                        match entry.deserialize_entry_ref::<ProtobufRawEntryCodec>() {
-                            Ok(Entry::GetPromise(GetPromiseEntry { key, .. }))
-                            | Ok(Entry::PeekPromise(PeekPromiseEntry { key, .. }))
-                            | Ok(Entry::CompletePromise(CompletePromiseEntry { key, .. })) => {
-                                row.promise_name(key)
-                            }
-                            Ok(_) => log_data_corruption_error!(
-                                "sys_journal",
-                                &journal_entry_id.invocation_id(),
-                                "promise_name",
-                                "The entry should be a GetPromise, PeekPromise or CompletePromise entry"
-                            ),
-                            Err(e) => log_data_corruption_error!(
-                                "sys_journal",
-                                &journal_entry_id.invocation_id(),
-                                "promise_name",
-                                e
-                            ),
-                        };
-                    }
+                | EnrichedEntryHeader::CompletePromise { .. }
+                    if row.is_promise_name_defined() =>
+                {
+                    match entry.deserialize_entry_ref::<ProtobufRawEntryCodec>() {
+                        Ok(Entry::GetPromise(GetPromiseEntry { key, .. }))
+                        | Ok(Entry::PeekPromise(PeekPromiseEntry { key, .. }))
+                        | Ok(Entry::CompletePromise(CompletePromiseEntry { key, .. })) => {
+                            row.promise_name(key)
+                        }
+                        Ok(_) => log_data_corruption_error!(
+                            "sys_journal",
+                            &journal_entry_id.invocation_id(),
+                            "promise_name",
+                            "The entry should be a GetPromise, PeekPromise or CompletePromise entry"
+                        ),
+                        Err(e) => log_data_corruption_error!(
+                            "sys_journal",
+                            &journal_entry_id.invocation_id(),
+                            "promise_name",
+                            e
+                        ),
+                    };
                 }
-                EnrichedEntryHeader::Sleep { .. } => {
-                    if row.is_sleep_wakeup_at_defined() {
-                        match entry.deserialize_entry_ref::<ProtobufRawEntryCodec>() {
-                            Ok(Entry::Sleep(entry)) => {
-                                row.sleep_wakeup_at(entry.wake_up_time as i64)
-                            }
-                            Ok(_) => log_data_corruption_error!(
-                                "sys_journal",
-                                &journal_entry_id.invocation_id(),
-                                "sleep_wakeup",
-                                "The entry should be a Sleep entry"
-                            ),
-                            Err(e) => log_data_corruption_error!(
-                                "sys_journal",
-                                &journal_entry_id.invocation_id(),
-                                "sleep_wakeup",
-                                e
-                            ),
-                        };
-                    }
+                EnrichedEntryHeader::Sleep { .. } if row.is_sleep_wakeup_at_defined() => {
+                    match entry.deserialize_entry_ref::<ProtobufRawEntryCodec>() {
+                        Ok(Entry::Sleep(entry)) => row.sleep_wakeup_at(entry.wake_up_time as i64),
+                        Ok(_) => log_data_corruption_error!(
+                            "sys_journal",
+                            &journal_entry_id.invocation_id(),
+                            "sleep_wakeup",
+                            "The entry should be a Sleep entry"
+                        ),
+                        Err(e) => log_data_corruption_error!(
+                            "sys_journal",
+                            &journal_entry_id.invocation_id(),
+                            "sleep_wakeup",
+                            e
+                        ),
+                    };
                 }
                 _ => {}
             }
@@ -154,6 +150,21 @@ pub(crate) fn append_journal_row_v2(
     }
 
     row.appended_at(raw_entry.header.append_time.as_u64() as i64);
+
+    if row.is_raw_defined() || row.is_raw_length_defined() {
+        let serialized = raw_entry.inner.serialized_content();
+        if row.is_raw_defined() {
+            row.raw(&serialized);
+        }
+        if row.is_raw_length_defined() {
+            row.raw_length(
+                serialized
+                    .len()
+                    .try_into()
+                    .expect("raw length to fit in a u64"),
+            );
+        }
+    }
 
     if row.is_entry_lite_json_defined() {
         // We need to parse the entry

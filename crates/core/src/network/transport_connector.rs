@@ -76,6 +76,8 @@ pub mod test_util {
     use restate_types::GenerationalNodeId;
     use restate_types::config::Configuration;
 
+    use restate_memory::MemoryPool;
+
     use crate::network::MessageRouterBuilder;
     use crate::network::handshake::negotiate_protocol_version;
     use crate::network::io::{ConnectionReactor, EgressMessage, EgressStream};
@@ -143,7 +145,7 @@ pub mod test_util {
             let router = if let Some(router) = guard.routers.get(&peer_node_id) {
                 router.clone()
             } else {
-                let mut router = MessageRouterBuilder::default();
+                let mut router = MessageRouterBuilder::with_default_pool(MemoryPool::unlimited());
                 (guard.router_factory)(peer_node_id, &mut router);
                 let router = Arc::new(router.build());
                 guard.routers.insert(peer_node_id, router.clone());
@@ -169,15 +171,15 @@ pub mod test_util {
             .await?;
 
             // NodeId **must** be generational at this layer
-            let _peer_node_id = hello.my_node_id.ok_or(HandshakeError::Failed(
-                "NodeId is not set in the Hello message".to_owned(),
-            ))?;
+            let _peer_node_id = hello.my_node_id.ok_or_else(|| {
+                HandshakeError::Failed("NodeId is not set in the Hello message".to_owned())
+            })?;
 
             // Are we both from the same cluster?
             if hello.cluster_name != nodes_config.cluster_name() {
                 return Err(HandshakeError::Failed("cluster name mismatch".to_owned()).into());
             }
-            let peer_metadata = PeerMetadataVersion::from(header.clone());
+            let peer_metadata = PeerMetadataVersion::from(header);
 
             let selected_protocol_version = negotiate_protocol_version(&hello)?;
 
@@ -185,7 +187,7 @@ pub mod test_util {
             let welcome = Welcome::new(peer_node_id, selected_protocol_version, hello.direction());
 
             shared
-                .unbounded_send(EgressMessage::Message(welcome.into(), None))
+                .unbounded_send(EgressMessage::Message(welcome.into()))
                 .unwrap();
 
             let connection =

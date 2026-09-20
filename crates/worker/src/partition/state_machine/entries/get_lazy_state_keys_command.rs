@@ -8,24 +8,31 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
-use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
 use futures::{StreamExt, TryStreamExt};
+use tracing::warn;
+
 use restate_storage_api::state_table::ReadStateTable;
 use restate_types::journal_v2::{
     EntryMetadata, GetLazyStateKeysCommand, GetLazyStateKeysCompletion,
 };
-use tracing::warn;
+
+use crate::partition::processor::Processor;
+use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
+use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
 
 pub(super) type ApplyGetLazyStateKeysCommand<'e> =
     ApplyJournalCommandEffect<'e, GetLazyStateKeysCommand>;
 
-impl<'e, 'ctx: 'e, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'e, 'ctx: 'e, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for ApplyGetLazyStateKeysCommand<'e>
 where
     S: ReadStateTable,
+    P: Processor,
 {
-    async fn apply(mut self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
+    async fn apply(
+        mut self,
+        ctx: &'ctx mut StateMachineApplyContext<'s, S, P>,
+    ) -> Result<(), Error> {
         let invocation_metadata = self
             .invocation_status
             .get_invocation_metadata()
@@ -64,12 +71,13 @@ where
 mod tests {
     use crate::partition::state_machine::tests::fixtures::invoker_entry_effect;
     use crate::partition::state_machine::tests::{TestEnv, fixtures, matchers};
+    use bytes::Bytes;
     use googletest::matchers::contains;
-    use googletest::prelude::assert_that;
+    use googletest::prelude::{assert_that, eq};
     use restate_storage_api::Transaction;
     use restate_storage_api::state_table::WriteStateTable;
     use restate_types::identifiers::ServiceId;
-    use restate_types::journal_v2::{GetLazyStateKeysCommand, GetLazyStateKeysCompletion};
+    use restate_types::journal_v2::{GetLazyStateKeysCommand, NotificationId};
 
     #[restate_core::test]
     async fn get_lazy_state_keys() {
@@ -82,9 +90,12 @@ mod tests {
 
         // Mock some state
         let mut txn = test_env.storage.transaction();
-        txn.put_user_state(&service_id, b"key1", b"value1").unwrap();
-        txn.put_user_state(&service_id, b"key2", b"value2").unwrap();
+        txn.put_user_state(&service_id, &Bytes::from_static(b"key1"), b"value1")
+            .unwrap();
+        txn.put_user_state(&service_id, &Bytes::from_static(b"key2"), b"value2")
+            .unwrap();
         txn.commit().await.unwrap();
+        drop(txn);
 
         let completion_id = 1;
         let actions = test_env
@@ -102,12 +113,22 @@ mod tests {
             actions,
             contains(matchers::actions::forward_notification(
                 invocation_id,
-                GetLazyStateKeysCompletion {
-                    completion_id,
-                    state_keys: vec!["key1".to_string(), "key2".to_string()]
-                }
+                2,
+                NotificationId::CompletionId(completion_id),
             ))
         );
+
+        let state_keys_command = test_env
+            .read_journal_entry::<GetLazyStateKeysCommand>(invocation_id, 1)
+            .await;
+        assert_that!(
+            state_keys_command,
+            eq(GetLazyStateKeysCommand {
+                completion_id: 1,
+                name: Default::default()
+            })
+        );
+
         test_env.shutdown().await;
     }
 }

@@ -9,22 +9,24 @@
 // by the Apache License, Version 2.0.
 
 use std::fmt::Debug;
-use std::ops::{ControlFlow, RangeInclusive};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use restate_partition_store::{PartitionStore, PartitionStoreManager};
 use restate_storage_api::StorageError;
-use restate_storage_api::invocation_status_table::ScanInvocationStatusTable;
+use restate_storage_api::invocation_status_table::{
+    ScanInvocationStatusTable, ScanInvocationStatusTableRange,
+};
 use restate_storage_api::protobuf_types::v1::lazy::InvocationStatusV2Lazy;
 use restate_types::errors::ConversionError;
-use restate_types::identifiers::{InvocationId, PartitionKey};
+use restate_types::identifiers::InvocationId;
 
 use crate::context::{QueryContext, SelectPartitions};
+use crate::filter::{FirstMatchingPartitionKeyExtractor, InvocationIdFilter};
 use crate::invocation_status::row::append_invocation_status_row;
 use crate::invocation_status::schema::{
     SysInvocationStatusBuilder, sys_invocation_status_sort_order,
 };
-use crate::partition_filter::FirstMatchingPartitionKeyExtractor;
 use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::statistics::{
@@ -59,8 +61,8 @@ pub(crate) fn register_self(
         sys_invocation_status_sort_order(),
         remote_scanner_manager.create_distributed_scanner(NAME, local_scanner),
         FirstMatchingPartitionKeyExtractor::default()
-            .with_service_key("target_service_key")
-            .with_invocation_id("id"),
+            .with_scope_or_service_key("scope", "target_service_key")
+            .with_grouped_invocation_id("id"),
     )
     .with_statistics(statistics.build());
     ctx.register_partitioned_table(NAME, Arc::new(status_table))
@@ -71,8 +73,9 @@ struct StatusScanner;
 
 impl ScanLocalPartition for StatusScanner {
     type Builder = SysInvocationStatusBuilder;
-    type Item<'a> = (InvocationId, InvocationStatusV2Lazy<'a>);
+    type Item<'a> = (InvocationId, &'a InvocationStatusV2Lazy<'a>);
     type ConversionError = ConversionError;
+    type Filter = InvocationIdFilter;
 
     fn for_each_row<
         F: for<'a> FnMut(Self::Item<'a>) -> ControlFlow<Result<(), Self::ConversionError>>
@@ -81,10 +84,10 @@ impl ScanLocalPartition for StatusScanner {
             + 'static,
     >(
         partition_store: &PartitionStore,
-        range: RangeInclusive<PartitionKey>,
+        filter: InvocationIdFilter,
         f: F,
     ) -> Result<impl Future<Output = Result<(), StorageError>> + Send, StorageError> {
-        partition_store.for_each_invocation_status_lazy(range, f)
+        partition_store.for_each_invocation_status_lazy(filter.into(), f)
     }
 
     fn append_row<'a>(
@@ -92,5 +95,14 @@ impl ScanLocalPartition for StatusScanner {
         (invocation_id, invocation_status): Self::Item<'a>,
     ) -> Result<(), ConversionError> {
         append_invocation_status_row(row_builder, invocation_id, invocation_status)
+    }
+}
+
+impl From<InvocationIdFilter> for ScanInvocationStatusTableRange {
+    fn from(value: InvocationIdFilter) -> Self {
+        match value.invocation_ids {
+            Some(selection) => ScanInvocationStatusTableRange::InvocationIdSet(selection.ids),
+            None => ScanInvocationStatusTableRange::PartitionKey(value.partition_keys),
+        }
     }
 }

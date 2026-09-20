@@ -8,286 +8,142 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use restate_storage_api::vqueue_table::{
-    AsEntryState, AsEntryStateHeader, EntryCard, EntryId, EntryKind, Stage, VisibleAt,
-};
-use restate_types::clock::UniqueTimestamp;
-use restate_types::identifiers::{InvocationId, PartitionKey, WithPartitionKey as _};
-use restate_types::vqueue::{EffectivePriority, VQueueId, VQueueInstance, VQueueParent};
+use restate_storage_api::vqueue_table::RawStatusHeader;
+use restate_storage_api::vqueue_table::{EntryKey, OwnedEntryStatusHeader};
+use restate_types::identifiers::{InvocationId, PartitionKey, WithPartitionKey};
+use restate_types::vqueues::EntryId;
 
 use crate::TableKind;
-use crate::keys::{KeyKind, TableKey, define_table_key};
+use crate::keys::{KeyKind, define_table_key};
 
-// `qe` | PKEY | KIND | ENTRY_ID
+// `qs` | PKEY | ENTRY_ID
 define_table_key!(
     TableKind::VQueue,
-    KeyKind::VQueueEntryState,
-    EntryStateKey(
+    KeyKind::VQueueEntryStatus,
+    EntryStatusKey(
         partition_key: PartitionKey,
-        kind: EntryKind,
         id: EntryId,
     )
 );
 
-static_assertions::const_assert_eq!(EntryStateKey::serialized_length_fixed(), 27);
-
-impl EntryStateKey {
+impl EntryStatusKey {
     pub const fn serialized_length_fixed() -> usize {
         KeyKind::SERIALIZED_LENGTH
             + std::mem::size_of::<PartitionKey>()
-            + std::mem::size_of::<EntryKind>()
-            // entry id (e.g. invocation uuid)
-            + std::mem::size_of::<EntryId>()
-    }
-
-    #[inline]
-    pub fn to_bytes(&self) -> [u8; Self::serialized_length_fixed()] {
-        let mut buf = [0u8; Self::serialized_length_fixed()];
-        self.serialize_to(&mut buf.as_mut());
-        buf
+            + EntryId::serialized_length_fixed()
     }
 }
 
-impl From<&InvocationId> for EntryStateKey {
+impl From<&InvocationId> for EntryStatusKey {
     #[inline]
     fn from(id: &InvocationId) -> Self {
-        EntryStateKey {
-            partition_key: id.partition_key(),
-            kind: EntryKind::Invocation,
+        EntryStatusKey {
+            partition_key: WithPartitionKey::partition_key(id),
             id: EntryId::from(id),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, bilrost::Message)]
-pub struct EntryStateHeader {
-    /// Unknown is an invalid state, this will be set to None when the invocation
-    /// leaves the queue.
-    #[bilrost(1)]
-    pub stage: Stage,
-    #[bilrost(2)]
-    pub queue_parent: u32,
-    #[bilrost(3)]
-    pub queue_instance: u32,
-    // current entry card details
-    #[bilrost(4)]
-    pub effective_priority: EffectivePriority,
-    #[bilrost(5)]
-    pub visible_at: VisibleAt,
-    #[bilrost(6)]
-    pub created_at: UniqueTimestamp,
+pub(super) fn entry_status_header_from_raw(
+    entry_id: EntryId,
+    header: RawStatusHeader,
+) -> OwnedEntryStatusHeader {
+    OwnedEntryStatusHeader::new(
+        header.qid,
+        header.stage,
+        EntryKey::new(header.has_lock, header.next_run_at, header.seq, entry_id),
+        header.metadata,
+        header.stats,
+        header.status,
+    )
 }
 
-pub struct OwnedHeader {
-    pub(crate) partition_key: PartitionKey,
-    pub(crate) kind: EntryKind,
-    pub(crate) id: EntryId,
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
 
-    pub(crate) inner: EntryStateHeader,
-}
+    use restate_types::vqueues::VQueueEntryId;
 
-impl AsEntryStateHeader for OwnedHeader {
-    fn kind(&self) -> EntryKind {
-        self.kind
+    use crate::keys::EncodeTableKeyPrefix;
+
+    use super::*;
+
+    /// Encodes a `VQueueEntryId` exactly the way its `EntryStatusKey` lands on disk:
+    /// `qs | partition_key (u64 BE) | kind (u8) | remainder (16B)`.
+    fn encode(id: VQueueEntryId) -> BytesMut {
+        EntryStatusKey {
+            partition_key: id.partition_key(),
+            id: EntryId::from(id),
+        }
+        .serialize()
     }
 
-    fn stage(&self) -> Stage {
-        self.inner.stage
+    /// A spread of ids exercising every tier of the comparison:
+    /// - partition keys whose relative order flips under little- vs big-endian,
+    /// - both entry kinds (Invocation = 0x69 < StateMutation = 0x73),
+    /// - remainders differing only in the first vs last byte (bytewise order).
+    fn sample_ids() -> Vec<VQueueEntryId> {
+        let r0 = [0u8; 16];
+        let mut r_first = [0u8; 16];
+        r_first[0] = 1;
+        let mut r_last = [0u8; 16];
+        r_last[15] = 1;
+        let r_max = [0xffu8; 16];
+
+        vec![
+            VQueueEntryId::Invocation(0, r0),
+            VQueueEntryId::StateMutation(0, r0),
+            VQueueEntryId::Invocation(0, r_first),
+            VQueueEntryId::Invocation(0, r_last),
+            VQueueEntryId::Invocation(0, r_max),
+            // partition keys that catch a little-endian mistake:
+            // 0x0000_0000_0000_00ff must sort before 0x0000_0000_0000_ff00.
+            VQueueEntryId::Invocation(0x0000_0000_0000_00ff, r0),
+            VQueueEntryId::Invocation(0x0000_0000_0000_ff00, r0),
+            VQueueEntryId::StateMutation(0x0000_0000_0000_00ff, r_max),
+            VQueueEntryId::Invocation(0xff00_0000_0000_0000, r0),
+            VQueueEntryId::StateMutation(u64::MAX, r0),
+            VQueueEntryId::Invocation(u64::MAX, r_max),
+        ]
     }
 
-    fn queue_parent(&self) -> VQueueParent {
-        VQueueParent::from_raw(self.inner.queue_parent)
-    }
+    /// The hand-written `Ord`/`PartialOrd` on `VQueueEntryId` must agree with the
+    /// lexicographic byte ordering of its encoded `EntryStatusKey` for every pair.
+    /// The `qs` kind prefix is identical for all entries, so it doesn't affect the
+    /// relative ordering.
+    #[test]
+    fn ord_matches_encoded_entry_status_key_bytes() {
+        let ids = sample_ids();
 
-    fn queue_instance(&self) -> VQueueInstance {
-        VQueueInstance::from_raw(self.inner.queue_instance)
-    }
+        for a in &ids {
+            for b in &ids {
+                let logical = a.cmp(b);
+                let bytewise = encode(*a).as_ref().cmp(encode(*b).as_ref());
+                assert_eq!(
+                    logical, bytewise,
+                    "ordering mismatch between {a:?} and {b:?}: \
+                     VQueueEntryId::cmp = {logical:?} but encoded bytes compare = {bytewise:?}"
+                );
 
-    fn vqueue_id(&self) -> VQueueId {
-        VQueueId::new(
-            self.queue_parent(),
-            self.partition_key,
-            self.queue_instance(),
-        )
-    }
-
-    fn current_entry_card(&self) -> EntryCard {
-        EntryCard {
-            priority: self.inner.effective_priority,
-            visible_at: self.inner.visible_at,
-            created_at: self.inner.created_at,
-            kind: self.kind,
-            id: self.id,
+                // PartialOrd must delegate to Ord.
+                assert_eq!(a.partial_cmp(b), Some(logical));
+            }
         }
     }
-}
 
-pub struct OwnedEntryState<E> {
-    pub(crate) header: OwnedHeader,
-    pub(crate) state: E,
-}
+    /// Sorting a collection by `VQueueEntryId::Ord` yields the same sequence as
+    /// sorting by the encoded key bytes (RocksDB's on-disk order).
+    #[test]
+    fn sort_order_agrees_with_encoded_bytes() {
+        let mut by_logical = sample_ids();
+        by_logical.sort();
 
-impl<E> AsEntryStateHeader for OwnedEntryState<E> {
-    fn kind(&self) -> EntryKind {
-        self.header.kind()
-    }
+        let mut by_bytes = sample_ids();
+        by_bytes.sort_by(|a, b| encode(*a).as_ref().cmp(encode(*b).as_ref()));
 
-    fn stage(&self) -> Stage {
-        self.header.stage()
-    }
-
-    fn queue_parent(&self) -> VQueueParent {
-        self.header.queue_parent()
-    }
-
-    fn queue_instance(&self) -> VQueueInstance {
-        self.header.queue_instance()
-    }
-
-    fn vqueue_id(&self) -> VQueueId {
-        self.header.vqueue_id()
-    }
-
-    fn current_entry_card(&self) -> EntryCard {
-        self.header.current_entry_card()
+        assert_eq!(
+            by_logical, by_bytes,
+            "sorting by VQueueEntryId::Ord disagrees with sorting by encoded key bytes"
+        );
     }
 }
-
-impl<E> AsEntryState for OwnedEntryState<E> {
-    type State = E;
-
-    fn state(&self) -> &Self::State {
-        &self.state
-    }
-}
-
-// pub struct Borrowed<'a, E> {
-//     pub(crate) partition_key: PartitionKey,
-//     pub(crate) kind: EntryKind,
-//     pub(crate) id: EntryId,
-//
-//     pub(crate) inner: State<E>,
-//     // pins the underlying rocksdb slice as long as this struct is alive
-//     pub(crate) _pinned: DBPinnableSlice<'a>,
-// }
-//
-// impl<'a, E> AsEntryStateHeader for Borrowed<'a, E> {
-//     fn kind(&self) -> EntryKind {
-//         self.kind
-//     }
-//
-//     fn stage(&self) -> Stage {
-//         self.inner.stage
-//     }
-//
-//     fn queue_parent(&self) -> VQueueParent {
-//         VQueueParent::from_raw(self.inner.queue_parent)
-//     }
-//
-//     fn queue_instance(&self) -> VQueueInstance {
-//         VQueueInstance::from_raw(self.inner.queue_instance)
-//     }
-//
-//     fn vqueue_id(&self) -> VQueueId {
-//         VQueueId::new(
-//             self.queue_parent(),
-//             self.partition_key,
-//             self.queue_instance(),
-//         )
-//     }
-//
-//     fn current_entry_card(&self) -> EntryCard {
-//         EntryCard {
-//             priority: self.inner.effective_priority,
-//             visible_at: self.inner.visible_at,
-//             created_at: self.inner.created_at,
-//             kind: self.kind,
-//             id: self.id,
-//         }
-//     }
-// }
-//
-//
-// impl<'a, E> AsEntryState for Borrowed<'a, E> {
-//     type State = E;
-//
-//     fn state(&self) -> &Self::State {
-//         &self.inner.extras
-//     }
-// }
-//
-// impl<'a> ReadVQueueEntryState for PartitionStoreTransaction<'a> {
-//
-//     async fn get_entry_state<E>(
-//         &mut self,
-//         partition_key: PartitionKey,
-//         id: &EntryId,
-//     ) -> Result<Option<impl AsEntryState + 'static>>
-//     where
-//         E: EntryStateKind + bilrost::OwnedMessage + Sized + 'static,
-//         State<E>: bilrost::OwnedMessage + Sized + Send,
-//     {
-//         use super::super::invocation_table::MetaKey;
-//         let mut key_buffer = [0u8; MetaKey::serialized_length_fixed()];
-//         MetaKey {
-//             partition_key,
-//             invocation_uuid: *id,
-//         }
-//         .serialize_to(&mut key_buffer.as_mut());
-//         let Some(raw_value) = self.get(MetaKey::TABLE, key_buffer)? else {
-//             return Ok(None);
-//         };
-//
-//         let slice = raw_value;
-//         let decoded = State::<E>::decode(&mut slice.as_ref())?;
-//         Ok(Some(Owned {
-//             partition_key,
-//             kind: EntryKind::Invocation,
-//             id: *id,
-//             inner: decoded,
-//         }))
-//     }
-// }
-//
-// impl WriteVQueueEntryState for PartitionStoreTransaction<'_> {
-//     fn create_vqueue_entry_state<E>(
-//         &mut self,
-//         at: UniqueTimestamp,
-//         qid: &VQueueId,
-//         card: &EntryCard,
-//         stage: Stage,
-//         // visible_at: VisibleAt,
-//         // priority: EffectivePriority,
-//         entry_state: E,
-//     ) where
-//         E: EntryStateKind + bilrost::Message + bilrost::encoding::RawMessage,
-//         State<E>: bilrost::Message + bilrost::encoding::RawMessage,
-//     {
-//         use super::super::invocation_table::MetaKey;
-//         let key_buffer = MetaKey {
-//             partition_key: qid.partition_key,
-//             invocation_uuid: card.id.clone(),
-//         }
-//         .to_bytes();
-//
-//         let entry = State {
-//             stage: 1,
-//             queue_parent: qid.parent.as_u16(),
-//             queue_instance: qid.instance.as_u32(),
-//             initial_visible_at: card.visible_at,
-//             latest_visible_at: card.visible_at,
-//             effective_priority: card.priority,
-//             created_at: at,
-//             entry_state,
-//         };
-//
-//         let value_buf = {
-//             let value_buf = self.cleared_value_buffer_mut(entry.encoded_len());
-//             // unwrap is safe because we know the buffer is big enough.
-//             entry.encode(value_buf).unwrap();
-//             value_buf.split()
-//         };
-//
-//         self.raw_put_cf(KeyKind::ResourceInvocation, key_buffer, value_buf);
-//     }
-// }

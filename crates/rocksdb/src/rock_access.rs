@@ -13,18 +13,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, ImportColumnFamilyOptions, WriteBufferManager,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, ImportColumnFamilyOptions, RateLimiter,
+    WriteBufferManager,
 };
 use rocksdb::{CompactOptions, ExportImportFilesMetaData};
 use tokio::time::Instant;
 use tracing::{debug, info, trace, warn};
 
-use crate::DbName;
 use crate::DbSpec;
 use crate::RawRocksDb;
 use crate::RocksError;
 use crate::configuration::create_default_cf_options;
-use crate::{CfName, RocksDbPerfGuard};
+use crate::{BottommostLevelCompaction, CfName, ManualCompactionOptions, RocksDbReadPerfGuard};
+use crate::{DbName, OpenMode};
 
 /// Operations in this wrapper can be IO blocking, prefer using [`crate::RocksDb`]
 /// for async access to the database.
@@ -63,6 +64,8 @@ fn prepare_cf_options(
         // rocksdb will create a new cache, wasting ~32MB RSS per db.
         let mut cf_options = create_default_cf_options(Some(write_buffer_manager));
         cf_options.set_write_buffer_manager(write_buffer_manager);
+        cf_options.set_level_zero_slowdown_writes_trigger(1 << 30);
+        cf_options.set_level_zero_stop_writes_trigger(1 << 30);
 
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(global_cache);
@@ -113,11 +116,15 @@ impl RocksAccess {
         env: &rocksdb::Env,
         write_buffer_manager: &WriteBufferManager,
         global_cache: &Cache,
+        limiter: &RateLimiter,
     ) -> Result<Self, RocksError> {
-        let db_options =
-            db_spec
-                .db_configurator
-                .get_db_options(db_spec.name(), env, write_buffer_manager);
+        let db_options = db_spec.db_configurator.get_db_options(
+            db_spec.name(),
+            env,
+            write_buffer_manager,
+            limiter,
+        );
+
         let mut all_cfs: HashSet<CfName> = match rocksdb::DB::list_cf(&db_options, &db_spec.path) {
             Ok(existing) => existing.into_iter().map(Into::into).collect(),
             Err(e) => {
@@ -140,13 +147,33 @@ impl RocksAccess {
             prepare_descriptors(&db_spec, write_buffer_manager, global_cache, &mut all_cfs)?;
         trace!(path = %db_spec.path.display(), "Opening rocksdb database '{}'", db_spec.name());
 
-        rocksdb::DB::open_cf_descriptors(&db_options, &db_spec.path, descriptors)
-            .map(|db| RocksAccess {
-                db,
-                db_options,
-                db_spec,
-            })
-            .map_err(RocksError::from_rocksdb_error)
+        match db_spec.open_mode() {
+            OpenMode::ReadWrite => {
+                trace!(path = %db_spec.path.display(), "Opening rocksdb database '{}'", db_spec.name());
+                rocksdb::DB::open_cf_descriptors(&db_options, &db_spec.path, descriptors)
+                    .map(|db| RocksAccess {
+                        db,
+                        db_options,
+                        db_spec,
+                    })
+                    .map_err(RocksError::from_rocksdb_error)
+            }
+            OpenMode::ReadOnly => {
+                warn!(path = %db_spec.path.display(), "Opening rocksdb database '{}' in read-only mode", db_spec.name());
+                rocksdb::DB::open_cf_descriptors_read_only(
+                    &db_options,
+                    &db_spec.path,
+                    descriptors,
+                    false,
+                )
+                .map(|db| RocksAccess {
+                    db,
+                    db_options,
+                    db_spec,
+                })
+                .map_err(RocksError::from_rocksdb_error)
+            }
+        }
     }
 
     pub fn spec(&self) -> &DbSpec {
@@ -174,7 +201,7 @@ impl RocksAccess {
 
     #[tracing::instrument(skip_all, fields(db = %self.name()))]
     pub(crate) fn shutdown(&self) {
-        let _x = RocksDbPerfGuard::new("shutdown");
+        let _x = RocksDbReadPerfGuard::new("shutdown");
         if let Err(e) = self.db.flush_wal(true) {
             warn!(
                 db = %self.name(),
@@ -282,8 +309,19 @@ impl RocksAccess {
         Ok(self.db.flush_cfs_opt(&cf_refs, &flushopts)?)
     }
 
-    pub fn compact_all(&self) {
-        let opts = CompactOptions::default();
+    pub fn compact_all(&self, options: ManualCompactionOptions) {
+        let mut opts = CompactOptions::default();
+        opts.set_bottommost_level_compaction(match options.bottommost_level_compaction {
+            BottommostLevelCompaction::Skip => rocksdb::BottommostLevelCompaction::Skip,
+            BottommostLevelCompaction::IfHaveCompactionFilter => {
+                rocksdb::BottommostLevelCompaction::IfHaveCompactionFilter
+            }
+            BottommostLevelCompaction::Force => rocksdb::BottommostLevelCompaction::Force,
+            BottommostLevelCompaction::ForceOptimized => {
+                rocksdb::BottommostLevelCompaction::ForceOptimized
+            }
+        });
+        opts.set_change_level(options.recalculate_level);
         self.cfs()
             .iter()
             .filter_map(|name| self.cf_handle(name))
@@ -291,6 +329,22 @@ impl RocksAccess {
                 self.db
                     .compact_range_cf_opt::<&str, &str>(&cf, None, None, &opts)
             });
+    }
+
+    /// Runs a manual compaction on the Range of keys given on the
+    /// given column family.
+    pub fn compact_cf<A, B>(
+        &self,
+        cf_handle: &Arc<rocksdb::BoundColumnFamily<'_>>,
+        opts: &CompactOptions,
+        start_key: Option<A>,
+        end_key: Option<B>,
+    ) where
+        A: AsRef<[u8]>,
+        B: AsRef<[u8]>,
+    {
+        self.db
+            .compact_range_cf_opt(cf_handle, start_key, end_key, opts)
     }
 
     pub fn set_options_cf(

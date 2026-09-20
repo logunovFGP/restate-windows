@@ -53,8 +53,8 @@ impl TailOffsetWatch {
         self.sender.send_if_modified(|v| v.combine(false, offset));
     }
 
-    pub fn notify_seal(&self) {
-        self.sender.send_if_modified(|v| v.seal());
+    pub fn notify_seal(&self) -> bool {
+        self.sender.send_if_modified(|v| v.seal())
     }
 
     pub fn latest_offset(&self) -> LogletOffset {
@@ -63,6 +63,11 @@ impl TailOffsetWatch {
 
     pub fn get(&self) -> watch::Ref<'_, TailState<LogletOffset>> {
         self.sender.borrow()
+    }
+
+    /// Returns true if both watches share the same underlying channel.
+    pub fn same_watch(&self, other: &TailOffsetWatch) -> bool {
+        self.sender.same_channel(&other.sender)
     }
 
     pub fn is_sealed(&self) -> bool {

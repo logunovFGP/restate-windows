@@ -34,7 +34,7 @@ pub struct SnapshotPartitionTask {
     pub snapshot_base_path: PathBuf,
     pub partition_store_manager: Arc<PartitionStoreManager>,
     pub cluster_name: String,
-    pub cluster_fingerprint: ClusterFingerprint,
+    pub cluster_fingerprint: Option<ClusterFingerprint>,
     pub node_name: String,
     pub snapshot_repository: SnapshotRepository,
 }
@@ -88,6 +88,7 @@ impl SnapshotPartitionTask {
 
         let status = self
             .snapshot_repository
+            // `put` takes ownership of the snapshot directory and removes it after upload.
             .put(&metadata, snapshot.base_dir)
             .await
             .map_err(|e| SnapshotError {
@@ -114,12 +115,12 @@ impl SnapshotPartitionTask {
         PartitionSnapshotMetadata {
             version: SnapshotFormatVersion::V1,
             cluster_name: self.cluster_name.clone(),
-            cluster_fingerprint: Some(self.cluster_fingerprint),
+            cluster_fingerprint: self.cluster_fingerprint,
             node_name: self.node_name.clone(),
             partition_id: self.partition_id,
             created_at: created_at.into_timestamp(),
             snapshot_id: self.snapshot_id,
-            key_range: snapshot.key_range.clone(),
+            key_range: snapshot.key_range,
             log_id: snapshot.log_id,
             min_applied_lsn: snapshot.min_applied_lsn,
             db_comparator_name: snapshot.db_comparator_name.clone(),

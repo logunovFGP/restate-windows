@@ -8,19 +8,27 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use futures::Stream;
 use std::ops::RangeInclusive;
 
+use futures::Stream;
+
 use crate::Result;
-use restate_types::identifiers::{EntryIndex, InvocationId, PartitionKey};
+use restate_types::identifiers::{EntryIndex, InvocationId};
 use restate_types::journal_events::raw::RawEvent;
+use restate_types::sharding::KeyRange;
 use restate_types::time::MillisSinceEpoch;
 
 pub trait ReadJournalEventsTable {
     fn get_journal_events(
         &mut self,
-        invocation_id: InvocationId,
+        invocation_id: &InvocationId,
     ) -> Result<impl Stream<Item = Result<EventView>> + Send>;
+}
+
+#[derive(Debug, Clone)]
+pub enum ScanJournalEventsTableRange {
+    PartitionKey(KeyRange),
+    InvocationId(RangeInclusive<InvocationId>),
 }
 
 pub trait ScanJournalEventsTable {
@@ -28,7 +36,7 @@ pub trait ScanJournalEventsTable {
         F: FnMut((InvocationId, EventView)) -> std::ops::ControlFlow<()> + Send + Sync + 'static,
     >(
         &self,
-        range: RangeInclusive<PartitionKey>,
+        range: ScanJournalEventsTableRange,
         f: F,
     ) -> Result<impl Future<Output = Result<()>> + Send>;
 }
@@ -36,12 +44,12 @@ pub trait ScanJournalEventsTable {
 pub trait WriteJournalEventsTable {
     fn put_journal_event(
         &mut self,
-        invocation_id: InvocationId,
+        invocation_id: &InvocationId,
         event: EventView,
         lsn: u64,
     ) -> Result<()>;
 
-    fn delete_journal_events(&mut self, invocation_id: InvocationId) -> Result<()>;
+    fn delete_journal_events(&mut self, invocation_id: &InvocationId) -> Result<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

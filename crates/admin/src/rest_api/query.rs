@@ -12,9 +12,6 @@ use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::error::GenericRestError;
-use crate::query_utils::{RecordBatchWriter, WriteRecordBatchStream};
-use crate::state::AdminServiceState;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -30,10 +27,78 @@ use http::{HeaderMap, HeaderValue};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use parking_lot::Mutex;
+use serde::Serialize;
+
 use restate_admin_rest_model::query::QueryRequest;
 use restate_core::network::TransportConnect;
 use restate_types::invocation::client::InvocationClient;
 use restate_types::schema::registry::{DiscoveryClient, MetadataService, TelemetryClient};
+
+use crate::query_utils::{RecordBatchWriter, WriteRecordBatchStream};
+use crate::state::AdminServiceState;
+
+const RETRY_AFTER_HEADER: &str = "Retry-After";
+
+/// Error response for query endpoint.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct QueryErrorBody {
+    message: String,
+}
+
+/// Errors that can occur when executing a query.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QueryError {
+    #[error("Datafusion error: {0}")]
+    Datafusion(#[from] datafusion::error::DataFusionError),
+    #[error("Query service not available")]
+    Unavailable,
+    #[error("Rate limited")]
+    RateLimited(#[from] gardal::RateLimited),
+}
+
+impl From<restate_storage_query_datafusion::context::QueryError> for QueryError {
+    fn from(err: restate_storage_query_datafusion::context::QueryError) -> Self {
+        match err {
+            restate_storage_query_datafusion::context::QueryError::DataFusion(e) => {
+                Self::Datafusion(e)
+            }
+            restate_storage_query_datafusion::context::QueryError::RateLimited(e) => {
+                Self::RateLimited(e)
+            }
+        }
+    }
+}
+
+impl IntoResponse for QueryError {
+    fn into_response(self) -> Response {
+        let mut headers = http::HeaderMap::new();
+        let status_code = match &self {
+            QueryError::Datafusion(datafusion::error::DataFusionError::Plan(_))
+            | QueryError::Datafusion(datafusion::error::DataFusionError::SchemaError(_, _))
+            | QueryError::Datafusion(datafusion::error::DataFusionError::SQL(_, _)) => {
+                StatusCode::BAD_REQUEST
+            }
+            QueryError::Datafusion(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            QueryError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            QueryError::RateLimited(e) => {
+                headers.insert(
+                    RETRY_AFTER_HEADER,
+                    HeaderValue::from(std::cmp::max(e.earliest_retry_after().as_secs(), 1)),
+                );
+                StatusCode::TOO_MANY_REQUESTS
+            }
+        };
+
+        (
+            status_code,
+            headers,
+            Json(QueryErrorBody {
+                message: self.to_string(),
+            }),
+        )
+            .into_response()
+    }
+}
 
 /// Query the system and service state by using SQL.
 #[utoipa::path(
@@ -47,15 +112,15 @@ use restate_types::schema::registry::{DiscoveryClient, MetadataService, Telemetr
                 ("application/vnd.apache.arrow.stream"),
                 ("application/json", example = json!({"rows": []}))
             )),
-        (status = 500, description = "Internal Datafusion error"),
-        (status = 503, description = "Query service not available"),
+        (status = 500, description = "Datafusion error", body = QueryErrorBody),
+        (status = 503, description = "Query service not available", body = QueryErrorBody),
     )
 )]
 pub(crate) async fn query<Metadata, Discovery, Telemetry, Invocations, Transport>(
     State(state): State<AdminServiceState<Metadata, Discovery, Telemetry, Invocations, Transport>>,
     headers: HeaderMap,
     Json(payload): Json<QueryRequest>,
-) -> Result<impl IntoResponse, GenericRestError>
+) -> Result<Response, QueryError>
 where
     Metadata: MetadataService + Send + Sync + Clone + 'static,
     Discovery: DiscoveryClient + Send + Sync + Clone + 'static,
@@ -64,33 +129,23 @@ where
     Transport: TransportConnect,
 {
     let Some(query_context) = state.query_context.as_ref() else {
-        return Err(GenericRestError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Query service not available",
-        ));
+        return Err(QueryError::Unavailable);
     };
 
-    let record_batch_stream = query_context
-        .execute(&payload.query)
-        .await
-        .map_err(|e| GenericRestError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let query_result = query_context.execute(&payload.query).await?;
 
     let (result_stream, content_type) = match headers.get(http::header::ACCEPT) {
         Some(v) if v == HeaderValue::from_static("application/json") => (
-            WriteRecordBatchStream::<JsonWriter>::new(record_batch_stream, payload.query)
-                .map_err(|e| {
-                    GenericRestError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                })?
+            WriteRecordBatchStream::<JsonWriter>::new(query_result.stream, payload.query)?
                 .map_ok(Frame::data)
                 .left_stream(),
             "application/json",
         ),
         _ => (
             WriteRecordBatchStream::<StreamWriter<Vec<u8>>>::new(
-                record_batch_stream,
+                query_result.stream,
                 payload.query,
-            )
-            .map_err(|e| GenericRestError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            )?
             .map_ok(Frame::data)
             .right_stream(),
             "application/vnd.apache.arrow.stream",
@@ -102,16 +157,14 @@ where
     // return an error (instead of just closing the stream) if there is a error getting the first record batch (eg, out of memory)
     if let Some(Err(_)) = futures::stream::Peekable::peek(Pin::new(&mut result_stream)).await {
         let err = result_stream.next().await.unwrap().unwrap_err();
-        return Err(GenericRestError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            err.to_string(),
-        ));
+        return Err(err.into());
     }
 
     Ok(Response::builder()
         .header(http::header::CONTENT_TYPE, content_type)
         .body(StreamBody::new(result_stream))
-        .expect("content-type header is correct"))
+        .expect("content-type header is correct")
+        .into_response())
 }
 
 #[derive(Clone)]

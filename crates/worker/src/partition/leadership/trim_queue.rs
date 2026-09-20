@@ -17,15 +17,33 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use restate_bifrost::Bifrost;
 use restate_core::{ShutdownError, TaskCenter, TaskId, cancellation_token};
 use restate_storage_api::fsm_table::PartitionDurability;
 use restate_types::config::Configuration;
 use restate_types::logs::{LogId, Lsn, SequenceNumber};
-use restate_types::retries::with_jitter;
 use restate_types::time::MillisSinceEpoch;
+use restate_util_time::DurationExt;
+
+pub trait HasTrimQueue {
+    fn trim_queue(&self) -> &TrimQueue;
+}
+
+impl<P: HasTrimQueue> HasTrimQueue for &P {
+    #[inline]
+    fn trim_queue(&self) -> &TrimQueue {
+        (**self).trim_queue()
+    }
+}
+
+impl<P: HasTrimQueue> HasTrimQueue for &mut P {
+    #[inline]
+    fn trim_queue(&self) -> &TrimQueue {
+        (**self).trim_queue()
+    }
+}
 
 /// A task that trims the log by removing durable LSNs from the log.
 pub struct LogTrimmer {
@@ -56,8 +74,8 @@ impl LogTrimmer {
         let cancel = cancellation_token();
         // wait for 60-ish seconds before starting the first trim
         let mut interval = tokio::time::interval_at(
-            Instant::now() + with_jitter(Duration::from_secs(60), 0.3),
-            with_jitter(Duration::from_secs(30), 0.5),
+            Instant::now() + Duration::from_secs(60).add_jitter(0.3),
+            Duration::from_secs(30).add_jitter(0.5),
         );
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -109,7 +127,7 @@ impl LogTrimmer {
             );
             false
         } else {
-            info!(
+            debug!(
                 "Trimmed log {} to {:?}. This Lsn was reported durable at {}",
                 self.log_id,
                 durability.durable_point,
@@ -248,7 +266,7 @@ mod tests {
     use googletest::prelude::*;
 
     #[test]
-    fn test_pop_next_immediately() {
+    fn pop_next_immediately() {
         let mut queue = State::default();
         let now = MillisSinceEpoch::now();
         let very_old = MillisSinceEpoch::new(MillisSinceEpoch::now().as_u64() - 20);
@@ -350,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_trim_point() {
+    fn update_trim_point() {
         let mut queue = State::default();
         // millis since epoch is bigger if it's closer to now, small if it's far in the past.
         let now = MillisSinceEpoch::new(100);
@@ -418,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction() {
+    fn compaction() {
         // simulating a realistic scenario. A partition starts with knowledge about a durable LSN
         // slightly in the future.
         // Then we replay a large number of older durability points as follower.

@@ -17,11 +17,20 @@ use typify::{TypeSpace, TypeSpaceSettings};
 fn main() -> std::io::Result<()> {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    // Only re-run when proto files, JSON schema, or this build script change
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../../service-protocol/dev/restate/service/protocol.proto");
+    println!("cargo:rerun-if-changed=../../service-protocol/dev/restate/service/legacy.proto");
+    println!("cargo:rerun-if-changed=../../service-protocol/endpoint_manifest_schema.json");
+
     prost_build::Config::new()
         .bytes(["."])
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(
-            &["../../service-protocol/dev/restate/service/protocol.proto"],
+            &[
+                "../../service-protocol/dev/restate/service/protocol.proto",
+                "../../service-protocol/dev/restate/service/legacy.proto",
+            ],
             &["../../service-protocol"],
         )?;
 

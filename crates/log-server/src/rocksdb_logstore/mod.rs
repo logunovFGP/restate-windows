@@ -10,8 +10,17 @@
 
 mod builder;
 mod error;
+#[cfg(feature = "expose-internals")]
+pub mod keys;
+#[cfg(not(feature = "expose-internals"))]
 mod keys;
+#[cfg(feature = "expose-internals")]
+pub mod metadata_merge;
+#[cfg(not(feature = "expose-internals"))]
 mod metadata_merge;
+#[cfg(feature = "expose-internals")]
+pub mod record_format;
+#[cfg(not(feature = "expose-internals"))]
 mod record_format;
 mod store;
 mod writer;
@@ -20,7 +29,5 @@ pub use self::builder::RocksDbLogStoreBuilder;
 pub use self::store::RocksDbLogStore;
 pub(crate) use error::*;
 
-// matches the default directory name
-const DB_NAME: &str = "log-server";
-const DATA_CF: &str = "data";
-const METADATA_CF: &str = "metadata";
+pub const DATA_CF: &str = "data";
+pub const METADATA_CF: &str = "metadata";

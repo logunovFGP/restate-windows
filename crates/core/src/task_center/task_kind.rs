@@ -87,9 +87,6 @@ pub enum TaskKind {
     /// An http2 stream handler created by the client-side of the connection.
     #[strum(props(OnError = "log", runtime = "default"))]
     H2ClientStream,
-    /// A type for ingress until we start enforcing timeouts for inflight requests. This enables us
-    /// to shut down cleanly without waiting indefinitely.
-    #[strum(props(OnCancel = "abort"))]
     HttpIngressRole,
     WorkerRole,
     RoleRunner,
@@ -153,11 +150,13 @@ pub enum TaskKind {
     #[strum(props(OnCancel = "abort", runtime = "default"))]
     NetworkMessageHandler,
     ReplicatedLogletReadStream,
-    #[strum(props(OnCancel = "abort"))]
     // -- Log-server tasks
-    LogletWriter,
+    LogletWorker,
+    LogStoreWriter,
     // - Datafusion
     DfScanner,
+    #[strum(props(runtime = "default"))]
+    IngestionSession,
 }
 
 impl TaskKind {

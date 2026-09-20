@@ -24,7 +24,9 @@ use restate_types::net::address::AdvertisedAddress;
 use restate_types::net::metadata::MetadataKind;
 use restate_types::nodes_config::{NodeConfig, NodesConfiguration, Role};
 use restate_types::partition_table::PartitionTable;
-use restate_types::{GenerationalNodeId, Version};
+use restate_types::{GenerationalNodeId, RestateVersion, Version};
+
+use restate_memory::MemoryPool;
 
 use crate::network::protobuf::network::Message;
 use crate::network::{
@@ -68,7 +70,7 @@ impl<T: TransportConnect> TestCoreEnvBuilder<T> {
         let metadata_manager =
             MetadataManager::new(metadata_builder, metadata_store_client.clone());
         let metadata_writer = metadata_manager.writer();
-        let router_builder = MessageRouterBuilder::default();
+        let router_builder = MessageRouterBuilder::with_default_pool(MemoryPool::unlimited());
         let nodes_config = NodesConfiguration::new_for_testing();
         let partition_table = PartitionTable::with_equally_sized_partitions(Version::MIN, 10);
         TaskCenter::try_set_global_metadata(metadata.clone());
@@ -121,7 +123,7 @@ impl<T: TransportConnect> TestCoreEnvBuilder<T> {
 
     pub fn register_buffered_service<H, S>(
         mut self,
-        buffer_size: usize,
+        pool: MemoryPool,
         backpressure: BackPressureMode,
         handler: H,
     ) -> Self
@@ -131,7 +133,7 @@ impl<T: TransportConnect> TestCoreEnvBuilder<T> {
     {
         let buffered = self
             .router_builder
-            .register_buffered_service(buffer_size, backpressure);
+            .register_buffered_service_with_pool(pool, backpressure);
         buffered
             .start(TaskKind::NetworkMessageHandler, "service-handler", handler)
             .unwrap();
@@ -245,6 +247,7 @@ pub fn create_mock_nodes_config(node_id: u32, generation: u32) -> NodesConfigura
         .current_generation(node_id)
         .address(address)
         .roles(roles)
+        .binary_version(RestateVersion::current())
         .build();
     nodes_config.upsert_node(my_node);
     nodes_config

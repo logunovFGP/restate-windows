@@ -12,12 +12,14 @@ use std::ops::RangeInclusive;
 
 use futures::Stream;
 
-use restate_types::identifiers::{EntryIndex, InvocationId, JournalEntryId, PartitionKey};
+use restate_memory::{LocalMemoryLease, LocalMemoryPool};
+use restate_types::identifiers::{EntryIndex, InvocationId, JournalEntryId};
 use restate_types::journal::enriched::EnrichedRawEntry;
 use restate_types::journal::{CompletionResult, EntryType};
+use restate_types::sharding::KeyRange;
 
-use crate::Result;
 use crate::protobuf_types::PartitionStoreProtobufValue;
+use crate::{BudgetedReadError, Result};
 
 /// Different types of journal entries persisted by the runtime
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,11 +63,53 @@ pub trait ReadJournalTable {
         journal_index: u32,
     ) -> impl Future<Output = Result<Option<JournalEntry>>> + Send;
 
-    fn get_journal(
-        &mut self,
+    /// Returns a lazy stream over journal entries.
+    /// The stream borrows from `self` only, not from `invocation_id`.
+    fn get_journal<'a>(
+        &'a self,
         invocation_id: &InvocationId,
         journal_length: EntryIndex,
-    ) -> Result<impl Stream<Item = Result<(EntryIndex, JournalEntry)>> + Send>;
+    ) -> Result<impl Stream<Item = Result<(EntryIndex, JournalEntry)>> + Send + 'a>;
+
+    /// Budget-gated point read of a single journal entry.
+    ///
+    /// Fetches raw bytes from the store, peeks the serialized size, acquires a
+    /// [`LocalMemoryLease`] from `budget`, and only then decodes the entry.
+    fn get_journal_entry_budgeted(
+        &mut self,
+        invocation_id: &InvocationId,
+        journal_index: u32,
+        budget: &mut LocalMemoryPool,
+    ) -> impl Future<
+        Output = std::result::Result<Option<(JournalEntry, LocalMemoryLease)>, BudgetedReadError>,
+    > + Send;
+
+    /// Budget-gated journal stream.
+    ///
+    /// Each entry's raw byte size is peeked from the underlying store **before**
+    /// deserialization. A [`LocalMemoryLease`] is acquired from `budget` for that
+    /// size, and only then is the entry decoded. This prevents memory allocation
+    /// when the budget is exhausted.
+    fn get_journal_budgeted<'a>(
+        &'a self,
+        invocation_id: &InvocationId,
+        journal_length: EntryIndex,
+        budget: &'a mut LocalMemoryPool,
+    ) -> Result<
+        impl Stream<
+            Item = std::result::Result<
+                (EntryIndex, JournalEntry, LocalMemoryLease),
+                BudgetedReadError,
+            >,
+        > + Send
+        + 'a,
+    >;
+}
+
+#[derive(Debug, Clone)]
+pub enum ScanJournalTableRange {
+    PartitionKey(KeyRange),
+    InvocationId(RangeInclusive<InvocationId>),
 }
 
 pub trait ScanJournalTable {
@@ -73,7 +117,7 @@ pub trait ScanJournalTable {
         F: FnMut((JournalEntryId, JournalEntry)) -> std::ops::ControlFlow<()> + Send + Sync + 'static,
     >(
         &self,
-        range: RangeInclusive<PartitionKey>,
+        range: ScanJournalTableRange,
         f: F,
     ) -> Result<impl Future<Output = Result<()>> + Send>;
 }

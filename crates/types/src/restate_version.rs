@@ -21,8 +21,18 @@ use restate_encoding::BilrostNewType;
 pub struct RestateVersionError(#[from] semver::Error);
 
 /// Version of a restate binary
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, BilrostNewType)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    BilrostNewType,
+    derive_more::Display,
+)]
 #[serde(transparent)]
+#[display("{_0}")]
 pub struct RestateVersion(Cow<'static, str>);
 
 impl RestateVersion {
@@ -223,6 +233,30 @@ pub static RESTATE_VERSION_1_6_0: LazyLock<SemanticRestateVersion> =
 /// Why isn't this value simply v1.7.0? See description of [`RESTATE_VERSION_1_6_0`].
 pub static RESTATE_VERSION_1_7_0: LazyLock<SemanticRestateVersion> =
     LazyLock::new(|| SemanticRestateVersion::parse("1.7.0-dev").expect("valid semver version"));
+
+/// Why isn't this value simply v1.7.5? See description of [`RESTATE_VERSION_1_6_0`].
+pub static RESTATE_VERSION_1_7_5: LazyLock<SemanticRestateVersion> =
+    LazyLock::new(|| SemanticRestateVersion::parse("1.7.5-dev").expect("valid semver version"));
+
+/// Why isn't this value simply v1.7.8? See description of [`RESTATE_VERSION_1_6_0`].
+pub static RESTATE_VERSION_1_7_8: LazyLock<SemanticRestateVersion> =
+    LazyLock::new(|| SemanticRestateVersion::parse("1.7.8-dev").expect("valid semver version"));
+
+/// Why isn't this value simply v1.7.9? See description of [`RESTATE_VERSION_1_6_0`].
+pub static RESTATE_VERSION_1_7_9: LazyLock<SemanticRestateVersion> =
+    LazyLock::new(|| SemanticRestateVersion::parse("1.7.9-dev").expect("valid semver version"));
+
+/// Why isn't this value simply v1.7.10? See description of [`RESTATE_VERSION_1_6_0`].
+pub static RESTATE_VERSION_1_7_10: LazyLock<SemanticRestateVersion> =
+    LazyLock::new(|| SemanticRestateVersion::parse("1.7.10-dev").expect("valid semver version"));
+
+/// Why isn't this value simply v1.8.0? See description of [`RESTATE_VERSION_1_6_0`].
+pub static RESTATE_VERSION_1_8_0: LazyLock<SemanticRestateVersion> =
+    LazyLock::new(|| SemanticRestateVersion::parse("1.8.0-dev").expect("valid semver version"));
+
+/// Why isn't this value simply v1.9.0? See description of [`RESTATE_VERSION_1_6_0`].
+pub static RESTATE_VERSION_1_9_0: LazyLock<SemanticRestateVersion> =
+    LazyLock::new(|| SemanticRestateVersion::parse("1.9.0-dev").expect("valid semver version"));
 
 #[cfg(test)]
 mod tests {

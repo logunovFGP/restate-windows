@@ -45,6 +45,7 @@ static MOCK_INVOKE_JOURNAL_ENTRY: LazyLock<JournalEntry> = LazyLock::new(|| {
                 invocation_target: InvocationTarget::Service {
                     name: ByteString::from_static("MySvc"),
                     handler: ByteString::from_static("MyHandler"),
+                    scope: None,
                 },
                 completion_retention_time: Some(Duration::from_secs(10)),
                 span_context: ServiceInvocationSpanContext::empty(),
@@ -70,7 +71,7 @@ fn populate_data<T: WriteJournalTable>(txn: &mut T) {
         .unwrap();
 }
 
-async fn get_entire_journal<T: ReadJournalTable>(txn: &mut T) {
+async fn get_entire_journal<T: ReadJournalTable>(txn: &T) {
     let mut journal = pin!(txn.get_journal(&MOCK_INVOCATION_ID_1, 5).unwrap());
     let mut count = 0;
     while (journal.next().await).is_some() {
@@ -80,7 +81,7 @@ async fn get_entire_journal<T: ReadJournalTable>(txn: &mut T) {
     assert_eq!(count, 5);
 }
 
-async fn get_subset_of_a_journal<T: ReadJournalTable>(txn: &mut T) {
+async fn get_subset_of_a_journal<T: ReadJournalTable>(txn: &T) {
     let mut journal = pin!(txn.get_journal(&MOCK_INVOCATION_ID_1, 2).unwrap());
     let mut count = 0;
     while (journal.next().await).is_some() {
@@ -139,12 +140,13 @@ async fn journal_tests() {
     let mut txn = rocksdb.transaction();
 
     populate_data(&mut txn);
-    get_entire_journal(&mut txn).await;
-    get_subset_of_a_journal(&mut txn).await;
+    get_entire_journal(&txn).await;
+    get_subset_of_a_journal(&txn).await;
     point_lookups(&mut txn).await;
     delete_journal(&mut txn);
 
     txn.commit().await.expect("should not fail");
+    drop(txn);
 
     let mut txn = rocksdb.transaction();
     verify_journal_deleted(&mut txn).await;

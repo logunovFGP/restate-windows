@@ -9,25 +9,26 @@
 // by the Apache License, Version 2.0.
 
 use std::fmt::Debug;
-use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use anyhow::anyhow;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DataFusionError;
+use datafusion::physical_plan::metrics::Time;
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
 use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
 use tokio::sync::mpsc::Sender;
 
-use restate_invoker_api::{InvocationStatusReport, StatusHandle};
 use restate_partition_store::PartitionStoreManager;
-use restate_types::identifiers::{PartitionId, PartitionKey};
+use restate_types::identifiers::PartitionId;
+use restate_types::sharding::KeyRange;
+use restate_worker_api::invoker::{InvocationStatusReport, StatusHandle};
 
 use crate::context::{QueryContext, SelectPartitions};
+use crate::filter::FirstMatchingPartitionKeyExtractor;
 use crate::invocation_state::row::append_invocation_state_row;
 use crate::invocation_state::schema::{SysInvocationStateBuilder, sys_invocation_state_sort_order};
-use crate::partition_filter::FirstMatchingPartitionKeyExtractor;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::statistics::{RowEstimate, TableStatisticsBuilder};
 use crate::table_providers::{PartitionedTableProvider, ScanPartition};
@@ -73,15 +74,15 @@ pub(crate) fn register_self(
 async fn partition_key_range(
     partition_store_manager: &PartitionStoreManager,
     partition_id: PartitionId,
-) -> datafusion::common::Result<RangeInclusive<PartitionKey>> {
+) -> datafusion::common::Result<KeyRange> {
     partition_store_manager
-        .get_partition_store(partition_id)
+        .get_local_partition_if_open(partition_id)
         .await
         .ok_or_else(|| {
             let err = anyhow!("expecting a partition store");
             DataFusionError::External(err.into())
         })
-        .map(|store| store.partition_key_range().clone())
+        .map(|partition| partition.key_range)
 }
 
 #[derive(derive_more::Debug, Clone)]
@@ -95,11 +96,12 @@ impl<S: StatusHandle + Send + Sync + Debug + Clone + 'static> ScanPartition for 
     fn scan_partition(
         &self,
         partition_id: PartitionId,
-        _range: RangeInclusive<PartitionKey>,
+        range: KeyRange,
         projection: SchemaRef,
         _predicate: Option<Arc<dyn PhysicalExpr>>,
         batch_size: usize,
         limit: Option<usize>,
+        _elapsed_compute: Time,
     ) -> anyhow::Result<SendableRecordBatchStream> {
         let status = self.status_handle.clone();
         let partition_store_manager = self.partition_store_manager.clone();
@@ -108,7 +110,18 @@ impl<S: StatusHandle + Send + Sync + Debug + Clone + 'static> ScanPartition for 
         let tx = stream_builder.tx();
 
         let background_task = async move {
-            let range = partition_key_range(&partition_store_manager, partition_id).await?;
+            // Validate the partition store exists locally, then clamp the requested
+            // range to the partition's own key range.
+            let partition_range =
+                partition_key_range(&partition_store_manager, partition_id).await?;
+
+            // Filter the invoker status by the *requested* `range`, not the full
+            // partition range. An `id IN (...)` predicate expands into one point
+            // read per key, and several point reads can land on the same partition.
+            // Reading the full partition range on each would re-emit every in-flight
+            // invocation in that partition once per point read, which then gets
+            // multiplied by the `sys_invocation` view's join against this table.
+            let range = range.intersect(&partition_range).unwrap_or(range);
             match limit {
                 Some(limit) => {
                     for_each_state(

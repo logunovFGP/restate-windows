@@ -12,13 +12,13 @@ use crate::table_macro::*;
 
 use datafusion::arrow::datatypes::DataType;
 
-define_sort_order!(sys_journal_events(partition_key, id));
+define_sort_order!(sys_journal_events(partition_key));
 
 define_table!(sys_journal_events (
     /// Internal column that is used for partitioning the services invocations. Can be ignored.
     partition_key: DataType::UInt64,
 
-    /// [Invocation ID](/operate/invocation#invocation-identifier).
+    /// [Invocation ID](/services/invocation/managing-invocations#invocation-id).
     id: DataType::LargeUtf8,
 
     /// The journal index after which this event happened. This can be used to establish a total order between events and journal entries.

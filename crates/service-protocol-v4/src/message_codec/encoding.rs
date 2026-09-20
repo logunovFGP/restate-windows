@@ -18,14 +18,14 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use bytes_utils::SegmentedBuf;
 use tracing::warn;
 
-use restate_serde_util::ByteCount;
-use restate_types::service_protocol::ServiceProtocolVersion;
+use restate_types::{errors::GenericError, service_protocol::ServiceProtocolVersion};
+use restate_util_bytecount::ByteCount;
 
 #[derive(Debug, codederror::CodedError, thiserror::Error)]
 #[code(restate_errors::RT0012)]
 pub enum EncodingError {
-    #[error("cannot decode message type {0:?}. This looks like a bug of the SDK. Reason: {1:?}")]
-    DecodeMessage(MessageType, #[source] prost::DecodeError),
+    #[error("cannot decode message type {0:?}. Reason: {1:?}")]
+    MessageEncoding(MessageType, #[source] MessageEncodingError),
     #[error(transparent)]
     UnknownMessageType(#[from] UnknownMessageType),
     #[error("hit message size limit: {0} >= {1}")]
@@ -33,10 +33,87 @@ pub enum EncodingError {
     MessageSizeLimit(usize, NonZeroUsize),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum MessageEncodingError {
+    #[error("unknown service protocol version {0:?}")]
+    UnknownServiceProtocolVersion(ServiceProtocolVersion),
+    #[error("cannot encode message {0}")]
+    Encoding(
+        #[source]
+        #[from]
+        prost::EncodeError,
+    ),
+    #[error("cannot decode message {0}. This looks like a bug of the SDK.")]
+    Decoding(
+        #[source]
+        #[from]
+        prost::DecodeError,
+    ),
+    #[error(transparent)]
+    Generic(GenericError),
+}
+
+pub trait ServiceWireEncoder {
+    fn encode(
+        &self,
+        buf: &mut impl bytes::BufMut,
+        service_protocol_version: ServiceProtocolVersion,
+    ) -> Result<(), MessageEncodingError>;
+
+    fn encoded_len(&self, service_protocol_version: ServiceProtocolVersion) -> usize;
+}
+
+pub trait ServiceWireDecoder: Sized {
+    fn decode(
+        buf: impl bytes::Buf,
+        service_protocol_version: ServiceProtocolVersion,
+    ) -> Result<Self, MessageEncodingError>;
+}
+
+/// Implements [`ServiceWireEncoder`] and [`ServiceWireDecoder`] for the given protobuf message
+/// types by delegating directly to [`prost::Message`], ignoring the `service_protocol_version`.
+///
+/// Types that need version-specific encoding/decoding should implement the traits manually instead.
+macro_rules! default_encode_decode {
+    ($ty:ident) => {
+        impl crate::message_codec::ServiceWireEncoder for $ty {
+            fn encode(
+                &self,
+                buf: &mut impl bytes::BufMut,
+                _service_protocol_version: restate_types::service_protocol::ServiceProtocolVersion,
+            ) -> Result<(), crate::message_codec::MessageEncodingError> {
+                prost::Message::encode(self, buf).map_err(Into::into)
+            }
+
+            fn encoded_len(&self, _service_protocol_version: restate_types::service_protocol::ServiceProtocolVersion) -> usize {
+                prost::Message::encoded_len(self)
+            }
+        }
+
+        impl crate::message_codec::ServiceWireDecoder for $ty {
+            fn decode(
+                buf: impl bytes::Buf,
+                _service_protocol_version: restate_types::service_protocol::ServiceProtocolVersion,
+            ) -> Result<Self, crate::message_codec::MessageEncodingError> {
+                prost::Message::decode(buf).map_err(Into::into)
+            }
+        }
+    };
+    ($($ty:ident),*) => {
+        $($crate::message_codec::default_encode_decode!($ty);)*
+    }
+}
+
+pub(crate) use default_encode_decode;
 // --- Input message encoder
 
+// TODO: To reduce allocation overhead for small messages (completions, acks), we could
+//  re-introduce a small bounded arena (e.g. 4-8 KiB) that is reused across encode calls.
+//  The key constraint is that it must not grow unbounded — the previous arena retained the
+//  high-water-mark capacity (up to 32 MiB) for the entire invocation lifetime, wasting
+//  memory across thousands of concurrent long-lived invocations. See #4364.
 pub struct Encoder {
-    arena: BytesMut,
+    service_protocol_version: ServiceProtocolVersion,
 }
 
 impl Encoder {
@@ -47,55 +124,53 @@ impl Encoder {
             "A protocol version should be specified"
         );
         Self {
-            arena: BytesMut::with_capacity(1024),
+            service_protocol_version,
         }
     }
 
-    /// Encodes a message to bytes
+    /// Encodes a message to bytes.
+    ///
+    /// Each call allocates a right-sized buffer for the message. This avoids retaining a
+    /// high-water-mark arena that would hold memory for the lifetime of the encoder — which
+    /// matters when thousands of long-lived invocations each encoded one large message during
+    /// replay but only send small completions/acks afterwards.
+    // Todo: Once we merge thread-local buffer pools (https://github.com/restatedev/restate/pull/4366),
+    //  we can consider passing in a reusable buffer.
     pub fn encode(&mut self, msg: Message) -> Bytes {
-        self.arena.reserve(self.encoded_len(&msg));
-        self.encode_to_arena(msg).expect(
+        let len = 8 + msg.encoded_len(self.service_protocol_version);
+        let mut buf = BytesMut::with_capacity(len);
+        let header = generate_header(&msg, self.service_protocol_version);
+        buf.put_u64(header.into());
+        msg.encode(&mut buf, self.service_protocol_version).expect(
             "Encoding messages should be infallible, \
             this error indicates a bug in the invoker code. \
             Please contact the Restate developers.",
         );
-        self.arena.split().freeze()
+        buf.freeze()
     }
 
-    /// Encodes a raw message to bytes
+    /// Encodes a raw message to bytes.
+    ///
+    /// See [`Self::encode`] for why we allocate per call.
     pub fn encode_raw(&mut self, msg_ty: MessageType, content: Bytes) -> Bytes {
-        self.arena.reserve(8 + content.len());
         let len: u32 = content
             .len()
             .try_into()
             .expect("Protocol messages can't be larger than u32");
-        self.arena.put_u64(MessageHeader::new(msg_ty, len).into());
-        self.arena.put(content);
-        self.arena.split().freeze()
-    }
-
-    /// Includes header len
-    fn encoded_len(&self, msg: &Message) -> usize {
-        8 + msg.encoded_len()
-    }
-
-    #[inline(always)]
-    fn encode_to_arena(&mut self, msg: Message) -> Result<(), prost::EncodeError> {
-        let header = generate_header(&msg);
-        self.arena.put_u64(header.into());
-
-        // Note:
-        // prost::EncodeError can be triggered only by a buffer smaller than required,
-        // but because we create the buffer a couple of lines above using the size computed by prost,
-        // this can happen only if there is a very bad bug in prost.
-        msg.encode(&mut self.arena)
+        let mut buf = BytesMut::with_capacity(8 + content.len());
+        buf.put_u64(MessageHeader::new(msg_ty, len).into());
+        buf.put(content);
+        buf.freeze()
     }
 }
 
 #[inline(always)]
-fn generate_header(msg: &Message) -> MessageHeader {
+fn generate_header(
+    msg: &Message,
+    service_protocol_version: ServiceProtocolVersion,
+) -> MessageHeader {
     let len: u32 = msg
-        .encoded_len()
+        .encoded_len(service_protocol_version)
         .try_into()
         .expect("Protocol messages can't be larger than u32");
     let ty = msg.ty();
@@ -108,6 +183,7 @@ fn generate_header(msg: &Message) -> MessageHeader {
 pub struct Decoder {
     buf: SegmentedBuf<Bytes>,
     state: DecoderState,
+    service_protocol_version: ServiceProtocolVersion,
     message_size_warning: NonZeroUsize,
     message_size_limit: NonZeroUsize,
 }
@@ -126,6 +202,7 @@ impl Decoder {
         Self {
             buf: SegmentedBuf::new(),
             state: DecoderState::WaitingHeader,
+            service_protocol_version,
             message_size_warning,
             message_size_limit,
         }
@@ -151,6 +228,7 @@ impl Decoder {
 
             if let Some(res) = self.state.decode(
                 &mut self.buf,
+                self.service_protocol_version,
                 self.message_size_warning,
                 self.message_size_limit,
             )? {
@@ -178,6 +256,7 @@ impl DecoderState {
     fn decode(
         &mut self,
         mut buf: impl Buf,
+        service_protocol_version: ServiceProtocolVersion,
         message_size_warning: NonZeroUsize,
         message_size_limit: NonZeroUsize,
     ) -> Result<Option<(MessageHeader, Message)>, EncodingError> {
@@ -211,8 +290,11 @@ impl DecoderState {
             DecoderState::WaitingPayload(h) => {
                 let msg = h
                     .message_type()
-                    .decode(buf.take(h.frame_length() as usize))
-                    .map_err(|e| EncodingError::DecodeMessage(h.message_type(), e))?;
+                    .decode(
+                        buf.take(h.frame_length() as usize),
+                        service_protocol_version,
+                    )
+                    .map_err(|e| EncodingError::MessageEncoding(h.message_type(), e))?;
                 res = Some((h, msg));
                 DecoderState::WaitingHeader
             }
@@ -247,6 +329,9 @@ mod tests {
             10,
             Duration::ZERO,
             10,
+            None,
+            &LimitKey::None,
+            None,
         );
 
         let expected_msg_1 = Message::InputCommand(Bytes::from_static(b"123"));
@@ -320,10 +405,10 @@ mod tests {
 
         let mut encoder = Encoder::new(ServiceProtocolVersion::V1);
         let message = Message::InputCommand((0..=u8::MAX).collect::<Vec<_>>().into());
-        let expected_msg_size = message.encoded_len();
+        let expected_msg_size = message.encoded_len(ServiceProtocolVersion::V1);
         let msg = encoder.encode(message);
 
-        decoder.push(msg.clone());
+        decoder.push(msg);
         let_assert!(
             EncodingError::MessageSizeLimit(msg_size, limit) = decoder.consume_next().unwrap_err()
         );

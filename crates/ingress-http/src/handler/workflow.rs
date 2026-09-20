@@ -8,19 +8,21 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use super::Handler;
-use super::HandlerError;
-use super::path_parsing::WorkflowRequestType;
-
-use crate::RequestDispatcher;
 use bytes::Bytes;
 use http::{Method, Request, Response};
 use http_body_util::Full;
+use tracing::{trace, warn};
+
+use restate_types::errors::GenericError;
 use restate_types::identifiers::ServiceId;
 use restate_types::invocation::InvocationQuery;
 use restate_types::invocation::client::{AttachInvocationResponse, GetInvocationOutputResponse};
 use restate_types::schema::invocation_target::InvocationTargetResolver;
-use tracing::{info, warn};
+
+use super::Handler;
+use super::HandlerError;
+use super::path_parsing::WorkflowRequestType;
+use crate::RequestDispatcher;
 
 impl<Schemas, Dispatcher> Handler<Schemas, Dispatcher>
 where
@@ -33,16 +35,27 @@ where
         workflow_request_type: WorkflowRequestType,
     ) -> Result<Response<Full<Bytes>>, HandlerError>
     where
-        <B as http_body::Body>::Error: std::error::Error + Send + Sync + 'static,
+        <B as http_body::Body>::Error: Into<GenericError>,
     {
         match workflow_request_type {
             WorkflowRequestType::Attach(name, key) => {
-                self.handle_workflow_attach(req, ServiceId::new(name, key))
+                self.handle_workflow_attach(req, ServiceId::new(None, name.as_str(), key.as_str()))
                     .await
             }
             WorkflowRequestType::GetOutput(name, key) => {
-                self.handle_workflow_get_output(req, ServiceId::new(name, key))
-                    .await
+                self.handle_workflow_get_output(
+                    req,
+                    ServiceId::new(None, name.as_str(), key.as_str()),
+                )
+                .await
+            }
+            WorkflowRequestType::Status(name, key) => {
+                self.handle_invocation_get_status(
+                    req,
+                    InvocationQuery::Workflow(ServiceId::new(None, name.as_str(), key.as_str()))
+                        .to_invocation_id(),
+                )
+                .await
             }
         }
     }
@@ -53,14 +66,14 @@ where
         workflow_id: ServiceId,
     ) -> Result<Response<Full<Bytes>>, HandlerError>
     where
-        <B as http_body::Body>::Error: std::error::Error + Send + Sync + 'static,
+        <B as http_body::Body>::Error: Into<GenericError>,
     {
         // Check HTTP Method
         if req.method() != Method::GET {
             return Err(HandlerError::MethodNotAllowed);
         }
 
-        info!(
+        trace!(
             restate.workflow.id = %workflow_id,
             "Processing workflow attach request"
         );
@@ -69,13 +82,14 @@ where
         let response = match self
             .dispatcher
             .attach_invocation(InvocationQuery::Workflow(workflow_id.clone()))
-            .await?
+            .await
+            .map_err(HandlerError::GenericReadDispatcherError)?
         {
             AttachInvocationResponse::NotFound => {
                 return Err(HandlerError::InvocationNotFound);
             }
             AttachInvocationResponse::NotSupported => {
-                return Err(HandlerError::NotImplemented);
+                return Err(HandlerError::UnsupportedGetOutput);
             }
             AttachInvocationResponse::Ready(response) => response,
         };
@@ -97,7 +111,7 @@ where
         workflow_id: ServiceId,
     ) -> Result<Response<Full<Bytes>>, HandlerError>
     where
-        <B as http_body::Body>::Error: std::error::Error + Send + Sync + 'static,
+        <B as http_body::Body>::Error: Into<GenericError>,
     {
         // Check HTTP Method
         if req.method() != Method::GET {
@@ -123,7 +137,7 @@ where
                     "Failed to read output: {}",
                     e,
                 );
-                return Err(HandlerError::Unavailable);
+                return Err(HandlerError::GenericReadDispatcherError(e));
             }
         };
 

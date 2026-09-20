@@ -8,82 +8,91 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use super::*;
-use std::ops::RangeInclusive;
+use tokio::sync::mpsc;
+use tracing::trace;
 
-use restate_invoker_api::Effect;
-use restate_invoker_api::invocation_reader::InvocationReader;
-use restate_types::identifiers::PartitionKey;
+use restate_platform::hash::HashMap;
+use restate_types::identifiers::InvocationId;
+use restate_types::sharding::KeyRange;
+use restate_worker_api::invoker::{FencedEffect, invocation_reader::InvocationReader};
+
+use crate::InvocationStateMachine;
 
 /// Tree of [InvocationStateMachine] held by the [Service].
 #[derive(Debug)]
 pub(super) struct InvocationStateMachineManager<SR> {
-    partitions: HashMap<PartitionLeaderEpoch, PartitionInvocationStateMachineCoordinator<SR>>,
-}
-
-impl<SR> Default for InvocationStateMachineManager<SR> {
-    fn default() -> Self {
-        InvocationStateMachineManager {
-            partitions: Default::default(),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct PartitionInvocationStateMachineCoordinator<IR> {
-    output_tx: mpsc::Sender<Box<Effect>>,
+    output_tx: mpsc::Sender<FencedEffect>,
     invocation_state_machines: HashMap<InvocationId, InvocationStateMachine>,
-    partition_key_range: RangeInclusive<PartitionKey>,
-    storage_reader: IR,
+    _partition_key_range: KeyRange,
+    storage_reader: SR,
 }
 
-impl<IR> InvocationStateMachineManager<IR>
+impl<SR> InvocationStateMachineManager<SR>
 where
-    IR: InvocationReader + Clone + Send + Sync + 'static,
+    SR: InvocationReader + Clone + Send + Sync + 'static,
 {
     #[inline]
-    pub(super) fn has_partition(&self, partition: PartitionLeaderEpoch) -> bool {
-        self.partitions.contains_key(&partition)
+    pub(super) fn new(
+        partition_key_range: KeyRange,
+        storage_reader: SR,
+        sender: mpsc::Sender<FencedEffect>,
+    ) -> Self {
+        Self {
+            output_tx: sender,
+            invocation_state_machines: Default::default(),
+            _partition_key_range: partition_key_range,
+            storage_reader,
+        }
     }
 
     #[inline]
-    pub(super) fn partition_storage_reader(&self, partition: PartitionLeaderEpoch) -> Option<&IR> {
-        self.partitions.get(&partition).map(|p| &p.storage_reader)
+    pub(super) fn storage_reader(&self) -> &SR {
+        &self.storage_reader
     }
 
     #[inline]
-    pub(super) fn resolve_partition_sender(
-        &self,
-        partition: PartitionLeaderEpoch,
-    ) -> Option<&mpsc::Sender<Box<Effect>>> {
-        self.partitions.get(&partition).map(|p| &p.output_tx)
+    pub(super) fn partition_sender(&self) -> &mpsc::Sender<FencedEffect> {
+        &self.output_tx
     }
 
     #[inline]
     pub(super) fn resolve_invocation(
         &mut self,
-        partition: PartitionLeaderEpoch,
         invocation_id: &InvocationId,
-    ) -> Option<(&mpsc::Sender<Box<Effect>>, &mut InvocationStateMachine)> {
-        self.resolve_partition(partition).and_then(|p| {
-            p.invocation_state_machines
-                .get_mut(invocation_id)
-                .map(|ism| (&p.output_tx, ism))
-        })
+    ) -> Option<(&mpsc::Sender<FencedEffect>, &mut InvocationStateMachine)> {
+        self.invocation_state_machines
+            .get_mut(invocation_id)
+            .map(|ism| (&self.output_tx, ism))
+    }
+
+    /// Returns `true` if the in-flight state machine for `invocation_id` exists
+    /// but represents a *different* (newer) attempt than `fencing_token`.
+    ///
+    /// This fences output from an aborted task that is still draining out of the
+    /// task→invoker channel after the invocation has already been restarted: such
+    /// output must neither mutate the new attempt's state machine nor be emitted
+    /// as an effect stamped with the new attempt's epoch.
+    #[inline]
+    pub(super) fn is_stale_fencing_token(
+        &self,
+        invocation_id: &InvocationId,
+        fencing_token: restate_types::invocation::FencingToken,
+    ) -> bool {
+        self.invocation_state_machines
+            .get(invocation_id)
+            .is_some_and(|ism| ism.fencing_token != fencing_token)
     }
 
     #[inline]
     pub(super) fn handle_for_invocation<R>(
         &mut self,
-        partition: PartitionLeaderEpoch,
         invocation_id: &InvocationId,
-        f: impl FnOnce(&mpsc::Sender<Box<Effect>>, &mut InvocationStateMachine) -> R,
+        f: impl FnOnce(&mpsc::Sender<FencedEffect>, &mut InvocationStateMachine) -> R,
     ) -> Option<R> {
-        if let Some((tx, ism)) = self.resolve_invocation(partition, invocation_id) {
+        if let Some((tx, ism)) = self.resolve_invocation(invocation_id) {
             Some(f(tx, ism))
         } else {
-            // If no state machine
-            trace!("No state machine found for selected server header");
+            trace!("No state machine found for invocation {invocation_id}");
             None
         }
     }
@@ -91,86 +100,20 @@ where
     #[inline]
     pub(super) fn remove_invocation(
         &mut self,
-        partition: PartitionLeaderEpoch,
         invocation_id: &InvocationId,
-    ) -> Option<(&mpsc::Sender<Box<Effect>>, &IR, InvocationStateMachine)> {
-        self.resolve_partition(partition).and_then(|p| {
-            p.invocation_state_machines
-                .remove(invocation_id)
-                .map(|ism| (&p.output_tx, &p.storage_reader, ism))
-        })
+    ) -> Option<(&mpsc::Sender<FencedEffect>, &SR, InvocationStateMachine)> {
+        self.invocation_state_machines
+            .remove(invocation_id)
+            .map(|ism| (&self.output_tx, &self.storage_reader, ism))
     }
 
     #[inline]
-    pub(super) fn remove_partition(
-        &mut self,
-        partition: PartitionLeaderEpoch,
-    ) -> Option<HashMap<InvocationId, InvocationStateMachine>> {
-        self.partitions
-            .remove(&partition)
-            .map(|p| p.invocation_state_machines)
+    pub(super) fn remove_all(&mut self) -> HashMap<InvocationId, InvocationStateMachine> {
+        std::mem::take(&mut self.invocation_state_machines)
     }
 
     #[inline]
-    pub(super) fn register_partition(
-        &mut self,
-        partition: PartitionLeaderEpoch,
-        partition_key_range: RangeInclusive<PartitionKey>,
-        storage_reader: IR,
-        sender: mpsc::Sender<Box<Effect>>,
-    ) {
-        self.partitions.insert(
-            partition,
-            PartitionInvocationStateMachineCoordinator {
-                output_tx: sender,
-                invocation_state_machines: Default::default(),
-                partition_key_range,
-                storage_reader,
-            },
-        );
-    }
-
-    #[inline]
-    pub(super) fn register_invocation(
-        &mut self,
-        partition: PartitionLeaderEpoch,
-        id: InvocationId,
-        ism: InvocationStateMachine,
-    ) {
-        self.resolve_partition(partition)
-            .expect("Cannot register an invocation on an unknown partition")
-            .invocation_state_machines
-            .insert(id, ism);
-    }
-
-    #[inline]
-    pub(super) fn registered_partitions(&self) -> Vec<PartitionLeaderEpoch> {
-        self.partitions.keys().cloned().collect()
-    }
-
-    pub(super) fn registered_partitions_with_keys(
-        &self,
-        keys: RangeInclusive<PartitionKey>,
-    ) -> impl Iterator<Item = PartitionLeaderEpoch> + '_ {
-        self.partitions
-            .iter()
-            .filter_map(move |(partition_leader_epoch, coordinator)| {
-                // check that there is some intersection
-                if coordinator.partition_key_range.start() <= keys.end()
-                    && keys.start() <= coordinator.partition_key_range.end()
-                {
-                    Some(*partition_leader_epoch)
-                } else {
-                    None
-                }
-            })
-    }
-
-    #[inline]
-    fn resolve_partition(
-        &mut self,
-        partition: PartitionLeaderEpoch,
-    ) -> Option<&mut PartitionInvocationStateMachineCoordinator<IR>> {
-        self.partitions.get_mut(&partition)
+    pub(super) fn register_invocation(&mut self, id: InvocationId, ism: InvocationStateMachine) {
+        self.invocation_state_machines.insert(id, ism);
     }
 }

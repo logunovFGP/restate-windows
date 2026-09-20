@@ -570,7 +570,7 @@ mod tests {
     use crate::nodes_config::{NodeConfig, NodesConfiguration, Role, WorkerConfig, WorkerState};
     use crate::partitions::worker_candidate_filter;
     use crate::replication::{NodeSet, ReplicationProperty};
-    use crate::{GenerationalNodeId, PlainNodeId};
+    use crate::{GenerationalNodeId, PlainNodeId, RestateVersion};
 
     /// Generate a test address that works on the current platform
     fn test_address(id: PlainNodeId) -> String {
@@ -599,6 +599,7 @@ mod tests {
             .address(test_address(id).parse().unwrap())
             .roles(role.into())
             .worker_config(WorkerConfig { worker_state })
+            .binary_version(RestateVersion::current())
             .build()
     }
 
@@ -773,7 +774,7 @@ mod tests {
                 eq(true)
             );
             leaders.insert(nodeset.first().unwrap());
-            combined.extend(nodeset.into_iter());
+            combined.extend(nodeset);
         }
         // check how many leaders, we should see diversity
         assert_that!(leaders.len(), eq(9));
@@ -1080,7 +1081,7 @@ mod tests {
         ));
 
         // Now, regenerating...
-        let options = SelectorOptions::new(partition_id).with_preferred_nodes(nodeset1.clone());
+        let options = SelectorOptions::new(partition_id).with_preferred_nodes(nodeset1);
         let nodeset2 = BalancedSpreadSelector::select(
             &nodes_config,
             &replication,

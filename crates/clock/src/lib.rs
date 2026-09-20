@@ -12,6 +12,7 @@
 mod hlc;
 #[cfg(feature = "test-util")]
 mod mock_clock;
+pub mod rough_ts;
 #[cfg(feature = "hlc")]
 pub mod storage;
 pub mod time;
@@ -23,6 +24,7 @@ mod wall_clock;
 pub use hlc::HlcClock;
 #[cfg(feature = "test-util")]
 pub use mock_clock::MockClock;
+pub use rough_ts::RoughTimestamp;
 #[cfg(feature = "hlc")]
 pub use storage::{AtomicStorage, HlcClockStorage, LocalStorage};
 pub use unique_timestamp::{Error, UniqueTimestamp};
@@ -35,12 +37,12 @@ pub use wall_clock::WallClock;
 /// between precision and performance:
 ///
 /// - [`recent()`](Clock::recent): Returns a cached timestamp with ~100x better performance
-///   but potentially up to ~1ms stale (refreshed every 500μs by [`ClockUpkeep`]).
+///   but potentially up to ~2ms stale (refreshed every 1ms by [`ClockUpkeep`]).
 /// - [`now()`](Clock::now): Returns a precise timestamp via a `SystemTime::now()` syscall/vDSO.
 pub trait Clock {
-    /// Returns a cached unix timestamp that may be up to ~1ms stale.
+    /// Returns a cached unix timestamp that may be up to ~2ms stale.
     ///
-    /// This method reads from an atomic variable updated every 500μs by the
+    /// This method reads from an atomic variable updated every 1ms by the
     /// [`ClockUpkeep`] background thread, avoiding syscall/vDSO overhead.
     ///
     /// # Performance

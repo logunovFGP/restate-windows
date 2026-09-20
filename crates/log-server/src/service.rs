@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Context;
 use tracing::{debug, instrument, warn};
 
-use restate_core::network::tonic_service_filter::{TonicServiceFilter, WaitForReady};
+use restate_core::network::tonic_service_filter::{StatusInRange, TonicServiceFilter};
 use restate_core::network::{MessageRouterBuilder, NetworkServerBuilder};
 use restate_core::{Metadata, MetadataWriter, TaskCenter, TaskKind};
 use restate_metadata_store::{ReadWriteError, RetryError, retry_on_retryable_error};
@@ -29,7 +29,7 @@ use restate_types::protobuf::common::LogServerStatus;
 use crate::error::LogServerBuildError;
 use crate::grpc_svc_handler::LogServerSvcHandler;
 use crate::logstore::LogStore;
-use crate::metadata::{LogStoreMarker, LogletStateMap};
+use crate::metadata::{ActiveWorkerMap, LogStoreMarker, LogletStateMap};
 use crate::metric_definitions::describe_metrics;
 use crate::network::RequestPump;
 use crate::rocksdb_logstore::{RocksDbLogStore, RocksDbLogStoreBuilder};
@@ -40,6 +40,7 @@ pub struct LogServerService {
     request_processor: RequestPump,
     state_map: LogletStateMap,
     log_store: RocksDbLogStore,
+    active_worker_map: ActiveWorkerMap,
 }
 
 impl LogServerService {
@@ -76,12 +77,17 @@ impl LogServerService {
             TonicServiceFilter::new(
                 LogServerSvcHandler::new(log_store.clone(), state_map.clone())
                     .into_server(&updateable_config.live_load().networking),
-                WaitForReady::new(health_status.clone(), LogServerStatus::Ready),
+                StatusInRange::new(
+                    health_status.clone(),
+                    LogServerStatus::Ready,
+                    LogServerStatus::Failsafe,
+                ),
             ),
             crate::protobuf::FILE_DESCRIPTOR_SET,
         );
 
-        let request_processor = RequestPump::new(updateable_config, router_builder);
+        let request_processor = RequestPump::new(router_builder);
+        let active_worker_map = ActiveWorkerMap::default();
 
         Ok(Self {
             health_status,
@@ -89,7 +95,18 @@ impl LogServerService {
             request_processor,
             state_map,
             log_store,
+            active_worker_map,
         })
+    }
+
+    /// Returns a handle to the active loglet worker map for external introspection.
+    pub fn active_worker_map(&self) -> &ActiveWorkerMap {
+        &self.active_worker_map
+    }
+
+    /// Returns a handle to the loglet state cache for external introspection.
+    pub fn state_map(&self) -> &LogletStateMap {
+        &self.state_map
     }
 
     pub async fn start(self, mut metadata_writer: MetadataWriter) -> anyhow::Result<()> {
@@ -99,6 +116,7 @@ impl LogServerService {
             request_processor: request_pump,
             state_map,
             mut log_store,
+            active_worker_map,
         } = self;
 
         // Run log-store checks and self-provision if needed.
@@ -108,7 +126,13 @@ impl LogServerService {
         let _ = TaskCenter::spawn(
             TaskKind::LogServerRole,
             "log-server",
-            request_pump.run(health_status, log_store, state_map, storage_state),
+            request_pump.run(
+                health_status,
+                log_store,
+                state_map,
+                storage_state,
+                active_worker_map,
+            ),
         )?;
 
         Ok(())
@@ -265,9 +289,9 @@ impl LogServerService {
                                 // It cannot happen that there is a newer generation of me that changed the StorageState,
                                 // because then I would have failed before when retrieving my NodeConfig with my generational
                                 // node id.
-                                Err(StorageStateUpdateError::PreviousAttemptSucceeded(
+                                Err(StorageStateUpdateError::PreviousAttemptSucceeded(Box::new(
                                     nodes_config,
-                                ))
+                                )))
                             };
                         }
 
@@ -289,7 +313,7 @@ impl LogServerService {
             )))
             | Err(RetryError::RetriesExhausted(
                 StorageStateUpdateError::PreviousAttemptSucceeded(nodes_config),
-            )) => nodes_config,
+            )) => *nodes_config,
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!("failed to update this log-server's storage-state to {target_state}")
@@ -319,7 +343,7 @@ enum StorageStateUpdateError {
     )]
     NotInExpectedState(StorageState),
     #[error("succeeded updating NodesConfiguration in a previous attempt")]
-    PreviousAttemptSucceeded(NodesConfiguration),
+    PreviousAttemptSucceeded(Box<NodesConfiguration>),
     #[error(transparent)]
     MetadataStore(#[from] ReadWriteError),
 }

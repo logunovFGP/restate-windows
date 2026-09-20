@@ -29,6 +29,7 @@ mod networking;
 mod object_store;
 mod query_engine;
 mod rocksdb;
+mod throttling;
 mod worker;
 
 pub use admin::*;
@@ -49,10 +50,12 @@ pub use networking::*;
 pub use object_store::*;
 pub use query_engine::*;
 pub use rocksdb::*;
+pub use throttling::*;
 pub use worker::*;
 
 use std::fs;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
@@ -65,8 +68,122 @@ use crate::PlainNodeId;
 use crate::errors::GenericError;
 use crate::live::Live;
 use crate::live::LiveLoadExt;
-use crate::net::address::{AdminPort, AdvertisedAddress, FabricPort, HttpIngressPort};
 use crate::nodes_config::Role;
+
+static CPU_COUNT: LazyLock<NonZeroU32> = LazyLock::new(|| {
+    let cpu_count: u32 = num_cpus::get().try_into().unwrap_or(10);
+    // fallback to 10 threads if we can't determine the number of cpus
+    NonZeroU32::new(cpu_count).unwrap_or(NonZeroU32::new(10).unwrap())
+});
+
+/// Background work budget for a single database.
+#[derive(Debug, Clone, Copy)]
+pub struct BackgroundWorkBudget {
+    pub max_background_flushes: NonZeroU32,
+    pub max_background_compactions: NonZeroU32,
+}
+
+/// Computes the background work budget for partition-store and log-server databases.
+///
+/// The budget is split between partition-store (worker role) and log-server based on which
+/// roles are active on this node. Flushes are split equally (they are latency-critical and
+/// should not be starved), while compaction slots are weighted toward the partition-store
+/// (~65%) since it typically has many more column families generating compaction demand.
+///
+/// Metadata-server and local-loglet always get a fixed small budget (1 flush, 1 compaction).
+pub fn compute_background_work_budgets(
+    roles: &EnumSet<Role>,
+    rocksdb_high_priority_bg_threads: NonZeroU32,
+    rocksdb_low_priority_bg_threads: NonZeroU32,
+) -> BackgroundWorkBudgets {
+    // local-loglet never runs alongside log-server, so its slot is not counted against the
+    // shared pools below; it just gets a fixed minimal budget for the single-node case.
+    let local_loglet = BackgroundWorkBudget {
+        max_background_flushes: NonZeroU32::new(1).unwrap(),
+        max_background_compactions: NonZeroU32::new(1).unwrap(),
+    };
+
+    let has_metadata_server = roles.contains(Role::MetadataServer);
+    let has_worker = roles.contains(Role::Worker);
+    let has_log_server = roles.contains(Role::LogServer);
+
+    // ---- Flush budget ----
+    //
+    // Flushes run on the shared high-priority env thread pool. `max_background_flushes` only
+    // bounds how many flushes a database *schedules* concurrently; all scheduled flushes
+    // compete for the same pool with no per-db reservation. To guarantee no database ever
+    // queues for a flush thread, we keep the sum of all per-db flush budgets within the pool,
+    // carving it into non-overlapping shares:
+    //
+    //   - metadata-server: 1 reserved slot, but only when its role is active on this node.
+    //   - log-server: a single reserved slot. Its data CF uses atomic_flush with one flushing
+    //     CF, so it can never have more than one flush in flight. One slot fully utilises it,
+    //     and because the slot is reserved, its latency-critical flushes never wait behind the
+    //     partition-store's many-CF flush bursts.
+    //   - partition-store (worker): the remainder. It has one CF per partition and benefits
+    //     from real flush parallelism.
+    //
+    // local-loglet is excluded from the accounting: it never co-runs with log-server.
+    //
+    // On very small pools the remainder may collapse to 1; raise
+    // `rocksdb-high-priority-threads` to give the partition-store more flush parallelism.
+    let high_pri_pool = rocksdb_high_priority_bg_threads.get();
+    let metadata_flush_reserve = if has_metadata_server { 1 } else { 0 };
+    // virtually a single CF + atomic_flush => at most 2 flush jobs in flight
+    let log_server_flush_reserve = if has_log_server { 2 } else { 0 };
+
+    // partition-store gets the pool minus whatever reserves are actually active.
+    let worker_flushes = if has_worker {
+        high_pri_pool
+            .saturating_sub(metadata_flush_reserve + log_server_flush_reserve)
+            .max(1)
+    } else {
+        0
+    };
+
+    // Compute compaction budget: weighted split (worker ~65%, log-server ~35%)
+    // Compactions are throughput-heavy; the partition-store with many CFs needs the lion's share.
+    let total_compactions = rocksdb_low_priority_bg_threads.get();
+    // at least 2
+    let available_compactions = total_compactions.max(2);
+    let (worker_compactions, log_server_compactions) = match (has_worker, has_log_server) {
+        (true, true) => {
+            let worker_share = ((available_compactions as f64 * 0.65).ceil() as u32).max(2);
+            let log_server_share = available_compactions.saturating_sub(worker_share).max(2);
+            (worker_share, log_server_share)
+        }
+        (true, false) => (available_compactions, available_compactions),
+        (false, true) => (available_compactions, available_compactions),
+        (false, false) => (2, 2),
+    };
+
+    BackgroundWorkBudgets {
+        partition_store: BackgroundWorkBudget {
+            max_background_flushes: NonZeroU32::new(worker_flushes).unwrap_or(NonZeroU32::MIN),
+            max_background_compactions: NonZeroU32::new(worker_compactions)
+                .unwrap_or(NonZeroU32::MIN),
+        },
+        log_server: BackgroundWorkBudget {
+            max_background_flushes: NonZeroU32::MIN,
+            max_background_compactions: NonZeroU32::new(log_server_compactions)
+                .unwrap_or(NonZeroU32::MIN),
+        },
+        metadata_server: BackgroundWorkBudget {
+            max_background_flushes: NonZeroU32::MIN,
+            max_background_compactions: NonZeroU32::MIN,
+        },
+        local_loglet,
+    }
+}
+
+/// Pre-computed background work budgets for all database types.
+#[derive(Debug, Clone, Copy)]
+pub struct BackgroundWorkBudgets {
+    pub partition_store: BackgroundWorkBudget,
+    pub log_server: BackgroundWorkBudget,
+    pub metadata_server: BackgroundWorkBudget,
+    pub local_loglet: BackgroundWorkBudget,
+}
 
 /// Overrides production profile
 pub static PRODUCTION_PROFILE_DEFAULTS: LazyLock<Configuration> = LazyLock::new(|| {
@@ -188,6 +305,11 @@ pub struct Configuration {
 }
 
 impl Configuration {
+    /// The number of CPUs available to the current process.
+    pub fn num_cpus() -> NonZeroU32 {
+        *CPU_COUNT
+    }
+
     /// A default configuration that exclusively uses unix sockets.
     ///
     /// Test-only constructor. On platforms without unix domain sockets it falls back to
@@ -203,10 +325,14 @@ impl Configuration {
             .common
             .set_derived_values(&config.networking)
             .unwrap();
-        config.worker.set_derived_values(&config.networking);
+        config
+            .worker
+            .set_derived_values(&config.common, &config.networking);
         config.bifrost.set_derived_values(&config.networking);
         config.admin.set_derived_values(&config.common);
-        config.ingress.set_derived_values(&config.common);
+        config
+            .ingress
+            .set_derived_values(&config.common, &config.networking);
         config
     }
 
@@ -217,31 +343,27 @@ impl Configuration {
         Self::new_random_ports()
     }
 
-    /// The advertised addresses pinned by [`Self::pin_listeners_to_tcp`], if any.
+    /// The sockets pinned by [`Self::pin_listeners_to_tcp`], if any.
     ///
-    /// Each is `None` when nothing was pinned, in which case the caller falls back to
-    /// whatever it would normally infer.
+    /// Each is `None` when nothing was pinned. Callers derive an advertised address from
+    /// these, choosing the scheme from the fabric TLS mode at the time they read it.
     #[allow(clippy::type_complexity)]
-    pub fn pinned_advertised_addresses(
+    pub fn pinned_bind_sockets(
         &self,
-    ) -> (
-        Option<AdvertisedAddress<FabricPort>>,
-        Option<AdvertisedAddress<AdminPort>>,
-        Option<AdvertisedAddress<HttpIngressPort>>,
-    ) {
+    ) -> (Option<SocketAddr>, Option<SocketAddr>, Option<SocketAddr>) {
         (
             self.common
                 .fabric_listener_options
-                .configured_advertised_address()
-                .cloned(),
+                .configured_bind_address()
+                .map(|a| *a.inner()),
             self.admin
                 .admin_listener_options
-                .configured_advertised_address()
-                .cloned(),
+                .configured_bind_address()
+                .map(|a| *a.inner()),
             self.ingress
                 .ingress_listener_options
-                .configured_advertised_address()
-                .cloned(),
+                .configured_bind_address()
+                .map(|a| *a.inner()),
         )
     }
 
@@ -272,10 +394,14 @@ impl Configuration {
             .common
             .set_derived_values(&config.networking)
             .unwrap();
-        config.worker.set_derived_values(&config.networking);
+        config
+            .worker
+            .set_derived_values(&config.common, &config.networking);
         config.bifrost.set_derived_values(&config.networking);
         config.admin.set_derived_values(&config.common);
-        config.ingress.set_derived_values(&config.common);
+        config
+            .ingress
+            .set_derived_values(&config.common, &config.networking);
         config
     }
 
@@ -329,6 +455,24 @@ impl Configuration {
         self.bifrost.set_derived_values(&self.networking);
         self.metadata_server.apply_common(&self.common);
         self.log_server.apply_common(&self.common);
+
+        // Compute and apply role-aware background work budgets for all databases.
+        let budgets = compute_background_work_budgets(
+            &self.common.roles,
+            self.common.rocksdb_high_priority_bg_threads(),
+            self.common.rocksdb_low_priority_bg_threads(),
+        );
+        self.worker
+            .storage
+            .apply_background_work_budget(&budgets.partition_store);
+        self.log_server
+            .apply_background_work_budget(&budgets.log_server);
+        self.metadata_server
+            .apply_background_work_budget(&budgets.metadata_server);
+        self.bifrost
+            .local
+            .apply_background_work_budget(&budgets.local_loglet);
+
         self
     }
 
@@ -404,6 +548,43 @@ pub enum InvalidConfigurationError {
     RequiredNodeName(String),
 }
 
+/// Migrates a single field from a deprecated config location to its new one.
+///
+/// `deprecated` is `Some` iff the user set the field at the old location (the all-Option shadow
+/// type the deprecated location deserializes into makes this unambiguous). When set, the value
+/// is moved into `new` and a deprecation warning is printed — even if the new location also has
+/// a value, the deprecated one wins so the user's prior effective behavior is preserved during
+/// the migration window.
+fn apply_deprecated_field<T>(
+    new: &mut T,
+    deprecated: Option<T>,
+    new_base: &str,
+    field: &'static str,
+    new_field: Option<&'static str>,
+) {
+    if let Some(value) = deprecated {
+        let new_field = new_field.unwrap_or(field);
+        print_warning_deprecated_config_option(field, Some(&format!("{new_base}.{new_field}")));
+        *new = value;
+    }
+}
+
+/// Same as [`apply_deprecated_field`], but for canonical fields that are themselves `Option<T>`.
+/// The shadow side carries `Option<T>` (single layer) using `Some` as the "user set this" flag.
+fn apply_deprecated_field_optional<T>(
+    new: &mut Option<T>,
+    deprecated: Option<T>,
+    new_base: &str,
+    field: &str,
+    new_field: Option<&'static str>,
+) {
+    if deprecated.is_some() {
+        let new_field = new_field.unwrap_or(field);
+        print_warning_deprecated_config_option(field, Some(&format!("{new_base}.{new_field}")));
+        *new = deprecated;
+    }
+}
+
 #[allow(dead_code)]
 fn print_warning_deprecated_config_option(deprecated: &str, replacement: Option<&str>) {
     // we can't use tracing since config loading happens before tracing is initialized
@@ -442,7 +623,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_read_subdirs_did_not_exist() {
+    fn read_subdirs_did_not_exist() {
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_dir_path = temp_dir.path().to_path_buf();
         assert!(fs::remove_dir(temp_dir).is_ok());
@@ -450,14 +631,14 @@ mod tests {
     }
 
     #[test]
-    fn test_read_subdirs_empty() {
+    fn read_subdirs_empty() {
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_dir_path = temp_dir.path().to_path_buf();
         assert!(read_subdirs(&temp_dir_path).is_empty());
     }
 
     #[test]
-    fn test_read_subdirs_with_subdirs_and_files() {
+    fn read_subdirs_with_subdirs_and_files() {
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_dir_path = temp_dir.path().to_path_buf();
 
@@ -476,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn test_configuration_validate_empty_base_dir() {
+    fn configuration_validate_empty_base_dir() {
         let mut config = Configuration::default();
         assert!(config.validate().is_ok());
 
@@ -487,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn test_configuration_validate_base_dir_one_subdir() {
+    fn configuration_validate_base_dir_one_subdir() {
         let mut config = Configuration::default();
         assert!(config.validate().is_ok());
 
@@ -505,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn test_configuration_validate_base_dir_multi_subdir() {
+    fn configuration_validate_base_dir_multi_subdir() {
         let mut config = Configuration::default();
         assert!(config.validate().is_ok());
 

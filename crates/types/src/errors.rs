@@ -14,84 +14,10 @@ use std::fmt;
 use tonic;
 use tracing::Level;
 
+// Re-exports the error traits from restate platform to avoid mass-migration of existing code.
+pub use restate_platform::errors::*;
+
 use restate_encoding::BilrostNewType;
-
-/// Error type which abstracts away the actual [`std::error::Error`] type. Use this type
-/// if you don't know the actual error type or if it is not important.
-pub type GenericError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-pub type BoxedMaybeRetryableError = Box<dyn MaybeRetryableError + Send + Sync>;
-
-/// Tells whether an error should be retried by upper layers or not.
-pub trait MaybeRetryableError: std::error::Error + 'static {
-    /// Signal upper layers whether this error should be retried or not.
-    fn retryable(&self) -> bool {
-        false
-    }
-}
-
-static_assertions::assert_obj_safe!(MaybeRetryableError);
-
-pub trait IntoMaybeRetryable: Sized {
-    /// Marks the error marked as retryable
-    fn into_retryable(self) -> RetryableError<Self> {
-        RetryableError(self)
-    }
-
-    /// Marks the error marked as non-retryable
-    fn into_terminal(self) -> TerminalError<Self> {
-        TerminalError(self)
-    }
-}
-
-impl<T> IntoMaybeRetryable for T where
-    T: fmt::Debug + fmt::Display + Send + Sync + std::error::Error + 'static
-{
-}
-
-/// Wraps any source error and marks it as retryable
-#[derive(Debug, thiserror::Error, derive_more::Deref, derive_more::From)]
-pub struct RetryableError<T>(#[source] T);
-
-/// Wraps any source error and marks it as non-retryable
-#[derive(Debug, thiserror::Error, derive_more::Deref, derive_more::From)]
-pub struct TerminalError<T>(#[source] T);
-
-impl<T> MaybeRetryableError for RetryableError<T>
-where
-    T: std::error::Error + 'static,
-{
-    fn retryable(&self) -> bool {
-        true
-    }
-}
-
-impl<T> MaybeRetryableError for TerminalError<T>
-where
-    T: std::error::Error + 'static,
-{
-    fn retryable(&self) -> bool {
-        false
-    }
-}
-
-impl<T> fmt::Display for RetryableError<T>
-where
-    T: fmt::Debug + fmt::Display + std::error::Error,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[retryable] {}", self.0)
-    }
-}
-
-impl<T> fmt::Display for TerminalError<T>
-where
-    T: fmt::Debug + fmt::Display + std::error::Error + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[terminal] {}", self.0)
-    }
-}
 
 #[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, BilrostNewType)]
 #[serde(transparent)]
@@ -165,14 +91,20 @@ pub mod codes {
     codes!(
         BAD_REQUEST 400 "Bad request",
         NOT_FOUND 404 "Not found",
-        INTERNAL 500 "Internal",
+        // Aborted is used for cancel/kill
         ABORTED 409 "Aborted",
+        // Conflict is used for promise already completed, workflow already running
+        CONFLICT 409 "Conflict",
         GONE 410 "Gone",
+        NOT_READY 470 "Not ready",
         UNSUPPORTED_MEDIA_TYPE 415 "Unsupported media type",
+        // The 500 range in this list should remain in sync with
+        // https://github.com/restatedev/sdk-shared-core/blob/435557dfb8edd0987cd4a9632e15381bd07c36d0/src/vm/errors.rs#L69
+        INTERNAL 500 "Internal",
         JOURNAL_MISMATCH 570 "Journal mismatch",
         PROTOCOL_VIOLATION 571 "Protocol violation",
-        CONFLICT 409 "Conflict",
-        NOT_READY 470 "Not ready",
+        AWAITING_TWO_ASYNC_RESULTS 572 "Awaiting two async results",
+        UNSUPPORTED_FEATURE 573 "Unsupported feature",
     );
 }
 
@@ -380,12 +312,20 @@ pub enum IdDecodeError {
     UnrecognizedType(String),
 }
 
+impl From<IdDecodeError> for ConversionError {
+    fn from(value: IdDecodeError) -> Self {
+        ConversionError::invalid_data(value)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConversionError {
     #[error("missing field '{0}'")]
     MissingField(&'static str),
+    #[error("unexpected enum variant {1} for field '{0}'")]
+    UnexpectedEnumVariant(&'static str, i32),
     #[error("invalid data '{0}'")]
-    InvalidData(&'static str),
+    InvalidData(anyhow::Error),
 }
 
 impl ConversionError {
@@ -393,8 +333,16 @@ impl ConversionError {
         ConversionError::MissingField(field)
     }
 
-    pub fn invalid_data(field: &'static str) -> Self {
-        ConversionError::InvalidData(field)
+    pub fn invalid_data(source: impl Into<anyhow::Error>) -> Self {
+        ConversionError::InvalidData(source.into())
+    }
+
+    pub fn invalid_data_static(field: &'static str) -> Self {
+        ConversionError::InvalidData(anyhow::anyhow!(field))
+    }
+
+    pub fn unexpected_enum_variant(field: &'static str, variant: impl Into<i32>) -> Self {
+        ConversionError::UnexpectedEnumVariant(field, variant.into())
     }
 }
 
@@ -452,13 +400,31 @@ impl std::error::Error for SimpleStatus {
     }
 }
 
+/// Check if a gRPC status represents a retryable error.
+///
+/// Transport errors can manifest in different ways:
+/// - `Unknown`: General transport errors
+/// - `Unavailable`: Server is not reachable or temporarily unable to serve
+/// - `Cancelled`: Connection was terminated (common with UDS when server is killed)
+/// - `Internal` with h2 errors: HTTP/2 protocol errors (e.g., connection reset, stream errors)
+pub fn is_retryable_status(status: &tonic::Status) -> bool {
+    match status.code() {
+        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Cancelled => true,
+        tonic::Code::Internal => {
+            let message = status.message();
+            message.contains("h2 protocol error") || message.contains("http2 error")
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tonic::Code;
 
     #[test]
-    fn test_simple_status_display() {
+    fn simple_status_display() {
         let status = tonic::Status::new(Code::NotFound, "Resource not found");
         let simple_status = SimpleStatus(status);
         assert_eq!(
@@ -468,14 +434,14 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_status_from_tonic() {
+    fn simple_status_from_tonic() {
         let tonic_status = tonic::Status::new(Code::Internal, "Internal error");
-        let simple_status: SimpleStatus = tonic_status.clone().into();
+        let simple_status: SimpleStatus = tonic_status.into();
         assert_eq!(simple_status.to_string(), "Internal error: Internal error");
     }
 
     #[test]
-    fn test_simple_status_as_ref() {
+    fn simple_status_as_ref() {
         let tonic_status = tonic::Status::new(Code::InvalidArgument, "Invalid argument");
         let simple_status = SimpleStatus(tonic_status.clone());
         assert_eq!(simple_status.as_ref().code(), tonic_status.code());
@@ -483,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_status_into_tonic() {
+    fn simple_status_into_tonic() {
         let tonic_status = tonic::Status::new(Code::Unauthenticated, "Unauthenticated");
         let simple_status = SimpleStatus(tonic_status.clone());
         let converted: tonic::Status = simple_status.into();
@@ -492,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_status_omits_details_and_metadata() {
+    fn simple_status_omits_details_and_metadata() {
         let mut status = tonic::Status::new(Code::Internal, "Error message");
 
         status

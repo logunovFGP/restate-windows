@@ -11,8 +11,8 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use restate_serde_util::NonZeroByteCount;
-use restate_time_util::NonZeroFriendlyDuration;
+use restate_util_bytecount::NonZeroByteCount;
+use restate_util_time::NonZeroFriendlyDuration;
 
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -21,6 +21,7 @@ use crate::retries::RetryPolicy;
 
 /// The default maximum size for messages (32 MiB).
 pub const DEFAULT_MESSAGE_SIZE_LIMIT: NonZeroUsize = NonZeroUsize::new(32 * 1024 * 1024).unwrap();
+pub const DEFAULT_FABRIC_MEMORY_LIMIT: NonZeroUsize = NonZeroUsize::new(64 * 1024 * 1024).unwrap();
 
 /// # Networking options
 ///
@@ -49,9 +50,20 @@ pub struct NetworkingOptions {
     pub handshake_timeout: NonZeroFriendlyDuration,
 
     /// # HTTP/2 Keep Alive Interval
+    ///
+    /// Interval at which HTTP/2 PING frames are sent on node-to-node
+    /// connections, to keep them alive and to detect peers that have become
+    /// unreachable.
+    ///
+    /// Applies both to the gRPC channels a node opens to its peers and to the
+    /// connections it accepts from them.
     pub http2_keep_alive_interval: NonZeroFriendlyDuration,
 
     /// # HTTP/2 Keep Alive Timeout
+    ///
+    /// How long to wait for a peer to acknowledge a keep-alive PING on a
+    /// node-to-node connection. If the acknowledgement does not arrive within
+    /// this timeout, the connection is closed and re-established.
     pub http2_keep_alive_timeout: NonZeroFriendlyDuration,
 
     /// # HTTP/2 Adaptive Window
@@ -89,6 +101,19 @@ pub struct NetworkingOptions {
         skip_serializing_if = "is_default_message_size_limit"
     )]
     pub message_size_limit: NonZeroByteCount,
+
+    /// # Global Fabric Memory Limit
+    ///
+    /// This sets the memory limit for all in-flight fabric services that don't own dedicated
+    /// memory pools. The memory limit will be sanitized to the configured `message-size-limit`
+    /// if smaller.
+    ///
+    /// Default: `64MiB`
+    #[serde(
+        default = "default_fabric_memory_limit",
+        skip_serializing_if = "is_default_fabric_memory_limit"
+    )]
+    fabric_memory_limit: NonZeroByteCount,
 }
 
 const fn default_message_size_limit() -> NonZeroByteCount {
@@ -98,9 +123,18 @@ const fn default_message_size_limit() -> NonZeroByteCount {
 fn is_default_message_size_limit(value: &NonZeroByteCount) -> bool {
     value.as_non_zero_usize() == DEFAULT_MESSAGE_SIZE_LIMIT
 }
+
+const fn default_fabric_memory_limit() -> NonZeroByteCount {
+    NonZeroByteCount::new(DEFAULT_FABRIC_MEMORY_LIMIT)
+}
+
+fn is_default_fabric_memory_limit(value: &NonZeroByteCount) -> bool {
+    value.as_non_zero_usize() == DEFAULT_FABRIC_MEMORY_LIMIT
+}
+
 impl NetworkingOptions {
     pub fn stream_window_size(&self) -> u32 {
-        // santize to 500MiB if set higher
+        // sanitize to 500MiB if set higher
         let stream_window_size = self.data_stream_window_size.as_u64().min(500 * 1024 * 1024); // Sanitize to 500MiB if set higher.
 
         u32::try_from(stream_window_size).expect("window size too big")
@@ -108,6 +142,10 @@ impl NetworkingOptions {
 
     pub fn connection_window_size(&self) -> u32 {
         self.stream_window_size() * 3
+    }
+
+    pub fn fabric_memory_limit(&self) -> NonZeroByteCount {
+        self.fabric_memory_limit.max(self.message_size_limit)
     }
 }
 
@@ -131,6 +169,7 @@ impl Default for NetworkingOptions {
                 NonZeroUsize::new(2 * 1024 * 1024).expect("Non zero number"),
             ),
             message_size_limit: default_message_size_limit(),
+            fabric_memory_limit: default_fabric_memory_limit(),
         }
     }
 }

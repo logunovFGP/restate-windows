@@ -10,31 +10,20 @@
 
 mod builder;
 mod consumer_task;
-mod legacy;
 mod metric_definitions;
+mod oauth;
 mod subscription_controller;
 
 use rdkafka::error::KafkaError;
 use tokio::sync::mpsc;
 
-use restate_bifrost::Bifrost;
-use restate_core::network::TransportConnect;
-use restate_ingestion_client::IngestionClient;
-use restate_types::{
-    config::{Configuration, IngressOptions},
-    identifiers::SubscriptionId,
-    live::{Live, LiveLoad},
-    partitions::PartitionTableError,
-    schema::{Schema, subscriptions::Subscription},
-};
-use restate_wal_protocol::Envelope;
-use tracing::debug;
+use restate_ingestion_client::IngestionError;
+use restate_types::schema::kafka::KafkaCluster;
+use restate_types::schema::subscriptions::Subscription;
 
 #[derive(Debug)]
 pub enum Command {
-    StartSubscription(Subscription),
-    StopSubscription(SubscriptionId),
-    UpdateSubscriptions(Vec<Subscription>),
+    UpdateSubscriptions(Vec<KafkaCluster>, Vec<Subscription>),
 }
 
 pub type SubscriptionCommandSender = mpsc::Sender<Command>;
@@ -45,7 +34,7 @@ pub enum Error {
     #[error(transparent)]
     Kafka(#[from] KafkaError),
     #[error(
-        "error processing message subscription {subscription} topic {topic} partition {partition} offset {offset}: {cause}"
+        "Error processing message subscription {subscription} topic {topic} partition {partition} offset {offset}: {cause}"
     )]
     Event {
         subscription: String,
@@ -55,16 +44,14 @@ pub enum Error {
         #[source]
         cause: anyhow::Error,
     },
-    #[error("ingress stream is closed")]
-    IngestionClosed,
-    #[error(transparent)]
-    PartitionTableError(#[from] PartitionTableError),
+    #[error("Ingress error: {0}")]
+    IngestionError(#[from] IngestionError),
     #[error(
-        "received a message on the main partition queue for topic {0} partition {1} despite partitioned queues"
+        "Received a message on the main partition queue for topic {0} partition {1} despite partitioned queues"
     )]
     UnexpectedMainQueueMessage(String, i32),
     #[error(
-        "consumption task exited unexpectedly for subscription '{subscription}', topic: {topic} and partition: {partition}"
+        "Consumption task exited unexpectedly for subscription '{subscription}', topic: {topic} and partition: {partition}"
     )]
     UnexpectedConsumptionTaskExited {
         subscription: String,
@@ -73,58 +60,4 @@ pub enum Error {
     },
 }
 
-enum ServiceInner<T> {
-    Legacy(legacy::Service<T>),
-    IngestionClient(subscription_controller::Service<T>),
-}
-
-pub struct Service<T> {
-    inner: ServiceInner<T>,
-}
-
-impl<T> Service<T>
-where
-    T: TransportConnect,
-{
-    pub fn new(
-        bifrost: Bifrost,
-        ingestion: IngestionClient<T, Envelope>,
-        schema: Live<Schema>,
-    ) -> Self {
-        let batch_ingestion = Configuration::pinned()
-            .common
-            .experimental_kafka_batch_ingestion;
-
-        let inner = if batch_ingestion {
-            debug!("Using kafka experimental batch ingestion mechanism");
-            ServiceInner::IngestionClient(subscription_controller::Service::new(ingestion, schema))
-        } else {
-            debug!("Using kafka legacy ingestion mechanism");
-            ServiceInner::Legacy(legacy::Service::new(
-                ingestion.networking().clone(),
-                ingestion.partition_routing().clone(),
-                bifrost,
-                schema,
-            ))
-        };
-
-        Self { inner }
-    }
-
-    pub fn create_command_sender(&self) -> SubscriptionCommandSender {
-        match &self.inner {
-            ServiceInner::Legacy(svc) => svc.create_command_sender(),
-            ServiceInner::IngestionClient(svc) => svc.create_command_sender(),
-        }
-    }
-
-    pub async fn run(
-        self,
-        updateable_config: impl LiveLoad<Live = IngressOptions>,
-    ) -> anyhow::Result<()> {
-        match self.inner {
-            ServiceInner::Legacy(svc) => svc.run(updateable_config).await,
-            ServiceInner::IngestionClient(svc) => svc.run(updateable_config).await,
-        }
-    }
-}
+pub use subscription_controller::Service;

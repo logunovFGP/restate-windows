@@ -54,7 +54,7 @@ spec:
           args:
             {{- toYaml . | nindent 12 }}
           {{- end}}
-          image: {{ .Values.image.repository }}:{{ include "restate.tag" . }}
+          image: {{ include "restate.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
@@ -129,6 +129,10 @@ spec:
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
   # It's important to start multiple pods at the same time in case multiple pods died. Otherwise, we risk

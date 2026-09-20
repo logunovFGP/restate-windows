@@ -8,7 +8,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -21,14 +21,13 @@ use serde::{Deserialize, Serialize};
 pub trait ListenerPort: Clone + PartialEq + Eq {
     const NAME: &'static str;
     const DEFAULT_PORT: u16;
+    const SUPPORTS_TLS: bool = false;
 
     const UDS_NAME: &'static str;
     /// Whether this port allows binding on an anonymous unix-socket or not.
     const IS_ANONYMOUS_UDS_ALLOWED: bool;
 
-    fn default_port_str() -> &'static str {
-        stringify!(Self::DEFAULT_PORT)
-    }
+    fn default_port_str() -> &'static str;
 }
 
 /// Implemented on ports that support gRPC protocol
@@ -48,6 +47,9 @@ impl ListenerPort for HttpIngressPort {
     const DEFAULT_PORT: u16 = 8080;
     const UDS_NAME: &'static str = "ingress.sock";
     const IS_ANONYMOUS_UDS_ALLOWED: bool = true;
+    fn default_port_str() -> &'static str {
+        "8080"
+    }
 }
 
 /// Admin HTTP Service 9070
@@ -60,6 +62,9 @@ impl ListenerPort for AdminPort {
     const DEFAULT_PORT: u16 = 9070;
     const UDS_NAME: &'static str = "admin.sock";
     const IS_ANONYMOUS_UDS_ALLOWED: bool = true;
+    fn default_port_str() -> &'static str {
+        "9070"
+    }
 }
 
 /// gRPC port for control and introspection
@@ -72,6 +77,9 @@ impl ListenerPort for ControlPort {
     const DEFAULT_PORT: u16 = 5122;
     const UDS_NAME: &'static str = "control.sock";
     const IS_ANONYMOUS_UDS_ALLOWED: bool = true;
+    fn default_port_str() -> &'static str {
+        "5122"
+    }
 }
 impl GrpcPort for ControlPort {}
 
@@ -82,10 +90,14 @@ pub struct FabricPort;
 impl ListenerPort for FabricPort {
     const NAME: &'static str = "message-fabric-server";
     const DEFAULT_PORT: u16 = 5122;
+    const SUPPORTS_TLS: bool = true;
     const UDS_NAME: &'static str = "fabric.sock";
     // this is disallowed for the message fabric since we must be able to acquire a
     // non-anonymous socket address to allow server-to-server communication.
     const IS_ANONYMOUS_UDS_ALLOWED: bool = false;
+    fn default_port_str() -> &'static str {
+        "5122"
+    }
 }
 impl GrpcPort for FabricPort {}
 
@@ -97,6 +109,9 @@ impl ListenerPort for TokioConsolePort {
     const DEFAULT_PORT: u16 = 6669;
     const UDS_NAME: &'static str = "tokio.sock";
     const IS_ANONYMOUS_UDS_ALLOWED: bool = false;
+    fn default_port_str() -> &'static str {
+        "6669"
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, derive_more::Display)]
@@ -138,7 +153,7 @@ pub struct BindAddress<P: ListenerPort> {
 }
 
 /// Local interface address to listen on (INET sockets only)
-/// tcp: bind_address (0.0.0.0:5122)
+/// tcp: bind_address ([::]:5122)
 impl<P: ListenerPort> BindAddress<P> {
     pub const fn new(addr: SocketAddr) -> Self {
         Self {
@@ -148,10 +163,12 @@ impl<P: ListenerPort> BindAddress<P> {
     }
 
     /// If `use_random_port` is true, the port will be chosen randomly unless `port` is set.
+    /// When no IP is specified, defaults to `::` (IPv6 unspecified) which on most systems
+    /// creates a dual-stack socket accepting both IPv4 and IPv6 connections.
     pub fn from_parts(ip: Option<IpAddr>, port: Option<u16>, use_random_port: bool) -> Self {
         Self {
             inner: SocketAddr::new(
-                ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+                ip.unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
                 port.unwrap_or(if use_random_port { 0 } else { P::DEFAULT_PORT }),
             ),
             _phantom: std::marker::PhantomData,
@@ -209,7 +226,7 @@ impl<P: ListenerPort> schemars::JsonSchema for BindAddress<P> {
             P::DEFAULT_PORT,
             P::UDS_NAME
         ),
-            "examples": [format!("0.0.0.0:{}", P::DEFAULT_PORT), format!("127.0.0.1:{}", P::DEFAULT_PORT)]
+            "examples": [format!("[::]:{}",P::DEFAULT_PORT), format!("0.0.0.0:{}", P::DEFAULT_PORT), format!("127.0.0.1:{}", P::DEFAULT_PORT)]
         })
     }
 }
@@ -255,6 +272,11 @@ impl PeerNetAddress {
     /// Returns true if this is an HTTP address
     pub fn is_http(&self) -> bool {
         matches!(self, PeerNetAddress::Http(_))
+    }
+
+    /// Returns true if this address uses the `https` scheme (TLS).
+    pub fn is_tls(&self) -> bool {
+        matches!(self, PeerNetAddress::Http(uri) if uri.scheme() == Some(&http::uri::Scheme::HTTPS))
     }
 }
 
@@ -344,7 +366,12 @@ impl<P: ListenerPort> Default for AdvertisedAddress<P> {
 }
 
 impl<P: ListenerPort> AdvertisedAddress<P> {
-    pub fn derive_from_bind_address(address: SocketAddress, advertised_host: Option<&str>) -> Self {
+    pub fn derive_from_bind_address(
+        address: SocketAddress,
+        advertised_host: Option<&str>,
+        tls: bool,
+    ) -> Self {
+        let scheme = if tls { "https" } else { "http" };
         let inner = match address {
             SocketAddress::Socket(address) => {
                 let routable_ip = || {
@@ -365,21 +392,19 @@ impl<P: ListenerPort> AdvertisedAddress<P> {
                 // do we have an input hostname?
                 let hostname = advertised_host.unwrap_or_else(|| routable_ip());
                 PeerNetAddress::Http(
-                    format!("http://{hostname}:{}", address.port())
+                    format!("{scheme}://{hostname}:{}", address.port())
                         .parse()
                         .expect("valid uri"),
                 )
             }
-            SocketAddress::Uds(path) => {
-                // it's a UDS address, we'll use the path.
-                PeerNetAddress::Uds(path)
-            }
+            // it's a UDS address, we'll use the path.
+            SocketAddress::Uds(path) => PeerNetAddress::Uds(path),
             SocketAddress::Anonymous => {
                 // In case this is an anonymous unix-socket, we'll fallback to a generic
                 // localhost-based address without a port. The assumption is the caller
                 // will proxy their request through the unix-socket and the host+scheme
                 // part of the URI will be ignored by the server.
-                PeerNetAddress::Http("http://localhost".parse().expect("valid uri"))
+                PeerNetAddress::Http(format!("{scheme}://localhost").parse().expect("valid uri"))
             }
         };
 
@@ -493,6 +518,16 @@ impl<P: ListenerPort> AdvertisedAddress<P> {
 
         Ok(PeerNetAddress::Http(Uri::from_parts(parts)?))
     }
+
+    /// Should used carefully, this makes one address from a given listener port act
+    /// as if it was another listener port. Used when we want to fallback from one address type to
+    /// another.
+    pub(crate) fn coerce<T: ListenerPort>(self) -> AdvertisedAddress<T> {
+        AdvertisedAddress {
+            inner: self.inner,
+            _phantom: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<P: ListenerPort> FromStr for AdvertisedAddress<P> {
@@ -526,33 +561,37 @@ impl<P: ListenerPort> FromStr for AdvertisedAddress<P> {
 }
 
 /// A helper function that attempts to derive the public routable IP address of
-/// the local machine. Falls back to `127.0.0.1` if the guessing fails.
+/// the local machine. Tries IPv6 first, then falls back to IPv4 for IPv4-only
+/// environments. Falls back to `127.0.0.1` if all guessing fails.
 fn guess_my_routable_ip() -> &'static str {
     static MY_IP: OnceLock<Option<String>> = OnceLock::new();
     static LOCALHOST: &str = "127.0.0.1";
-    // guesses the publicly reachable IP address by creating a datagram socket
-    // to 1.1.1.1 and then reading the source address of the response.
-    // Note that this does not send any packets, but it will use the system's
-    // routing table to determine the local interface that is used to reach the
-    // default gateway.
+    // Guesses the publicly reachable IP address by creating a datagram socket
+    // and then reading the source address. This does not send any packets, but
+    // it will use the system's routing table to determine the local interface
+    // that is used to reach the default gateway.
     //
-    // We fallback to `127.0.0.1` if we failed to guess the public IP address.
+    // We try IPv6 first (connect to 2606:4700:4700::1111), then IPv4 (connect
+    // to 1.1.1.1) for IPv4-only environments. We fall back to `127.0.0.1` if
+    // both fail.
     MY_IP
-        .get_or_init(|| {
-            let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-            socket.connect("1.1.1.1:80").ok()?;
-            let ip = socket.local_addr().ok()?.ip();
-            let ip = if ip.is_ipv6() {
-                // we need to wrap the IPv6 address in brackets to be compatible with
-                // the URI specification.
-                format!("[{}]", ip)
-            } else {
-                ip.to_string()
-            };
-            Some(ip)
-        })
+        .get_or_init(|| guess_routable_ipv6().or_else(guess_routable_ipv4))
         .as_deref()
         .unwrap_or(LOCALHOST)
+}
+
+fn guess_routable_ipv4() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("1.1.1.1:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+fn guess_routable_ipv6() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("[::]:0").ok()?;
+    socket.connect("[2606:4700:4700::1111]:80").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    // IPv6 addresses in URIs must be wrapped in brackets per RFC 3986
+    Some(format!("[{ip}]"))
 }
 
 #[cfg(unix)]
@@ -570,12 +609,30 @@ fn parse_uri(s: &str) -> Result<Uri, anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv6Addr;
-
     use super::*;
 
     #[test]
-    fn test_parse_bind_address() {
+    fn from_parts_defaults_to_ipv6_unspecified() {
+        let addr = BindAddress::<ControlPort>::from_parts(None, None, false);
+        assert_eq!(addr.inner.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(addr.inner.port(), ControlPort::DEFAULT_PORT);
+
+        // Explicit IPv4 still works
+        let addr = BindAddress::<ControlPort>::from_parts(
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            None,
+            false,
+        );
+        assert_eq!(addr.inner.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+        // Random port
+        let addr = BindAddress::<ControlPort>::from_parts(None, None, true);
+        assert_eq!(addr.inner.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(addr.inner.port(), 0);
+    }
+
+    #[test]
+    fn parse_bind_address() {
         let input = "127.0.0.1:8080";
         let addr = input
             .parse::<BindAddress<ControlPort>>()
@@ -595,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bind_address_with_default_port() {
+    fn parse_bind_address_with_default_port() {
         let input = "127.0.0.1";
         let result = match input.parse::<BindAddress<ControlPort>>() {
             Ok(addr) => addr.inner,
@@ -619,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bind_address_invalid() {
+    fn parse_bind_address_invalid() {
         let input = "unsupported:address";
         let result = input.parse::<BindAddress<ControlPort>>();
         assert!(
@@ -629,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_advertised_address_host_port() {
+    fn parse_advertised_address_host_port() {
         // stick the port next to the hostname
         let input = "localhost";
         let result = input.parse::<AdvertisedAddress<ControlPort>>().unwrap();
@@ -706,5 +763,46 @@ mod tests {
         let input = "";
         let result = input.parse::<AdvertisedAddress<FabricPort>>();
         assert!(result.is_err(), "Expected an error for empty input");
+    }
+
+    #[test]
+    fn peer_net_address_is_tls() {
+        // https scheme is TLS
+        let addr: AdvertisedAddress<FabricPort> = "https://10.0.0.1:5122".parse().unwrap();
+        let peer = addr.into_address().unwrap();
+        assert!(peer.is_tls());
+
+        // http scheme is not TLS
+        let addr: AdvertisedAddress<FabricPort> = "http://10.0.0.1:5122".parse().unwrap();
+        let peer = addr.into_address().unwrap();
+        assert!(!peer.is_tls());
+
+        // bare host (defaults to http) is not TLS
+        let addr: AdvertisedAddress<FabricPort> = "10.0.0.1:5122".parse().unwrap();
+        let peer = addr.into_address().unwrap();
+        assert!(!peer.is_tls());
+
+        // UDS is not TLS
+        let addr: AdvertisedAddress<FabricPort> = "unix:/tmp/fabric.sock".parse().unwrap();
+        let peer = addr.into_address().unwrap();
+        assert!(!peer.is_tls());
+    }
+
+    #[test]
+    fn derive_from_bind_address_tls_scheme() {
+        let socket = SocketAddress::Socket("192.168.1.1:5122".parse().unwrap());
+
+        // Without TLS — should produce http://
+        let addr =
+            AdvertisedAddress::<FabricPort>::derive_from_bind_address(socket.clone(), None, false);
+        let peer = addr.into_address().unwrap();
+        assert!(!peer.is_tls());
+        assert!(peer.to_string().starts_with("http://"));
+
+        // With TLS — should produce https://
+        let addr = AdvertisedAddress::<FabricPort>::derive_from_bind_address(socket, None, true);
+        let peer = addr.into_address().unwrap();
+        assert!(peer.is_tls());
+        assert!(peer.to_string().starts_with("https://"));
     }
 }

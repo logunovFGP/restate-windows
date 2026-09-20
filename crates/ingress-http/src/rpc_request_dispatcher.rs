@@ -12,11 +12,12 @@ use super::{RequestDispatcher, RequestDispatcherError};
 
 use restate_types::identifiers::{InvocationId, PartitionProcessorRpcRequestId, WithInvocationId};
 use restate_types::invocation::client::{
-    AttachInvocationResponse, GetInvocationOutputResponse, InvocationClient, InvocationClientError,
-    InvocationOutput, SubmittedInvocationNotification,
+    AttachInvocationResponse, GetInvocationOutputResponse, GetInvocationStatusResponse,
+    InvocationClient, InvocationOutput, SubmittedInvocationNotification,
 };
 use restate_types::invocation::{InvocationQuery, InvocationRequest, InvocationResponse};
 use restate_types::journal_v2::Signal;
+use restate_types::partition_processor::client::PartitionProcessorClientError;
 use restate_types::retries::RetryPolicy;
 use std::future::Future;
 use std::sync::Arc;
@@ -41,8 +42,12 @@ impl<IC> InvocationClientRequestDispatcher<IC> {
     pub fn new(invocation_client: IC) -> Self {
         Self {
             invocation_client,
-            // TODO figure out how to tune this?
-            retry_policy: RetryPolicy::fixed_delay(Duration::from_millis(50), None),
+            retry_policy: RetryPolicy::exponential(
+                Duration::from_millis(50),
+                2.0,
+                None,                         // max attempts
+                Some(Duration::from_secs(1)), // max interval
+            ),
         }
     }
 
@@ -53,7 +58,7 @@ impl<IC> InvocationClientRequestDispatcher<IC> {
     ) -> Result<T, RequestDispatcherError>
     where
         Fn: FnMut() -> Fut,
-        Fut: Future<Output = Result<T, InvocationClientError>>,
+        Fut: Future<Output = Result<T, PartitionProcessorClientError>>,
     {
         Ok(self
             .retry_policy
@@ -132,6 +137,19 @@ where
                 .get_invocation_output(request_id, invocation_query.clone())
         })
         .instrument(debug_span!("get invocation output", %request_id, invocation_id = %invocation_query.to_invocation_id()))
+        .await
+    }
+
+    async fn get_invocation_status(
+        &self,
+        invocation_id: InvocationId,
+    ) -> Result<GetInvocationStatusResponse, RequestDispatcherError> {
+        let request_id = PartitionProcessorRpcRequestId::default();
+        self.execute_rpc(true, || {
+            self.invocation_client
+                .get_invocation_status(request_id, invocation_id)
+        })
+        .instrument(debug_span!("get invocation status", %request_id, %invocation_id))
         .await
     }
 

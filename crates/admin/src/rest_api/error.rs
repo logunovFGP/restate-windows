@@ -8,16 +8,21 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::ops::RangeInclusive;
+
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use codederror::{Code, CodedError};
+
 use restate_core::ShutdownError;
 use restate_types::identifiers::{DeploymentId, SubscriptionId};
 use restate_types::invocation::ServiceType;
-use restate_types::schema::registry::SchemaRegistryError;
-use serde::Serialize;
-use std::ops::RangeInclusive;
+use restate_types::schema::registry::{HttpAuthValidationError, SchemaRegistryError};
+use restate_util_string::RestrictedValueError;
+
+use crate::rest_api::ErrorDescriptionResponse;
+
 // --- Few helpers to define Admin API errors.
 
 /// Macro to generate an Admin API Error enum with the given variants.
@@ -144,7 +149,7 @@ impl_meta_api_error!(InvocationNotFoundError: NOT_FOUND);
 #[derive(Debug, thiserror::Error)]
 #[error("Error when routing the request internally. Reason: {0}")]
 pub(crate) struct InvocationClientError(
-    #[from] pub(crate) restate_types::invocation::client::InvocationClientError,
+    #[from] pub(crate) restate_types::partition_processor::client::PartitionProcessorClientError,
 );
 impl_meta_api_error!(InvocationClientError: SERVICE_UNAVAILABLE "Error when routing the request within restate.");
 
@@ -276,6 +281,8 @@ pub enum MetaApiError {
     },
     #[error("The requested subscription '{0}' does not exist")]
     SubscriptionNotFound(SubscriptionId),
+    #[error("The requested Kafka cluster '{0}' does not exist")]
+    KafkaClusterNotFound(String),
     #[error("Cannot {0} for service type {1}")]
     UnsupportedOperation(&'static str, ServiceType),
     #[error(transparent)]
@@ -286,18 +293,8 @@ pub enum MetaApiError {
     Conflict(String),
     #[error("PUT deployment is deprecated, use PATCH instead")]
     DeprecatedPutDeployment,
-}
-
-/// # Error description response
-///
-/// Error details of the response
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(crate) struct ErrorDescriptionResponse {
-    message: String,
-    /// # Restate code
-    ///
-    /// Restate error code describing this error
-    restate_code: Option<&'static str>,
+    #[error("bad scope: {0}")]
+    BadScope(RestrictedValueError),
 }
 
 impl IntoResponse for MetaApiError {
@@ -306,7 +303,8 @@ impl IntoResponse for MetaApiError {
             MetaApiError::ServiceNotFound(_)
             | MetaApiError::HandlerNotFound { .. }
             | MetaApiError::DeploymentNotFound(_)
-            | MetaApiError::SubscriptionNotFound(_) => StatusCode::NOT_FOUND,
+            | MetaApiError::SubscriptionNotFound(_)
+            | MetaApiError::KafkaClusterNotFound(_) => StatusCode::NOT_FOUND,
             MetaApiError::InvalidField(_, _) | MetaApiError::UnsupportedOperation(_, _) => {
                 StatusCode::BAD_REQUEST
             }
@@ -363,7 +361,8 @@ impl utoipa::IntoResponses for MetaApiError {
 
 pub mod meta_api_error {
     //! Those types are only used to generate the corresponding OpenAPI specification for error types
-    //! that are referenced by [`super::MetaApiError`] when calling [`utoipa::IntoResponses`].
+    //! that are referenced by [`crate::rest_api::error::MetaApiError`] and [`crate::rest_api::rules::RulesApiError`]
+    //! when calling [`utoipa::IntoResponses`].
     #![allow(dead_code)]
 
     /// Bad request
@@ -382,6 +381,10 @@ pub mod meta_api_error {
     #[derive(utoipa::ToResponse)]
     pub struct Conflict(super::ErrorDescriptionResponse);
 
+    /// Unprocessable entity
+    #[derive(utoipa::ToResponse)]
+    pub struct UnprocessableEntity(super::ErrorDescriptionResponse);
+
     /// Internal server error
     #[derive(utoipa::ToResponse)]
     pub struct InternalServerError(super::ErrorDescriptionResponse);
@@ -390,6 +393,12 @@ pub mod meta_api_error {
 impl From<ShutdownError> for MetaApiError {
     fn from(value: ShutdownError) -> Self {
         MetaApiError::Internal(value.to_string())
+    }
+}
+
+impl From<HttpAuthValidationError> for MetaApiError {
+    fn from(value: HttpAuthValidationError) -> Self {
+        MetaApiError::InvalidField(value.field(), value.message().to_owned())
     }
 }
 

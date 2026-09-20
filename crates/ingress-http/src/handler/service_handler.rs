@@ -20,25 +20,38 @@ use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tracing::{Instrument, debug, trace, trace_span};
+use ulid::Ulid;
+
+use restate_types::Scope;
+use restate_types::errors::GenericError;
+use restate_types::identifiers::{InvocationId, WithInvocationId};
+use restate_types::invocation::{
+    Header, InvocationRequest, InvocationRequestHeader, InvocationTarget, InvocationTargetType,
+    SpanRelation, WorkflowHandlerType,
+};
+use restate_types::limit_key::LimitKey;
+use restate_types::nodes_config::ClusterFeature;
+use restate_types::schema::invocation_target::{
+    DeploymentStatus, InvocationTargetMetadata, InvocationTargetResolver,
+};
+use restate_types::time::MillisSinceEpoch;
+use restate_util_string::{ReString, RestateString};
 
 use super::HandlerError;
 use super::path_parsing::{InvokeType, ServiceRequestType, TargetType};
 use super::tracing::prepare_tracing_span;
 use super::{APPLICATION_JSON, Handler};
 use crate::RequestDispatcher;
-use crate::handler::responses::{IDEMPOTENCY_EXPIRES, X_RESTATE_ID};
-use crate::metric_definitions::{INGRESS_REQUEST_DURATION, INGRESS_REQUESTS, REQUEST_COMPLETED};
-use restate_types::identifiers::{InvocationId, WithInvocationId};
-use restate_types::invocation::{
-    Header, InvocationRequest, InvocationRequestHeader, InvocationTarget, InvocationTargetType,
-    SpanRelation, WorkflowHandlerType,
+use crate::handler::is_reserved_header_name;
+use crate::handler::responses::X_RESTATE_ID;
+use crate::metric_definitions::{
+    INGRESS_REQUEST_DURATION, INGRESS_REQUESTS, REQUEST_COMPLETED, REQUEST_ERROR,
+    REQUEST_INGRESS_ERROR, REQUEST_INVOCATION_ERROR,
 };
-use restate_types::schema::invocation_target::{
-    DeploymentStatus, InvocationTargetMetadata, InvocationTargetResolver,
-};
-use restate_types::time::MillisSinceEpoch;
 
 pub(crate) const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
+const LIMIT_KEY_HEADER: HeaderName = HeaderName::from_static("x-restate-limit-key");
+const LIMIT_KEY_QUERY_PARAM: &str = "limit-key";
 const DELAY_QUERY_PARAM: &str = "delay";
 const X_RESTATE_INGRESS_PATH: ByteString = ByteString::from_static("x-restate-ingress-path");
 
@@ -64,6 +77,20 @@ pub(crate) struct SendResponse {
     status: SendStatus,
 }
 
+fn request_metric_status(result: &Result<Response<Full<Bytes>>, HandlerError>) -> &'static str {
+    match result {
+        Ok(response)
+            if response.status().is_client_error() || response.status().is_server_error() =>
+        {
+            REQUEST_INVOCATION_ERROR
+        }
+        Ok(_) => REQUEST_COMPLETED,
+        Err(HandlerError::Invocation(_)) => REQUEST_INVOCATION_ERROR,
+        Err(error) if error.status_code().is_client_error() => REQUEST_ERROR,
+        Err(_) => REQUEST_INGRESS_ERROR,
+    }
+}
+
 impl<Schemas, Dispatcher> Handler<Schemas, Dispatcher>
 where
     Schemas: InvocationTargetResolver + Clone + Send + Sync + 'static,
@@ -75,21 +102,51 @@ where
         service_request: ServiceRequestType,
     ) -> Result<Response<Full<Bytes>>, HandlerError>
     where
-        <B as http_body::Body>::Error: std::error::Error + Send + Sync + 'static,
+        <B as http_body::Body>::Error: Into<GenericError>,
     {
         let start_time = Instant::now();
+        let service_name_label = service_request.name.to_string();
+        let invoke_ty_label = service_request.invoke_ty.as_static_str();
 
+        let result = self.process_service_request(req, service_request).await;
+
+        histogram!(
+            INGRESS_REQUEST_DURATION,
+            "rpc.service" => service_name_label.clone(),
+            "rpc.type" => invoke_ty_label,
+        )
+        .record(start_time.elapsed());
+
+        counter!(
+            INGRESS_REQUESTS,
+            "status" => request_metric_status(&result),
+            "rpc.service" => service_name_label,
+            "rpc.type" => invoke_ty_label,
+        )
+        .increment(1);
+        result
+    }
+
+    async fn process_service_request<B: http_body::Body>(
+        self,
+        req: Request<B>,
+        service_request: ServiceRequestType,
+    ) -> Result<Response<Full<Bytes>>, HandlerError>
+    where
+        <B as http_body::Body>::Error: Into<GenericError>,
+    {
         let ServiceRequestType {
             name: service_name,
             handler: handler_name,
             target,
             invoke_ty,
+            scope,
         } = service_request;
 
         let invocation_target_meta = if let Some(invocation_target) = self
             .schemas
             .pinned()
-            .resolve_latest_invocation_target(&service_name, &handler_name)
+            .resolve_latest_invocation_target(service_name.as_str(), &handler_name)
         {
             if !invocation_target.public {
                 return Err(HandlerError::PrivateService);
@@ -97,16 +154,19 @@ where
             invocation_target
         } else {
             return Err(HandlerError::ServiceHandlerNotFound(
-                service_name.clone(),
+                service_name.to_string(),
                 handler_name.clone(),
             ));
         };
         if let DeploymentStatus::Deprecated(dp_id) = invocation_target_meta.deployment_status {
-            return Err(HandlerError::DeploymentDeprecated(service_name, dp_id));
+            return Err(HandlerError::DeploymentDeprecated(
+                service_name.to_string(),
+                dp_id,
+            ));
         }
 
         // Check if Idempotency-Key is available
-        let idempotency_key = parse_idempotency(req.headers())?;
+        let mut idempotency_key = parse_idempotency(req.headers())?;
         if idempotency_key.is_some()
             && invocation_target_meta.target_ty
                 == InvocationTargetType::Workflow(WorkflowHandlerType::Workflow)
@@ -114,23 +174,45 @@ where
             return Err(HandlerError::UnsupportedIdempotencyKey);
         }
 
+        // Inject a new random idempotency key for
+        // calls that have no idempotency keys only
+        // if the `controlled-idempotent-sharding` is enabled.
+        if self
+            .cluster_features
+            .contains(ClusterFeature::ControlledIdempotentSharding)
+            && matches!(
+                invocation_target_meta.target_ty,
+                InvocationTargetType::Service | InvocationTargetType::VirtualObject(_)
+            )
+            && idempotency_key.is_none()
+        {
+            idempotency_key = Some(Ulid::new().to_string().into());
+        }
+
         // Compute retention values
         let invocation_retention =
             invocation_target_meta.compute_retention(idempotency_key.is_some());
+
+        // Parse scope from path
+        let scope = if let Some(scope) = scope {
+            Some(Scope::try_from_restring(scope).map_err(HandlerError::BadScopeValue)?)
+        } else {
+            None
+        };
 
         // Craft Invocation Target and Id
         let invocation_target = if let TargetType::Keyed { key } = target {
             match invocation_target_meta.target_ty {
                 InvocationTargetType::VirtualObject(handler_ty) => {
                     InvocationTarget::virtual_object(
-                        &*service_name,
+                        service_name.as_str(),
                         key,
                         &*handler_name,
                         handler_ty,
                     )
                 }
                 InvocationTargetType::Workflow(handler_ty) => {
-                    InvocationTarget::workflow(&*service_name, key, &*handler_name, handler_ty)
+                    InvocationTarget::workflow(service_name.as_str(), key, &*handler_name, handler_ty)
                 }
                 InvocationTargetType::Service => {
                     panic!(
@@ -139,11 +221,13 @@ where
                 }
             }
         } else {
-            InvocationTarget::service(&*service_name, &*handler_name)
-        };
+            InvocationTarget::service(service_name.as_str(), &*handler_name)
+        }
+        .with_scope(scope);
+
         let invocation_id = InvocationId::generate(&invocation_target, idempotency_key.as_deref());
 
-        let result = async move {
+        async move {
             let ingress_span_context =
                 prepare_tracing_span(&invocation_id, &invocation_target, &req);
 
@@ -184,6 +268,14 @@ where
             // Parse delay query parameter
             let delay = parse_delay(parts.uri.query())?;
 
+            // Parse limit-key from header or query param (header takes precedence)
+            let limit_key = parse_limit_key(&parts.headers, parts.uri.query())?;
+
+            // Validate invariant: limit-key requires scope
+            if !limit_key.is_empty() && invocation_target.scope().is_none() {
+                return Err(HandlerError::LimitKeyWithoutScope);
+            }
+
             // Get headers
             let headers = parse_headers(parts)?;
 
@@ -195,6 +287,7 @@ where
             if let Some(key) = idempotency_key {
                 invocation_request_header.idempotency_key = Some(key);
             }
+            invocation_request_header.limit_key = limit_key;
             invocation_request_header.headers = headers;
 
             match invoke_ty {
@@ -221,23 +314,7 @@ where
                 }
             }
         }
-        .await;
-
-        // Note that we only record (mostly) successful requests here. We might want to
-        // change this in the _near_ future.
-        histogram!(
-            INGRESS_REQUEST_DURATION,
-            "rpc.service" => service_name.clone(),
-        )
-        .record(start_time.elapsed());
-
-        counter!(
-            INGRESS_REQUESTS,
-            "status" => REQUEST_COMPLETED,
-            "rpc.service" => service_name,
-        )
-        .increment(1);
-        result
+        .await
     }
 
     async fn handle_service_call(
@@ -248,7 +325,8 @@ where
         let response = dispatcher
             .call(invocation_request)
             .instrument(trace_span!("Waiting for response"))
-            .await?;
+            .await
+            .map_err(HandlerError::InvocationDispatcherError)?;
 
         Self::reply_with_invocation_response(response, move |_| Ok(invocation_target_metadata))
     }
@@ -260,7 +338,10 @@ where
         let invocation_id = invocation_request.invocation_id();
 
         // Send the service invocation, wait for the submit notification
-        let response = dispatcher.send(invocation_request).await?;
+        let response = dispatcher
+            .send(invocation_request)
+            .await
+            .map_err(HandlerError::InvocationDispatcherError)?;
 
         trace!("Complete external HTTP send request successfully");
         Ok(Response::builder()
@@ -307,11 +388,7 @@ fn parse_headers(parts: http::request::Parts) -> Result<Vec<Header>, HandlerErro
             continue;
         };
 
-        if k == header::CONNECTION
-            || k == header::HOST
-            || k == IDEMPOTENCY_KEY
-            || k == IDEMPOTENCY_EXPIRES
-        {
+        if is_reserved_header_name(&k) {
             continue;
         }
 
@@ -327,7 +404,7 @@ fn parse_headers(parts: http::request::Parts) -> Result<Vec<Header>, HandlerErro
 #[serde_as]
 #[derive(Deserialize)]
 #[serde(transparent)]
-struct DurationQueryParam(#[serde_as(as = "restate_time_util::FriendlyDuration")] Duration);
+struct DurationQueryParam(#[serde_as(as = "restate_util_time::FriendlyDuration")] Duration);
 
 fn parse_delay(query: Option<&str>) -> Result<Option<Duration>, HandlerError> {
     if query.is_none() {
@@ -361,6 +438,39 @@ fn parse_idempotency(headers: &HeaderMap) -> Result<Option<ByteString>, HandlerE
     };
 
     Ok(Some(idempotency_key))
+}
+
+/// Parse limit-key from header or query parameter. Header takes precedence.
+fn parse_limit_key(
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Result<LimitKey<ReString>, HandlerError> {
+    // Try header first
+    if let Some(header_value) = headers.get(LIMIT_KEY_HEADER) {
+        let s = header_value
+            .to_str()
+            .map_err(|e| HandlerError::BadHeader(LIMIT_KEY_HEADER, e))?;
+        return s
+            .parse()
+            .map_err(|e: restate_types::limit_key::ParseError| {
+                HandlerError::InvalidLimitKey(e.to_string())
+            });
+    }
+
+    // Fall back to query parameter
+    if let Some(query) = query {
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            if k.eq_ignore_ascii_case(LIMIT_KEY_QUERY_PARAM) {
+                return v
+                    .parse()
+                    .map_err(|e: restate_types::limit_key::ParseError| {
+                        HandlerError::InvalidLimitKey(e.to_string())
+                    });
+            }
+        }
+    }
+
+    Ok(LimitKey::None)
 }
 
 #[cfg(test)]

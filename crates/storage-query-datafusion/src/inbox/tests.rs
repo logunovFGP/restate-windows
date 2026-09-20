@@ -19,6 +19,7 @@ use restate_storage_api::Transaction;
 use restate_storage_api::inbox_table::{InboxEntry, WriteInboxTable};
 use restate_types::identifiers::InvocationId;
 use restate_types::invocation::InvocationTarget;
+use restate_types::state_mut::ExternalStateMutation;
 
 #[restate_core::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_inbox() {
@@ -33,19 +34,30 @@ async fn get_inbox() {
         &InboxEntry::Invocation(service_id.clone(), invocation_id_1),
     )
     .unwrap();
-    let invocation_id_2 = InvocationId::mock_generate(&invocation_target);
     tx.put_inbox_entry(
         1,
+        &InboxEntry::StateMutation(ExternalStateMutation {
+            service_id: service_id.clone(),
+            version: None,
+            state: Default::default(),
+        }),
+    )
+    .unwrap();
+    let invocation_id_2 = InvocationId::mock_generate(&invocation_target);
+    tx.put_inbox_entry(
+        2,
         &InboxEntry::Invocation(service_id.clone(), invocation_id_2),
     )
     .unwrap();
     tx.commit().await.unwrap();
+    drop(tx);
 
     let records = engine
         .execute("SELECT * FROM sys_inbox ORDER BY sequence_number")
         .await
         .unwrap()
-        .collect::<Vec<Result<RecordBatch, _>>>()
+        .stream
+        .collect::<Vec<datafusion::common::Result<RecordBatch>>>()
         .await
         .remove(0)
         .unwrap();
@@ -66,7 +78,7 @@ async fn get_inbox() {
                 1,
                 {
                     "id" => LargeStringArray: eq(invocation_id_2.to_string()),
-                    "sequence_number" => UInt64Array: eq(1),
+                    "sequence_number" => UInt64Array: eq(2),
                     "service_name" => LargeStringArray: eq(service_id.service_name.to_string()),
                     "service_key" => LargeStringArray: eq(service_id.key.to_string()),
                 }

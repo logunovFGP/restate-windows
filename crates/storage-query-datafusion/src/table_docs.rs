@@ -9,8 +9,9 @@
 // by the Apache License, Version 2.0.
 
 use crate::{
-    deployment, idempotency, inbox, invocation_state, invocation_status, journal, journal_events,
-    keyed_service_status, promise, service, state,
+    deployment, inbox, invocation_state, invocation_status, journal, journal_events, promise,
+    rules, scheduler_status, service, state, user_limits, vqueue_entry_status, vqueue_meta,
+    vqueues,
 };
 use std::borrow::Cow;
 
@@ -18,15 +19,19 @@ use std::borrow::Cow;
 /// this array. This will ensure that the table docs will be included in the automatic
 /// table docs generation process.
 pub const ALL_TABLE_DOCS: &[StaticTableDocs] = &[
-    state::schema::TABLE_DOCS,
+    deployment::schema::TABLE_DOCS,
+    inbox::schema::TABLE_DOCS,
     journal::schema::TABLE_DOCS,
     journal_events::schema::TABLE_DOCS,
-    keyed_service_status::schema::TABLE_DOCS,
-    inbox::schema::TABLE_DOCS,
-    idempotency::schema::TABLE_DOCS,
     promise::schema::TABLE_DOCS,
+    rules::schema::TABLE_DOCS,
+    scheduler_status::schema::TABLE_DOCS,
     service::schema::TABLE_DOCS,
-    deployment::schema::TABLE_DOCS,
+    state::schema::TABLE_DOCS,
+    user_limits::schema::TABLE_DOCS,
+    vqueue_entry_status::schema::TABLE_DOCS,
+    vqueue_meta::schema::TABLE_DOCS,
+    vqueues::schema::TABLE_DOCS,
 ];
 
 pub trait TableDocs {
@@ -105,6 +110,9 @@ pub fn sys_invocation_table_docs() -> OwnedTableDocs {
     let columns = vec![
         sys_invocation_status.remove("id").expect("id should exist"),
         sys_invocation_status
+            .remove("vqueue_id")
+            .expect("vqueue_id should exist"),
+        sys_invocation_status
             .remove("target")
             .expect("target should exist"),
         sys_invocation_status
@@ -119,6 +127,12 @@ pub fn sys_invocation_table_docs() -> OwnedTableDocs {
         sys_invocation_status
             .remove("target_service_ty")
             .expect("target_service_ty should exist"),
+        sys_invocation_status
+            .remove("scope")
+            .expect("scope should exist"),
+        sys_invocation_status
+            .remove("limit_key")
+            .expect("limit_key should exist"),
         sys_invocation_status
             .remove("idempotency_key")
             .expect("idempotency_key should exist"),
@@ -191,6 +205,9 @@ pub fn sys_invocation_table_docs() -> OwnedTableDocs {
         sys_invocation_status
             .remove("suspended_waiting_for_signals")
             .expect("suspended_waiting_for_signals should exist"),
+        sys_invocation_status
+            .remove("suspended_waiting_future_json")
+            .expect("suspended_waiting_future_json should exist"),
         sys_invocation_state
             .remove("retry_count")
             .expect("retry_count should exist"),
@@ -230,6 +247,9 @@ pub fn sys_invocation_table_docs() -> OwnedTableDocs {
         sys_invocation_state
             .remove("last_failure_related_command_type")
             .expect("last_failure_related_command_type should exist"),
+        sys_invocation_state
+            .remove("last_awaiting_on_future_json")
+            .expect("last_awaiting_on_future_json should exist"),
         TableColumn {
             name: "status",
             column_type: "Utf8",

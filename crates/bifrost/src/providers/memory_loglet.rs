@@ -309,7 +309,7 @@ impl Stream for MemoryReadStream {
 
             self.read_pointer = next_record
                 .trim_gap_to_sequence_number()
-                .unwrap_or(next_record.sequence_number())
+                .unwrap_or_else(|| next_record.sequence_number())
                 .next();
 
             // If this is a filtered record, skip it.
@@ -328,6 +328,10 @@ impl Stream for MemoryReadStream {
 
 #[async_trait]
 impl Loglet for MemoryLoglet {
+    fn id(&self) -> Option<LogletId> {
+        Some(self.loglet_id)
+    }
+
     fn debug_str(&self) -> Cow<'static, str> {
         Cow::from(format!("in-memory/{}", self.loglet_id))
     }

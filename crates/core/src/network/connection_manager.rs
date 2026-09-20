@@ -169,7 +169,7 @@ impl ConnectionManagerInner {
             .observed_generations
             .get(&peer_node_id.as_plain())
             .copied()
-            .unwrap_or(GenStatus::new(peer_node_id.generation()));
+            .unwrap_or_else(|| GenStatus::new(peer_node_id.generation()));
 
         if known_status.generation > peer_node_id.generation() {
             // This peer is _older_ than the one we have seen in the past, we cannot accept
@@ -300,9 +300,10 @@ impl ConnectionManager {
         let nodes_config = metadata.nodes_config_ref();
 
         // check cluster fingerprint if it's set on the hello message *and* our nodes config has it
-        // set as well.
+        // set as well. Only validate if BOTH sides have a fingerprint.
         if let Ok(incoming_fingerprint) = ClusterFingerprint::try_from(hello.cluster_fingerprint)
-            && incoming_fingerprint != nodes_config.cluster_fingerprint()
+            && let Some(expected_fingerprint) = nodes_config.cluster_fingerprint()
+            && incoming_fingerprint != expected_fingerprint
         {
             return Err(HandshakeError::Failed("cluster fingerprint mismatch".to_owned()).into());
         }
@@ -358,7 +359,7 @@ impl ConnectionManager {
         // Enqueue the welcome message
         let welcome = Welcome::new(my_node_id, selected_protocol_version, hello.direction());
         shared
-            .unbounded_send(EgressMessage::Message(welcome.into(), None))
+            .unbounded_send(EgressMessage::Message(welcome.into()))
             .map_err(|_| HandshakeError::PeerDropped)?;
         let connection = Connection::new(
             peer_node_id,
@@ -657,6 +658,7 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use restate_test_util::assert_eq;
+    use restate_types::RestateVersion;
     use restate_types::Version;
     use restate_types::config::NetworkingOptions;
     use restate_types::net::address::AdvertisedAddress;
@@ -669,6 +671,9 @@ mod tests {
     };
     use restate_types::nodes_config::{NodeConfig, NodesConfiguration, Role};
 
+    use restate_memory::MemoryPool;
+
+    use crate::network::BackPressureMode;
     use crate::network::MessageRouterBuilder;
     use crate::network::ServiceMessage;
     use crate::network::Swimlane;
@@ -677,7 +682,7 @@ mod tests {
 
     // Test handshake with a client
     #[restate_core::test]
-    async fn test_hello_welcome_handshake() -> Result<()> {
+    async fn hello_welcome_handshake() -> Result<()> {
         let _env = TestCoreEnv::create_with_single_node(1, 1).await;
         let connections = ConnectionManager::default();
 
@@ -694,7 +699,7 @@ mod tests {
     }
 
     #[restate_core::test(start_paused = true)]
-    async fn test_hello_welcome_timeout() -> Result<()> {
+    async fn hello_welcome_timeout() -> Result<()> {
         let _env = TestCoreEnv::create_with_single_node(1, 1).await;
         let net_opts = NetworkingOptions::default();
         let connections = ConnectionManager::default();
@@ -713,7 +718,7 @@ mod tests {
     }
 
     #[restate_core::test]
-    async fn test_bad_handshake() -> Result<()> {
+    async fn bad_handshake() -> Result<()> {
         let test_setup = TestCoreEnv::create_with_single_node(1, 1).await;
         let metadata = test_setup.metadata;
         let (tx, rx) = mpsc::channel(1);
@@ -725,7 +730,10 @@ mod tests {
             max_protocol_version: ProtocolVersion::Unknown.into(),
             my_node_id: Some(my_node_id.into()),
             cluster_name: metadata.nodes_config_ref().cluster_name().to_owned(),
-            cluster_fingerprint: metadata.nodes_config_ref().cluster_fingerprint().to_u64(),
+            cluster_fingerprint: metadata
+                .nodes_config_ref()
+                .cluster_fingerprint()
+                .map_or(0, |f| f.to_u64()),
             direction: ConnectionDirection::Bidirectional.into(),
             swimlane: Swimlane::default().into(),
         };
@@ -751,7 +759,10 @@ mod tests {
             max_protocol_version: CURRENT_PROTOCOL_VERSION.into(),
             my_node_id: Some(my_node_id.into()),
             cluster_name: "Random-cluster".to_owned(),
-            cluster_fingerprint: metadata.nodes_config_ref().cluster_fingerprint().to_u64(),
+            cluster_fingerprint: metadata
+                .nodes_config_ref()
+                .cluster_fingerprint()
+                .map_or(0, |f| f.to_u64()),
             direction: ConnectionDirection::Bidirectional.into(),
             swimlane: Swimlane::default().into(),
         };
@@ -804,7 +815,7 @@ mod tests {
     }
 
     #[restate_core::test]
-    async fn test_node_generation() -> Result<()> {
+    async fn node_generation() -> Result<()> {
         let _env = TestCoreEnv::create_with_single_node(1, 2).await;
         let metadata = Metadata::current();
         let (tx, rx) = mpsc::channel(1);
@@ -851,6 +862,7 @@ mod tests {
             .current_generation(node_id)
             .address(AdvertisedAddress::default())
             .roles(Role::Worker.into())
+            .binary_version(RestateVersion::current())
             .build();
         nodes_config.upsert_node(node_config);
 
@@ -861,11 +873,9 @@ mod tests {
 
         let metadata = Metadata::current();
 
-        let mut incoming_router = MessageRouterBuilder::default();
-        let metadata_manager_rx = incoming_router.register_service::<MetadataManagerService>(
-            10,
-            crate::network::BackPressureMode::PushBack,
-        );
+        let mut incoming_router = MessageRouterBuilder::with_default_pool(MemoryPool::unlimited());
+        let metadata_manager_rx =
+            incoming_router.register_service::<MetadataManagerService>(BackPressureMode::Lossy);
 
         let mut metadata_manager_rx = metadata_manager_rx.start();
 

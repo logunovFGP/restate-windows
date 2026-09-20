@@ -17,6 +17,13 @@ use typify::{TypeSpace, TypeSpaceSettings};
 fn main() -> std::io::Result<()> {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    // Only re-run when proto files, JSON schema, or this build script change
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=service-protocol-v3/");
+    println!("cargo:rerun-if-changed=../../service-protocol/dev/restate/service/discovery.proto");
+    println!("cargo:rerun-if-changed=../../service-protocol/endpoint_manifest_schema.json");
+    println!("cargo:rerun-if-changed=protobuf/");
+
     // Old service-protocol
     prost_build::Config::new()
         .bytes(["."])
@@ -101,6 +108,15 @@ fn build_restate_proto(out_dir: &Path) -> std::io::Result<()> {
         .enum_attribute("LogServerStatus", "#[derive(::serde::Serialize)]")
         .enum_attribute("WorkerStatus", "#[derive(::serde::Serialize)]")
         .enum_attribute("MetadataServerStatus", "#[derive(::serde::Serialize)]")
+        .enum_attribute(
+            "DetailedRunMode",
+            "#[derive(::strum::Display, ::restate_encoding::NetSerde, ::bilrost::Enumeration)]",
+        )
+        .enum_attribute(
+            "BrokenReason",
+            "#[derive(::strum::Display, ::restate_encoding::NetSerde, ::bilrost::Enumeration)]",
+        )
+        .enum_attribute("BrokenReason", "#[strum(serialize_all = \"snake_case\")]")
         .btree_map([
             ".restate.cluster.ClusterState",
             ".restate.cluster.AliveNode",

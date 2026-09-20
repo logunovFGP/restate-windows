@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use rocksdb::{BlockBasedOptions, BoundColumnFamily, Cache, DB, DBCompressionType, SliceTransform};
+use rocksdb::{BlockBasedOptions, BoundColumnFamily, Cache, DB, SliceTransform};
 use static_assertions::const_assert;
 
 use restate_rocksdb::{
@@ -19,14 +19,12 @@ use restate_rocksdb::{
 use restate_types::config::{Configuration, LocalLogletOptions};
 use restate_types::errors::MaybeRetryableError;
 use restate_types::live::LiveLoad;
+use restate_types::protobuf::common::DatabaseKind;
 use restate_types::storage::{StorageDecodeError, StorageEncodeError};
 
 use super::keys::{DATA_KEY_PREFIX_LENGTH, MetadataKey, MetadataKind};
 use super::log_state::{LogState, log_state_full_merge, log_state_partial_merge};
 use super::log_store_writer::LogStoreWriter;
-
-// matches the default directory name
-pub(crate) const DB_NAME: &str = "local-loglet";
 
 pub(crate) const DATA_CF: &str = "logstore_data";
 pub(crate) const METADATA_CF: &str = "logstore_metadata";
@@ -74,15 +72,21 @@ impl RocksDbLogStore {
         let opts = options.live_load();
         let data_dir = opts.data_dir();
 
-        let db_spec = DbSpecBuilder::new(DbName::new(DB_NAME), data_dir, RocksConfigurator)
-            .add_cf_pattern(CfExactPattern::new(DATA_CF), RocksConfigurator)
-            .add_cf_pattern(CfExactPattern::new(METADATA_CF), RocksConfigurator)
-            // not very important but it's to reduce the number of merges by flushing.
-            // it's also a small cf so it should be quick.
-            .add_to_flush_on_shutdown(CfExactPattern::new(METADATA_CF))
-            .ensure_column_families(cfs)
-            .build()
-            .expect("valid spec");
+        let kind = DatabaseKind::LocalLoglet;
+        let db_spec = DbSpecBuilder::new(
+            DbName::new(kind.db_name()),
+            kind,
+            data_dir,
+            RocksConfigurator,
+        )
+        .add_cf_pattern(CfExactPattern::new(DATA_CF), RocksConfigurator)
+        .add_cf_pattern(CfExactPattern::new(METADATA_CF), RocksConfigurator)
+        // not very important but it's to reduce the number of merges by flushing.
+        // it's also a small cf so it should be quick.
+        .add_to_flush_on_shutdown(CfExactPattern::new(METADATA_CF))
+        .ensure_column_families(cfs)
+        .build()
+        .expect("valid spec");
         let rocksdb = db_manager.open_db(db_spec).await?;
         Ok(Self { rocksdb })
     }
@@ -132,16 +136,29 @@ impl restate_rocksdb::configuration::DbConfigurator for RocksConfigurator {
         db_name: &DbName,
         env: &rocksdb::Env,
         write_buffer_manager: &rocksdb::WriteBufferManager,
+        limiter: &rocksdb::RateLimiter,
     ) -> rocksdb::Options {
         let mut db_options = restate_rocksdb::configuration::create_default_db_options(
             env,
             db_name,
-            true, /* create_db_if_missing */
             write_buffer_manager,
+            limiter,
         );
+
         let local_loglet_config = &Configuration::pinned().bifrost.local;
         // amend default options from rocksdb_manager
         self.apply_db_opts_from_config(&mut db_options, &local_loglet_config.rocksdb);
+
+        restate_rocksdb::configuration::set_background_work_budget(
+            &mut db_options,
+            local_loglet_config.rocksdb_max_background_flushes(),
+            local_loglet_config.rocksdb_max_background_compactions(),
+        );
+
+        if !local_loglet_config.rocksdb_disable_wal() {
+            // RocksDB does not support recycling wal log files if wal is disabled when writing
+            db_options.set_recycle_log_file_num(4);
+        }
         // local loglet customizations
 
         // Enable atomic flushes.
@@ -157,7 +174,12 @@ impl restate_rocksdb::configuration::DbConfigurator for RocksConfigurator {
         // we can use absolute consistency but on a single-node setup, we don't have a way to recover
         // from it, so it's not useful for us.
         db_options.set_wal_recovery_mode(rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords);
-        db_options.set_wal_compression_type(DBCompressionType::Zstd);
+        if !local_loglet_config
+            .rocksdb
+            .rocksdb_disable_wal_compression()
+        {
+            db_options.set_wal_compression_type(rocksdb::DBCompressionType::Zstd);
+        }
         // most reads are sequential
         db_options.set_advise_random_on_open(false);
 
@@ -217,15 +239,20 @@ fn cf_data_options(
     opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
     opts.set_num_levels(7);
 
-    opts.set_compression_per_level(&[
-        DBCompressionType::None,
-        DBCompressionType::None,
-        DBCompressionType::Zstd,
-        DBCompressionType::Zstd,
-        DBCompressionType::Zstd,
-        DBCompressionType::Zstd,
-        DBCompressionType::Zstd,
-    ]);
+    let l0_l1 = if local_loglet_config
+        .rocksdb
+        .rocksdb_disable_l0_l1_compression()
+    {
+        rocksdb::DBCompressionType::None
+    } else {
+        rocksdb::DBCompressionType::Zstd
+    };
+    let levels = restate_rocksdb::configuration::build_compression_per_level(
+        7,
+        l0_l1,
+        rocksdb::DBCompressionType::Zstd,
+    );
+    opts.set_compression_per_level(&levels);
 
     opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(DATA_KEY_PREFIX_LENGTH));
     opts.set_memtable_prefix_bloom_ratio(0.2);
@@ -267,11 +294,20 @@ fn cf_metadata_options(
     // Set compactions per level
     //
     opts.set_num_levels(3);
-    opts.set_compression_per_level(&[
-        DBCompressionType::None,
-        DBCompressionType::None,
-        DBCompressionType::Zstd,
-    ]);
+    let l0_l1 = if local_loglet_config
+        .rocksdb
+        .rocksdb_disable_l0_l1_compression()
+    {
+        rocksdb::DBCompressionType::None
+    } else {
+        rocksdb::DBCompressionType::Zstd
+    };
+    let levels = restate_rocksdb::configuration::build_compression_per_level(
+        3,
+        l0_l1,
+        rocksdb::DBCompressionType::Zstd,
+    );
+    opts.set_compression_per_level(&levels);
 
     opts.set_memtable_whole_key_filtering(true);
     opts.set_max_write_buffer_number(4);

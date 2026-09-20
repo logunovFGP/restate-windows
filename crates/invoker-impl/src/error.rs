@@ -8,20 +8,16 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
-use tokio::task::JoinError;
 
-use restate_invoker_api::InvocationErrorReport;
+use restate_memory::OutOfMemoryKind;
 use restate_service_client::ServiceClientError;
-use restate_service_protocol::message::{EncodingError, MessageType};
-use restate_time_util::FriendlyDuration;
-use restate_types::errors::{InvocationError, InvocationErrorCode, codes};
+use restate_types::errors::{IdDecodeError, InvocationError, InvocationErrorCode, codes};
 use restate_types::identifiers::DeploymentId;
 use restate_types::journal::raw::RawEntryCodecError;
 use restate_types::journal::{EntryIndex, EntryType};
@@ -31,6 +27,10 @@ use restate_types::service_protocol::{
     MAX_INFLIGHT_SERVICE_PROTOCOL_VERSION, MIN_INFLIGHT_SERVICE_PROTOCOL_VERSION,
     ServiceProtocolVersion,
 };
+use restate_util_bytecount::NonZeroByteCount;
+use restate_util_string::RestrictedValueError;
+use restate_util_time::FriendlyDuration;
+use restate_worker_api::invoker::{InvocationErrorReport, InvocationReaderError};
 
 #[derive(Debug, thiserror::Error, codederror::CodedError)]
 pub(crate) enum InvokerError {
@@ -58,21 +58,12 @@ pub(crate) enum InvokerError {
     UnexpectedContentType(Option<HeaderValue>, HeaderValue),
     #[error("received unexpected message: {0:?}")]
     #[code(restate_errors::RT0012)]
-    UnexpectedMessage(MessageType),
-    #[error("received unexpected message: {0:?}")]
-    #[code(restate_errors::RT0012)]
     UnexpectedMessageV4(restate_service_protocol_v4::message_codec::MessageType),
     #[error("message encoding error: {0}")]
-    Encoding(
-        #[from]
-        #[code]
-        EncodingError,
-    ),
-    #[error("message encoding error: {0}")]
     #[code(restate_errors::RT0012)]
-    EncodingV2(#[from] journal_v2::encoding::DecodingError),
+    Encoding(#[from] journal_v2::encoding::DecodingError),
     #[error("message encoding error: {0}")]
-    EncoderV2(
+    Encoder(
         #[from]
         #[code]
         restate_service_protocol_v4::message_codec::EncodingError,
@@ -94,11 +85,9 @@ pub(crate) enum InvokerError {
     #[error("got empty SuspensionMessage")]
     #[code(restate_errors::RT0012)]
     EmptySuspensionMessage,
-    #[error(
-        "got bad SuspensionMessage, suspending on journal indexes {0:?}, but journal length is {1}"
-    )]
+    #[error("got empty AwaitingOnMessage")]
     #[code(restate_errors::RT0012)]
-    BadSuspensionMessage(HashSet<EntryIndex>, EntryIndex),
+    EmptyAwaitingOnMessage,
     #[error("malformed ProposeRunCompletionMessage, missing result field")]
     #[code(restate_errors::RT0012)]
     MalformedProposeRunCompletion,
@@ -123,9 +112,6 @@ pub(crate) enum InvokerError {
     #[error("unexpected error while reading the response body: {0}")]
     #[code(restate_errors::RT0010)]
     ClientBody(Box<dyn std::error::Error + Send + Sync>),
-    #[error("unexpected join error, looks like hyper panicked: {0}")]
-    #[code(restate_errors::RT0010)]
-    UnexpectedJoinError(#[from] JoinError),
     #[error("unexpected closed request stream while trying to write a message")]
     #[code(restate_errors::RT0010)]
     UnexpectedClosedRequestStream,
@@ -134,9 +120,6 @@ pub(crate) enum InvokerError {
     #[code(restate_errors::RT0001)]
     AbortTimeoutFired(FriendlyDuration),
 
-    #[error("cannot process entry {1} (index {0}) because of a failed precondition: {2}")]
-    #[code(restate_errors::RT0017)]
-    EntryEnrichment(EntryIndex, EntryType, #[source] InvocationError),
     #[error("cannot process command {1} (command index {0}) because of a failed precondition: {2}")]
     CommandPrecondition(
         CommandIndex,
@@ -171,10 +154,63 @@ pub(crate) enum InvokerError {
     ServiceUnavailable(http::StatusCode),
 
     #[error(
+        "service is rate limited due to '{code}'{}",
+        retry_after_display(retry_after)
+    )]
+    #[code(restate_errors::RT0023)]
+    RateLimited {
+        code: http::StatusCode,
+        retry_after: Option<Duration>,
+    },
+    #[error(
         "service {0} is exposed by the deprecated deployment {1}, please upgrade the SDK used by the service."
     )]
     #[code(restate_errors::RT0020)]
     DeploymentDeprecated(String, DeploymentId),
+
+    #[error("{0}")]
+    #[code(restate_errors::RT0001)]
+    OutOfMemory(InvocationMemoryExhausted),
+    #[error("maximum awaited future depth limit of {limit} has been reached.")]
+    #[code(restate_errors::RT0025)]
+    MaxFutureDepthReached { limit: usize },
+}
+
+/// Describes a memory budget exhaustion that occurred during invocation
+/// processing. Carried through the invoker pipeline from the origin site
+/// (journal reader, state reader) all the way to the invoker main loop
+/// where it either triggers a yield or an error effect.
+#[derive(Debug, Clone)]
+pub(crate) struct InvocationMemoryExhausted {
+    /// Bytes needed to satisfy the failed allocation.
+    pub needed: NonZeroByteCount,
+    /// Why the allocation failed.
+    pub kind: OutOfMemoryKind,
+    /// Human-readable description of what was being done when the OOM occurred.
+    pub context: &'static str,
+}
+
+impl fmt::Display for InvocationMemoryExhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let hint = match self.kind {
+            OutOfMemoryKind::PoolExhausted => "consider increasing 'worker.invoker.memory-limit'",
+            OutOfMemoryKind::UpperBoundExceeded => {
+                "consider increasing 'worker.invoker.per-invocation-memory-limit'"
+            }
+        };
+        write!(
+            f,
+            "memory budget exhausted ({}) while {}: needed {}; {}",
+            self.kind, self.context, self.needed, hint,
+        )
+    }
+}
+
+fn retry_after_display(after: &Option<Duration>) -> String {
+    match after {
+        Some(duration) => format!(" (retry after: {} seconds)", duration.as_secs()),
+        None => String::new(),
+    }
 }
 
 impl InvokerError {
@@ -193,7 +229,11 @@ impl InvokerError {
     }
 
     pub(crate) fn is_transient(&self) -> bool {
-        !matches!(self, InvokerError::NotInvoked)
+        match self {
+            InvokerError::NotInvoked => false,
+            InvokerError::OutOfMemory(oom) => oom.kind != OutOfMemoryKind::UpperBoundExceeded,
+            _ => true,
+        }
     }
 
     pub(crate) fn should_bump_start_message_retry_count_since_last_stored_entry(&self) -> bool {
@@ -207,20 +247,54 @@ impl InvokerError {
                 | InvokerError::UnknownDeployment(_)
                 | InvokerError::ResumeWithWrongServiceProtocolVersion(_)
                 | InvokerError::IncompatibleServiceEndpoint(_, _)
+                | InvokerError::OutOfMemory(_)
         )
     }
 
-    pub(crate) fn next_retry_interval_override(&self) -> Option<Duration> {
+    /// Converts a journal reader error, preserving budget exhaustion as
+    /// [`InvokerError::OutOfMemory`].
+    pub(crate) fn from_journal_reader<E: InvocationReaderError>(e: E) -> Self {
+        if let Some(oom) = e.budget_exhaustion() {
+            InvokerError::OutOfMemory(InvocationMemoryExhausted {
+                needed: oom.needed,
+                kind: oom.kind,
+                context: "reading journal entries",
+            })
+        } else {
+            InvokerError::JournalReader(e.into())
+        }
+    }
+
+    /// Converts a state reader error, preserving budget exhaustion as
+    /// [`InvokerError::OutOfMemory`].
+    pub(crate) fn from_state_reader<E: InvocationReaderError>(e: E) -> Self {
+        if let Some(oom) = e.budget_exhaustion() {
+            InvokerError::OutOfMemory(InvocationMemoryExhausted {
+                needed: oom.needed,
+                kind: oom.kind,
+                context: "reading service state",
+            })
+        } else {
+            InvokerError::StateReader(e.into())
+        }
+    }
+
+    pub(crate) fn requested_error_behavior(&self) -> RequestedErrorBehavior {
         match self {
+            InvokerError::SdkV2(SdkInvocationErrorV2 {
+                requested_error_behavior,
+                ..
+            }) => *requested_error_behavior,
             InvokerError::Sdk(SdkInvocationError {
                 next_retry_interval_override,
                 ..
-            }) => *next_retry_interval_override,
-            InvokerError::SdkV2(SdkInvocationErrorV2 {
-                next_retry_interval_override,
-                ..
-            }) => *next_retry_interval_override,
-            _ => None,
+            }) => RequestedErrorBehavior::retry(*next_retry_interval_override),
+            InvokerError::RateLimited { retry_after, .. } => {
+                RequestedErrorBehavior::retry(*retry_after)
+            }
+            InvokerError::MaxFutureDepthReached { .. } => RequestedErrorBehavior::Pause,
+            InvokerError::DeploymentDeprecated { .. } => RequestedErrorBehavior::Fail,
+            _ => RequestedErrorBehavior::Retry,
         }
     }
 
@@ -228,19 +302,6 @@ impl InvokerError {
         match self {
             InvokerError::Sdk(sdk_error) => *sdk_error.error,
             InvokerError::SdkV2(sdk_error) => *sdk_error.error,
-            InvokerError::EntryEnrichment(entry_index, entry_type, e) => {
-                let msg = format!(
-                    "Error when processing entry {} of type {}: {}",
-                    entry_index,
-                    entry_type,
-                    e.message()
-                );
-                let mut err = InvocationError::new(e.code(), msg);
-                if let Some(desc) = e.into_stacktrace() {
-                    err = err.with_stacktrace(desc);
-                }
-                err
-            }
             e @ InvokerError::BadNegotiatedServiceProtocolVersion(_) => {
                 InvocationError::new(codes::UNSUPPORTED_MEDIA_TYPE, e.to_string())
             }
@@ -299,6 +360,19 @@ pub(crate) enum CommandPreconditionError {
     #[error("the service {0} is exposed by the deprecated deployment {1}.")]
     #[code(restate_errors::RT0020)]
     DeploymentDeprecated(String, DeploymentId),
+    #[error(
+        "limit key was provided without a scope. Limit keys take effect only when used in combination with scope"
+    )]
+    #[code(restate_errors::RT0024)]
+    LimitKeyWithoutScope,
+    #[error("the provided scope '{0}' is invalid: {1}")]
+    #[code(restate_errors::RT0024)]
+    InvalidScope(String, RestrictedValueError),
+    #[error("the provided limit key '{0}' is invalid: {1}")]
+    #[code(restate_errors::RT0024)]
+    InvalidLimitKey(String, restate_types::limit_key::ParseError),
+    #[error("invalid invocation id {0}: {1}")]
+    InvalidInvocationId(String, IdDecodeError),
 }
 
 #[derive(Debug)]
@@ -306,16 +380,6 @@ pub(crate) struct SdkInvocationError {
     pub(crate) related_entry: Option<InvocationErrorRelatedEntry>,
     pub(crate) next_retry_interval_override: Option<Duration>,
     pub(crate) error: Box<InvocationError>,
-}
-
-impl SdkInvocationError {
-    pub(crate) fn unknown() -> Self {
-        Self {
-            related_entry: None,
-            next_retry_interval_override: None,
-            error: Default::default(),
-        }
-    }
 }
 
 impl fmt::Display for SdkInvocationError {
@@ -394,19 +458,46 @@ impl fmt::Display for InvocationErrorRelatedEntry {
     }
 }
 
+/// What the SDK requested the invoker to do when an invocation fails.
+///
+/// Mirrors the protocol's `ErrorBehavior`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RequestedErrorBehavior {
+    /// Retry the invocation using the configured retry policy.
+    #[default]
+    Retry,
+    /// Retry the invocation after the given delay, overriding the retry policy
+    /// for the next retry attempt only.
+    RetryWithIntervalOverride(Duration),
+    /// Pause the invocation instead of retrying.
+    Pause,
+    /// Fail the invocation, without retrying.
+    Fail,
+}
+
+impl RequestedErrorBehavior {
+    /// Build a retry behavior, optionally overriding the retry interval for the next attempt.
+    pub(crate) fn retry(next_retry_interval_override: Option<Duration>) -> Self {
+        match next_retry_interval_override {
+            Some(interval) => Self::RetryWithIntervalOverride(interval),
+            None => Self::Retry,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SdkInvocationErrorV2 {
     pub(crate) related_command: Option<InvocationErrorRelatedCommandV2>,
-    pub(crate) next_retry_interval_override: Option<Duration>,
     pub(crate) error: Box<InvocationError>,
+    pub(crate) requested_error_behavior: RequestedErrorBehavior,
 }
 
 impl SdkInvocationErrorV2 {
     pub(crate) fn unknown() -> Self {
         Self {
             related_command: None,
-            next_retry_interval_override: None,
             error: Default::default(),
+            requested_error_behavior: RequestedErrorBehavior::default(),
         }
     }
 }

@@ -8,11 +8,10 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use crate::debug_if_leader;
-use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
-use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
+use tracing::warn;
+
 use restate_storage_api::fsm_table::WriteFsmTable;
-use restate_storage_api::outbox_table::{OutboxMessage, WriteOutboxTable};
+use restate_storage_api::outbox_table::WriteOutboxTable;
 use restate_storage_api::promise_table::{
     Promise, PromiseState, ReadPromiseTable, WritePromiseTable,
 };
@@ -23,17 +22,26 @@ use restate_types::journal_v2::{
     CompletePromiseCommand, CompletePromiseCompletion, CompletePromiseResult, CompletePromiseValue,
     EntryMetadata,
 };
-use tracing::warn;
+use restate_wal_protocol::v2::commands;
+
+use crate::debug_if_leader;
+use crate::partition::processor::ProcessorContext;
+use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
+use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
 
 pub(super) type ApplyCompletePromiseCommand<'e> =
     ApplyJournalCommandEffect<'e, CompletePromiseCommand>;
 
-impl<'e, 'ctx: 'e, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'e, 'ctx: 'e, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for ApplyCompletePromiseCommand<'e>
 where
     S: ReadStateTable + ReadPromiseTable + WritePromiseTable + WriteFsmTable + WriteOutboxTable,
+    P: ProcessorContext,
 {
-    async fn apply(mut self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
+    async fn apply(
+        mut self,
+        ctx: &'ctx mut StateMachineApplyContext<'s, S, P>,
+    ) -> Result<(), Error> {
         let invocation_metadata = self
             .invocation_status
             .get_invocation_metadata()
@@ -76,7 +84,7 @@ where
                     //  because we have the guarantee the the listener has the same partition key, so we could just process the command now.
                     //  Because we still miss the API for doing that, for now we use the outbox.
                     for listener in listeners {
-                        ctx.handle_outgoing_message(OutboxMessage::ServiceResponse(
+                        ctx.do_enqueue_into_outbox(commands::InvocationResponseCommand::from(
                             InvocationResponse {
                                 target: listener,
                                 result: match self.entry.value.clone() {

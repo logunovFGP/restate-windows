@@ -8,43 +8,36 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use restate_invoker_api::InvokeInputJournal;
+use restate_limiter::RuleUpdate;
 use restate_storage_api::outbox_table::OutboxMessage;
 use restate_storage_api::timer_table::TimerKey;
-use restate_storage_api::vqueue_table::EntryCard;
-use restate_types::identifiers::{InvocationId, PartitionProcessorRpcRequestId};
+use restate_storage_api::vqueue_table::EntryKey;
+use restate_types::identifiers::{EntryIndex, InvocationId, PartitionProcessorRpcRequestId};
 use restate_types::invocation::InvocationTarget;
 use restate_types::invocation::client::{
     CancelInvocationResponse, InvocationOutputResponse, KillInvocationResponse,
-    PurgeInvocationResponse, RestartAsNewInvocationResponse, ResumeInvocationResponse,
+    PauseInvocationResponse, PurgeInvocationResponse, RestartAsNewInvocationResponse,
+    ResumeInvocationResponse,
 };
-use restate_types::journal::Completion;
-use restate_types::journal_v2::CommandIndex;
-use restate_types::journal_v2::raw::RawNotification;
+use restate_types::journal_v2::{CommandIndex, NotificationId};
 use restate_types::message::MessageIndex;
 use restate_types::time::MillisSinceEpoch;
-use restate_types::vqueue::VQueueId;
-use restate_vqueues::VQueueEvent;
+use restate_util_string::ReString;
+use restate_vqueues::{VQueueEvent, VQueueHandle};
 use restate_wal_protocol::timer::TimerKeyValue;
 
 pub type ActionCollector = Vec<Action>;
 
-#[derive(derive_more::Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[derive(derive_more::Debug, strum::IntoStaticStr)]
 pub enum Action {
     /// Notifies the scheduler about a vqueue inbox event (e.g, enqueue, run permitted, etc.)
-    VQEvent(VQueueEvent<EntryCard>),
+    VQEvent(VQueueEvent),
     /// Tells invoker to run this invocation (similar to Invoke) but carries more information
     VQInvoke {
-        qid: VQueueId,
-        item_hash: u64,
-        invocation_id: InvocationId,
+        vq_handle: VQueueHandle,
+        key: EntryKey,
         invocation_target: InvocationTarget,
-        invoke_input_journal: InvokeInputJournal,
-    },
-    Invoke {
-        invocation_id: InvocationId,
-        invocation_target: InvocationTarget,
-        invoke_input_journal: InvokeInputJournal,
+        idempotency_key: Option<ReString>,
     },
     NewOutboxMessage {
         seq_number: MessageIndex,
@@ -60,13 +53,10 @@ pub enum Action {
         invocation_id: InvocationId,
         command_index: CommandIndex,
     },
-    ForwardCompletion {
-        invocation_id: InvocationId,
-        completion: Completion,
-    },
     ForwardNotification {
         invocation_id: InvocationId,
-        notification: RawNotification,
+        entry_index: EntryIndex,
+        notification_id: NotificationId,
     },
     AbortInvocation {
         invocation_id: InvocationId,
@@ -104,15 +94,25 @@ pub enum Action {
         request_id: PartitionProcessorRpcRequestId,
         response: ResumeInvocationResponse,
     },
+    ForwardPauseInvocationResponse {
+        request_id: PartitionProcessorRpcRequestId,
+        response: PauseInvocationResponse,
+    },
     ForwardRestartAsNewInvocationResponse {
         request_id: PartitionProcessorRpcRequestId,
         response: RestartAsNewInvocationResponse,
     },
+    /// Forward a batch of rule-book diff entries to the leader's
+    /// `UserLimiter` via the resource-manager mpsc. Emitted by
+    /// `Command::UpsertRuleBook` apply when the rule book version
+    /// advances. Followers ignore this action (no live UserLimiter to
+    /// notify); only the leader's `leader_state` dispatches it onward.
+    RulesUpdated(Box<[RuleUpdate]>),
 }
 
-impl From<VQueueEvent<EntryCard>> for Action {
+impl From<VQueueEvent> for Action {
     #[inline(always)]
-    fn from(value: VQueueEvent<EntryCard>) -> Self {
+    fn from(value: VQueueEvent) -> Self {
         Self::VQEvent(value)
     }
 }

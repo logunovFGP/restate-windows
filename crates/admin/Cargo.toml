@@ -28,15 +28,18 @@ restate-bifrost = { workspace = true, features = ["local-loglet", "replicated-lo
 restate-core = { workspace = true }
 restate-errors = { workspace = true }
 restate-ingestion-client = { workspace = true }
+restate-limiter = { workspace = true, features = ["rule-book"] }
 restate-metadata-store = { workspace = true }
 restate-metadata-providers = { workspace = true }
+restate-serde-util = { workspace = true }
 restate-service-client = { workspace = true }
-restate-service-protocol = { workspace = true, features = ["discovery"] }
+restate-service-protocol-v4 = { workspace = true, features = ["discovery", "serdes"] }
 restate-storage-query-datafusion = { workspace = true }
-restate-time-util = { workspace = true }
+restate-util-time = { workspace = true }
 restate-types = { workspace = true }
+restate-util-string = { workspace = true }
 restate-wal-protocol = { workspace = true }
-restate-web-ui = { git = "https://github.com/restatedev/restate-web-ui-crate", optional = true, version = "0.1.35", tag = "v0.1.35" }
+restate-web-ui = { git = "https://github.com/restatedev/restate-web-ui-crate", optional = true, version = "1.0.28", tag = "v1.0.28" }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
@@ -48,12 +51,13 @@ bytestring = { workspace = true }
 codederror = { workspace = true }
 datafusion = { workspace = true }
 derive_builder = { workspace = true }
-derive_more = { workspace = true }
+derive_more = { workspace = true, features = ["deref", "from"] }
 futures = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 hyper-util = { workspace = true }
+gardal = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
 mime_guess = { version = "2.0.5", optional = true }
@@ -67,7 +71,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport", "codegen", "gzip", "zstd"] }
 tower = { workspace = true, features = ["load-shed", "limit"] }
-tower-http = { workspace = true, features = ["trace"] }
+tower-http = { workspace = true, features = ["compression-br", "compression-gzip", "compression-zstd", "trace"] }
 tracing = { workspace = true }
 urlencoding = { workspace = true }
 utoipa = { workspace = true, features = ["axum_extras"] }

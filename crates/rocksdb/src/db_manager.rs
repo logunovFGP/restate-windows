@@ -14,13 +14,13 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use parking_lot::RwLock;
-use rocksdb::{Cache, WriteBufferManager};
+use rocksdb::{Cache, RateLimiter, RateLimiterMode, WriteBufferManager};
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 use restate_core::{ShutdownError, TaskCenter, TaskKind, cancellation_watcher};
-use restate_serde_util::ByteCount;
 use restate_types::config::{CommonOptions, Configuration};
+use restate_util_bytecount::ByteCount;
 
 use crate::background::ReadyStorageTask;
 use crate::{DbName, DbSpec, Priority, RocksAccess, RocksDb, RocksError, metric_definitions};
@@ -34,7 +34,8 @@ static DB_MANAGER: OnceLock<RocksDbManager> = OnceLock::new();
 #[derive(derive_more::Debug)]
 #[debug("RocksDbManager")]
 pub struct RocksDbManager {
-    pub(crate) env: rocksdb::Env,
+    /// A shared IO write rate limiter
+    pub(crate) rate_limiter: RateLimiter,
     /// a shared rocksdb block cache
     pub(crate) cache: Cache,
     // auto updates to changes in common.rocksdb_memory_limit and common.rocksdb_memtable_total_size_limit
@@ -44,6 +45,8 @@ pub struct RocksDbManager {
     close_db_tasks: TaskTracker,
     high_pri_pool: threadpool::ThreadPool,
     low_pri_pool: threadpool::ThreadPool,
+    // Keep at the end of the struct to ensure it's dropped last
+    pub(crate) env: rocksdb::Env,
 }
 
 impl RocksDbManager {
@@ -70,17 +73,28 @@ impl RocksDbManager {
 
         check_memory_limit(opts);
 
-        let cache = Cache::new_lru_cache(opts.rocksdb_total_memory_size.get());
+        // HCC is the newly recommended default for RocksDB.
+        let cache = Cache::new_hyper_clock_cache(opts.rocksdb_total_memory_size().as_usize(), 0);
         let write_buffer_manager = WriteBufferManager::new_write_buffer_manager_with_cache(
-            opts.rocksdb_actual_total_memtables_size(),
+            opts.rocksdb_total_memtables_size().as_usize(),
             false,
             cache.clone(),
         );
-        // Setup the shared rocksdb environment
+        // Setup the default shared rocksdb environment. These are just the initial pool sizes;
+        // rocksdb grows them on demand at db-open to fit each database's max_background_flushes
+        // (high-priority) and max_background_compactions (low-priority), never shrinking below.
         let mut env = rocksdb::Env::new().expect("rocksdb env is created");
-        env.set_low_priority_background_threads(opts.rocksdb_bg_threads().get() as i32);
-        env.set_high_priority_background_threads(opts.rocksdb_high_priority_bg_threads.get() as i32);
-        env.set_background_threads(opts.rocksdb_bg_threads().get() as i32);
+        env.set_high_priority_background_threads(2);
+        env.set_low_priority_background_threads(1);
+
+        // Setup the global write rate limiter
+        let rate_limiter = RateLimiter::new(
+            opts.rocksdb_max_write_rate_per_second.as_u64() as i64,
+            100 * 1000,
+            10,
+            RateLimiterMode::KWritesOnly,
+            true,
+        );
 
         // Create our own storage thread pools
         let high_pri_pool = threadpool::Builder::new()
@@ -97,6 +111,7 @@ impl RocksDbManager {
 
         let manager = Self {
             env,
+            rate_limiter,
             cache,
             write_buffer_manager,
             dbs,
@@ -216,6 +231,16 @@ impl RocksDbManager {
         Ok(builder.build()?)
     }
 
+    /// Returns aggregated memory usage for all databases if filter is empty
+    pub fn get_db_memory_usage_stats(
+        &self,
+        db: &Arc<RocksDb>,
+    ) -> Result<rocksdb::perf::MemoryUsage, RocksError> {
+        let mut builder = rocksdb::perf::MemoryUsageBuilder::new()?;
+        builder.add_db(db.inner().as_raw_db());
+        Ok(builder.build()?)
+    }
+
     pub fn get_all_dbs(&self) -> Vec<Arc<RocksDb>> {
         self.dbs.read().values().filter_map(Weak::upgrade).collect()
     }
@@ -260,7 +285,7 @@ impl RocksDbManager {
 
             self.close_db_tasks.spawn_blocking(move || {
                 db.db.shutdown();
-                name.clone()
+                name
             });
         }
         // wait for all tasks to complete
@@ -422,40 +447,36 @@ impl DbWatchdog {
         let new_common_opts = &Configuration::pinned().common;
 
         // Memory budget changed?
-        if new_common_opts.rocksdb_total_memory_size
-            != self.current_common_opts.rocksdb_total_memory_size
+        if new_common_opts.rocksdb_total_memory_size()
+            != self.current_common_opts.rocksdb_total_memory_size()
         {
             warn!(
-                old = self.current_common_opts.rocksdb_total_memory_size,
-                new = new_common_opts.rocksdb_total_memory_size,
+                old = %self.current_common_opts.rocksdb_total_memory_size(),
+                new = %new_common_opts.rocksdb_total_memory_size(),
                 "[config update] Setting rocksdb total memory limit to {}",
-                ByteCount::from(new_common_opts.rocksdb_total_memory_size)
+                new_common_opts.rocksdb_total_memory_size()
             );
             check_memory_limit(new_common_opts);
             self.cache
-                .set_capacity(new_common_opts.rocksdb_total_memory_size.get());
+                .set_capacity(new_common_opts.rocksdb_total_memory_size().as_usize());
             self.manager
                 .write_buffer_manager
-                .set_buffer_size(new_common_opts.rocksdb_actual_total_memtables_size());
+                .set_buffer_size(new_common_opts.rocksdb_total_memtables_size().as_usize());
         }
 
         // update memtable total memory
-        if new_common_opts.rocksdb_actual_total_memtables_size()
-            != self
-                .current_common_opts
-                .rocksdb_actual_total_memtables_size()
+        if new_common_opts.rocksdb_total_memtables_size()
+            != self.current_common_opts.rocksdb_total_memtables_size()
         {
             warn!(
-                old = self
-                    .current_common_opts
-                    .rocksdb_actual_total_memtables_size(),
-                new = new_common_opts.rocksdb_actual_total_memtables_size(),
+                old = %self.current_common_opts.rocksdb_total_memtables_size(),
+                new = %new_common_opts.rocksdb_total_memtables_size(),
                 "[config update] Setting rocksdb total memtables size limit to {}",
-                ByteCount::from(new_common_opts.rocksdb_actual_total_memtables_size())
+                new_common_opts.rocksdb_total_memtables_size()
             );
             self.manager
                 .write_buffer_manager
-                .set_buffer_size(new_common_opts.rocksdb_actual_total_memtables_size());
+                .set_buffer_size(new_common_opts.rocksdb_total_memtables_size().as_usize());
         }
 
         // Databases choose to react to config updates as they see fit.
@@ -474,23 +495,17 @@ impl DbWatchdog {
 fn check_memory_limit(opts: &CommonOptions) {
     if let Some(process_memory_size) = opts.process_total_memory_size() {
         let memory_ratio =
-            opts.rocksdb_total_memory_size.get() as f64 / process_memory_size.get() as f64;
-        if memory_ratio < 0.5 {
-            warn!(
-                "'rocksdb-total-memory-size' parameter is set to {}, less than half the process memory limit of {}. Roughly 75% of process memory should be given to RocksDB",
-                ByteCount::from(opts.rocksdb_total_memory_size),
-                ByteCount::from(process_memory_size),
-            )
-        } else if memory_ratio > 1.0 {
+            opts.rocksdb_total_memory_size().as_u64() as f64 / process_memory_size.get() as f64;
+        if memory_ratio > 1.0 {
             error!(
-                "'rocksdb-total-memory-size' parameter is set to {}, more than the process memory limit of {}. This guarantees an OOM under load; roughly 75% of process memory should be given to RocksDB",
-                ByteCount::from(opts.rocksdb_total_memory_size),
+                "'rocksdb-total-memory-size' parameter is set to {}, more than the process memory limit of {}. This guarantees an OOM under load; keep it under 50% of process memory",
+                opts.rocksdb_total_memory_size(),
                 ByteCount::from(process_memory_size),
             )
         } else if memory_ratio > 0.9 {
             error!(
-                "'rocksdb-total-memory-size' parameter is set to {}, more than 90% of the process memory limit of {}. This risks an OOM under load; roughly 75% of process memory should be given to RocksDB",
-                ByteCount::from(opts.rocksdb_total_memory_size),
+                "'rocksdb-total-memory-size' parameter is set to {}, more than 90% of the process memory limit of {}. This risks an OOM under load; keep it under 50% of process memory",
+                opts.rocksdb_total_memory_size(),
                 ByteCount::from(process_memory_size),
             )
         }

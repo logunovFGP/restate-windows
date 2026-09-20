@@ -36,6 +36,7 @@ use restate_storage_api::invocation_status_table::{
 };
 use restate_storage_api::journal_table as journal_table_v1;
 use restate_storage_api::journal_table_v2::{ReadJournalTable, WriteJournalTable};
+use restate_storage_api::lock_table::WriteLockTable;
 use restate_storage_api::outbox_table::WriteOutboxTable;
 use restate_storage_api::promise_table::{ReadPromiseTable, WritePromiseTable};
 use restate_storage_api::state_table::{ReadStateTable, WriteStateTable};
@@ -50,6 +51,7 @@ use restate_types::storage::{StoredRawEntry, StoredRawEntryHeader};
 
 use crate::debug_if_leader;
 use crate::metric_definitions::USAGE_LEADER_JOURNAL_ENTRY_COUNT;
+use crate::partition::processor::ProcessorContext;
 use crate::partition::state_machine::entries::attach_invocation_command::ApplyAttachInvocationCommand;
 use crate::partition::state_machine::entries::call_commands::{
     ApplyCallCommand, ApplyOneWayCallCommand,
@@ -102,7 +104,7 @@ impl OnJournalEntryCommand {
     }
 }
 
-impl<'ctx, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'ctx, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for OnJournalEntryCommand
 where
     S: WriteJournalTable
@@ -119,9 +121,14 @@ where
         + ReadStateTable
         + WriteStateTable
         + WriteVQueueTable
+        + WriteLockTable
         + ReadVQueueTable,
+    P: ProcessorContext,
 {
-    async fn apply(mut self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
+    async fn apply(
+        mut self,
+        ctx: &'ctx mut StateMachineApplyContext<'s, S, P>,
+    ) -> Result<(), Error> {
         if !matches!(self.invocation_status, InvocationStatus::Invoked(_))
             && !matches!(self.invocation_status, InvocationStatus::Suspended { .. })
             && !matches!(self.invocation_status, InvocationStatus::Paused(_))
@@ -149,6 +156,14 @@ where
 
         let mut entries = VecDeque::from([self.entry]);
         while let Some(entry) = entries.pop_front() {
+            // Compute the entry index before processing effects, so it's available
+            // for signal-only notification forwarding.
+            let entry_index = self
+                .invocation_status
+                .get_journal_metadata()
+                .expect("At this point there must be a journal")
+                .length;
+
             // We need this information to store the journal entry!
             let mut related_completion_ids = vec![];
 
@@ -337,6 +352,7 @@ where
                         entry: entry
                             .try_as_notification_ref()
                             .ok_or(Error::BadEntryVariant(et))?,
+                        entry_index,
                     }
                     .apply(ctx)
                     .await?;
@@ -349,7 +365,9 @@ where
                 .get_journal_metadata_mut()
                 .expect("At this point there must be a journal");
 
-            let entry_index = journal_meta.length;
+            // Make sure that nobody changed the journal_meta.length which we use to predict the new
+            // entry index. Otherwise, we might have sent a notification with the wrong entry index.
+            debug_assert_eq!(entry_index, journal_meta.length);
             debug_if_leader!(
                 ctx.is_leader,
                 restate.journal.index = entry_index,
@@ -367,7 +385,7 @@ where
             // Store journal entry
             WriteJournalTable::put_journal_entry(
                 ctx.storage,
-                self.invocation_id,
+                &self.invocation_id,
                 entry_index,
                 // Make sure that a deterministic append time is set based on Bifrost's record creation
                 // time. This ensures that the append time does not depend on the application time of
@@ -418,21 +436,24 @@ mod tests {
         Header, InvocationResponse, InvocationTarget, JournalCompletionTarget, ResponseResult,
     };
     use restate_types::journal_v2::{CallCommand, CallRequest};
-    use restate_types::{RESTATE_VERSION_1_6_0, SemanticRestateVersion};
-    use restate_wal_protocol::Command;
+    use restate_types::partitions::{PartitionFeatureChange, PersistedFeatures};
+    use restate_wal_protocol::v2::{Command, commands};
 
     #[restate_core::test]
     async fn update_journal_and_commands_length() {
-        run_update_journal_and_commands_length(SemanticRestateVersion::unknown()).await;
+        run_update_journal_and_commands_length(PersistedFeatures::default()).await;
     }
 
     #[restate_core::test]
     async fn update_journal_and_commands_length_journal_v2_enabled() {
-        run_update_journal_and_commands_length(RESTATE_VERSION_1_6_0.clone()).await;
+        run_update_journal_and_commands_length(PersistedFeatures::from_iter([
+            PartitionFeatureChange::EnableJournalV2,
+        ]))
+        .await;
     }
 
-    async fn run_update_journal_and_commands_length(min_restate_version: SemanticRestateVersion) {
-        let mut test_env = TestEnv::create_with_min_restate_version(min_restate_version).await;
+    async fn run_update_journal_and_commands_length(features: PersistedFeatures) {
+        let mut test_env = TestEnv::create_with_features(features).await;
         let invocation_id = fixtures::mock_start_invocation(&mut test_env).await;
         fixtures::mock_pinned_deployment_v5(&mut test_env, invocation_id).await;
 
@@ -471,13 +492,15 @@ mod tests {
         );
 
         let _ = test_env
-            .apply(Command::InvocationResponse(InvocationResponse {
-                target: JournalCompletionTarget {
-                    caller_id: invocation_id,
-                    caller_completion_id: result_completion_id,
+            .apply(commands::InvocationResponseCommand::test_envelope(
+                InvocationResponse {
+                    target: JournalCompletionTarget {
+                        caller_id: invocation_id,
+                        caller_completion_id: result_completion_id,
+                    },
+                    result: ResponseResult::Success(success_result.clone()),
                 },
-                result: ResponseResult::Success(success_result.clone()),
-            }))
+            ))
             .await;
         assert_that!(
             test_env

@@ -11,7 +11,6 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use metrics::Key;
 
 use restate_encoding::{ArcedSlice, RestateEncoding};
 
@@ -35,7 +34,7 @@ impl IngestRecord {
     }
 
     pub fn estimate_size(&self) -> usize {
-        size_of::<Key>() + self.record.len()
+        size_of::<Keys>() + self.record.len()
     }
 }
 
@@ -56,12 +55,6 @@ impl IngestRequest {
         self.records
             .iter()
             .fold(0, |size, item| size + item.estimate_size())
-    }
-}
-
-impl From<Arc<[IngestRecord]>> for IngestRequest {
-    fn from(records: Arc<[IngestRecord]>) -> Self {
-        Self { records }
     }
 }
 
@@ -102,6 +95,11 @@ define_rpc! {
     @service=PartitionLeaderService,
 }
 
+/// [`ReceivedIngestRequest`] must be kept
+/// in lockstep with [`IngestRequest`]
+/// It uses the same TYPE as [`IngestRequest`]
+/// to be able to decode directly to owned Vec
+/// on server side.
 #[derive(Debug, bilrost::Message)]
 pub struct ReceivedIngestRequest {
     #[bilrost(tag(1), encoding(packed))]

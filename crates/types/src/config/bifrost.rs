@@ -8,23 +8,24 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use adaptive_timeout::BackoffInterval;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tracing::warn;
 
-use restate_serde_util::{ByteCount, NonZeroByteCount};
-use restate_time_util::{FriendlyDuration, NonZeroFriendlyDuration};
+use restate_util_bytecount::{ByteCount, NonZeroByteCount};
+use restate_util_time::{FriendlyDuration, NonZeroFriendlyDuration};
 
 use crate::logs::metadata::{NodeSetSize, ProviderKind};
 use crate::net::connect_opts::MESSAGE_SIZE_OVERHEAD;
 use crate::retries::RetryPolicy;
 
 use super::networking::DEFAULT_MESSAGE_SIZE_LIMIT;
-use super::{CommonOptions, NetworkingOptions, RocksDbOptions, RocksDbOptionsBuilder};
+use super::{BackgroundWorkBudget, CommonOptions, NetworkingOptions, RocksDbOptions};
 
 /// # Bifrost options
 #[serde_as]
@@ -192,6 +193,12 @@ pub struct LocalLogletOptions {
     /// (See `rocksdb-total-memtables-ratio` in common).
     rocksdb_memory_ratio: f32,
 
+    /// # Disable WAL
+    ///
+    /// Dangerous option, use with caution.
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    rocksdb_disable_wal: bool,
+
     /// Disable fsync of WAL on every batch
     rocksdb_disable_wal_fsync: bool,
 
@@ -208,6 +215,24 @@ pub struct LocalLogletOptions {
     /// Trigger a commit when the time since the last commit exceeds this threshold.
     /// Batching is disabled if this is set to zero.
     pub writer_batch_commit_duration: FriendlyDuration,
+
+    /// # Max background flushes
+    ///
+    /// Maximum number of concurrent flush operations for the local-loglet database.
+    ///
+    /// If unset, defaults to 1 (local-loglet has a lightweight workload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    rocksdb_max_background_flushes: Option<NonZeroU32>,
+
+    /// # Max background compactions
+    ///
+    /// Maximum number of concurrent compaction operations for the local-loglet database.
+    ///
+    /// If unset, defaults to 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    rocksdb_max_background_compactions: Option<NonZeroU32>,
 }
 
 impl LocalLogletOptions {
@@ -217,7 +242,7 @@ impl LocalLogletOptions {
             self.rocksdb_memory_budget = Some(
                 // 1MB minimum
                 NonZeroUsize::new(
-                    (common.rocksdb_safe_total_memtables_size() as f64
+                    (common.rocksdb_total_memtables_size().as_usize() as f64
                         * self.rocksdb_memory_ratio as f64)
                         .floor()
                         .max(1024.0 * 1024.0) as usize,
@@ -225,6 +250,29 @@ impl LocalLogletOptions {
                 .unwrap(),
             );
         }
+    }
+
+    pub fn apply_background_work_budget(&mut self, budget: &BackgroundWorkBudget) {
+        if self.rocksdb_max_background_flushes.is_none() {
+            self.rocksdb_max_background_flushes = Some(budget.max_background_flushes);
+        }
+        if self.rocksdb_max_background_compactions.is_none() {
+            self.rocksdb_max_background_compactions = Some(budget.max_background_compactions);
+        }
+    }
+
+    pub fn rocksdb_disable_wal(&self) -> bool {
+        self.rocksdb_disable_wal
+    }
+
+    pub fn rocksdb_max_background_flushes(&self) -> NonZeroU32 {
+        self.rocksdb_max_background_flushes
+            .unwrap_or(NonZeroU32::new(1).unwrap())
+    }
+
+    pub fn rocksdb_max_background_compactions(&self) -> NonZeroU32 {
+        self.rocksdb_max_background_compactions
+            .unwrap_or(NonZeroU32::new(1).unwrap())
     }
 
     pub fn rocksdb_disable_wal_fsync(&self) -> bool {
@@ -248,12 +296,8 @@ impl LocalLogletOptions {
 
 impl Default for LocalLogletOptions {
     fn default() -> Self {
-        let rocksdb = RocksDbOptionsBuilder::default()
-            .rocksdb_disable_wal(Some(false))
-            .build()
-            .unwrap();
         Self {
-            rocksdb,
+            rocksdb: RocksDbOptions::default(),
             // set by apply_common in runtime
             rocksdb_memory_budget: None,
             rocksdb_memory_ratio: 0.5,
@@ -261,6 +305,9 @@ impl Default for LocalLogletOptions {
             writer_batch_commit_duration: FriendlyDuration::ZERO,
             rocksdb_disable_wal_fsync: false,
             always_commit_in_background: false,
+            rocksdb_max_background_flushes: None,
+            rocksdb_max_background_compactions: None,
+            rocksdb_disable_wal: false,
         }
     }
 }
@@ -283,7 +330,22 @@ pub struct ReplicatedLogletOptions {
     /// Sequencer retry policy
     ///
     /// Backoff introduced when sequencer fail to find a suitable spread of log servers
-    pub sequencer_retry_policy: RetryPolicy,
+    #[deprecated(since = "1.7.0", note = "Use `rpc_timeout` instead")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequencer_retry_policy: Option<RetryPolicy>,
+
+    /// Adaptive timeout for LogServer RPC
+    ///
+    /// This configures the adaptive timeout range for RPC operations from this node to log servers.
+    /// The timeout range is also used to determine the appropriate retry delay between retry attempts.
+    pub rpc_timeout: BackoffInterval,
+
+    /// Adaptive timeout for LogServer Store Messages
+    ///
+    /// This configures the adaptive timeout range for Store operations from this node to log servers.
+    ///
+    /// Since v1.7.0
+    pub store_timeout: BackoffInterval,
 
     /// Sequencer inactivity timeout
     ///
@@ -296,12 +358,16 @@ pub struct ReplicatedLogletOptions {
     /// Log Server RPC timeout
     ///
     /// Timeout waiting on log server response
-    pub log_server_rpc_timeout: NonZeroFriendlyDuration,
+    #[deprecated(since = "1.7.0", note = "Use `rpc_timeout` instead")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_server_rpc_timeout: Option<NonZeroFriendlyDuration>,
 
     /// Log Server RPC retry policy
     ///
     /// Retry policy for log server RPCs
-    pub log_server_retry_policy: RetryPolicy,
+    #[deprecated(since = "1.7.0", note = "Use `rpc_timeout` instead")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_server_retry_policy: Option<RetryPolicy>,
 
     /// Maximum number of records to prefetch from log servers
     ///
@@ -364,24 +430,21 @@ impl Default for ReplicatedLogletOptions {
         Self {
             maximum_inflight_records: NonZeroUsize::new(1000).unwrap(),
 
-            sequencer_retry_policy: RetryPolicy::exponential(
-                Duration::from_millis(250),
-                2.0,
-                None,
-                Some(Duration::from_millis(5000)),
-            ),
+            sequencer_retry_policy: None,
+            rpc_timeout: BackoffInterval {
+                min_ms: NonZeroU32::new(250).unwrap(),
+                max_ms: NonZeroU32::new(60_000).unwrap(),
+            },
+            store_timeout: BackoffInterval {
+                min_ms: NonZeroU32::new(2000).unwrap(),
+                max_ms: NonZeroU32::new(60_000).unwrap(),
+            },
             sequencer_inactivity_timeout: NonZeroFriendlyDuration::from_secs_unchecked(15),
             read_batch_size: NonZeroByteCount::new(
                 NonZeroUsize::new(32 * 1024).expect("Non zero number"),
             ),
-            log_server_rpc_timeout: NonZeroFriendlyDuration::from_millis_unchecked(2000),
-
-            log_server_retry_policy: RetryPolicy::exponential(
-                Duration::from_millis(250),
-                2.0,
-                Some(3),
-                Some(Duration::from_millis(2000)),
-            ),
+            log_server_rpc_timeout: None,
+            log_server_retry_policy: None,
             readahead_records: NonZeroU16::new(20).unwrap(),
             readahead_trigger_ratio: 0.5,
             default_nodeset_size: NodeSetSize::default(),

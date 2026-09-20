@@ -14,20 +14,24 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use anyhow::bail;
 use enumset::EnumSet;
+use paste::paste;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use restate_serde_util::{NonZeroByteCount, SerdeableHeaderHashMap};
-use restate_time_util::{FriendlyDuration, NonZeroFriendlyDuration};
+use restate_serde_util::SerdeableHeaderHashMap;
+use restate_util_bytecount::NonZeroByteCount;
+use restate_util_time::{FriendlyDuration, NonZeroFriendlyDuration};
+use tracing::warn;
 
 use super::{
-    AwsLambdaOptions, DEFAULT_MESSAGE_SIZE_LIMIT, GossipOptions, HttpOptions,
-    InvalidConfigurationError, ObjectStoreOptions, PerfStatsLevel, RocksDbOptions,
+    CPU_COUNT, DEFAULT_MESSAGE_SIZE_LIMIT, GossipOptions, InvalidConfigurationError,
+    ObjectStoreOptions, PerfStatsLevel, RocksDbOptions,
 };
 use crate::PlainNodeId;
-use crate::config::NetworkingOptions;
 use crate::config::dynamodb_store::DynamoDbOptions;
+use crate::config::{DeprecatedServiceClientOptions, NetworkingOptions};
 use crate::locality::NodeLocation;
 use crate::net::address::{AdvertisedAddress, ListenerPort};
 use crate::net::address::{BindAddress, FabricPort, TokioConsolePort};
@@ -36,14 +40,18 @@ use crate::nodes_config::Role;
 use crate::replication::ReplicationProperty;
 use crate::retries::RetryPolicy;
 
+const MIN_ROCKSDB_MEMORY: NonZeroByteCount =
+    NonZeroByteCount::new(NonZeroUsize::new(256 * 1024 * 1024).unwrap());
+
+const MIN_MEMTABLE_TOTAL_BUDGET: NonZeroByteCount =
+    NonZeroByteCount::new(NonZeroUsize::new(32 * 1024 * 1024).unwrap());
+
 const DEFAULT_STORAGE_DIRECTORY: &str = "restate-data";
-const X_RESTATE_CLUSTER_NAME: http::HeaderName =
-    http::HeaderName::from_static("x-restate-cluster-name");
 
 static HOSTNAME: LazyLock<String> = LazyLock::new(|| {
     hostname::get()
         .map(|h| h.into_string().expect("hostname is valid unicode"))
-        .unwrap_or("INVALID_HOSTANAME".to_owned())
+        .unwrap_or_else(|_| "INVALID_HOSTANAME".to_owned())
 });
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,7 +153,7 @@ impl<P: ListenerPort + 'static> ListenerOptions<P> {
         }
 
         if self.advertised_host.is_none() && self.advertised_address.is_none() {
-            self.advertised_host = other.advertised_host.clone();
+            self.advertised_host.clone_from(&other.advertised_host);
         }
     }
 
@@ -163,12 +171,12 @@ impl<P: ListenerPort + 'static> ListenerOptions<P> {
         })
     }
 
-    /// The advertised address explicitly configured for this listener, if any.
+    /// The bind address explicitly configured for this listener, if any.
     ///
-    /// Unlike [`Self::advertised_address`] this never guesses, so a caller can tell a
-    /// pinned address apart from one that would be inferred at bind time.
-    pub fn configured_advertised_address(&self) -> Option<&AdvertisedAddress<P>> {
-        self.advertised_address.as_ref()
+    /// Unlike [`Self::bind_address`] this never falls back to a default, so a caller can
+    /// tell a pinned address apart from one that would be inferred at bind time.
+    pub fn configured_bind_address(&self) -> Option<&BindAddress<P>> {
+        self.bind_address.as_ref()
     }
 
     /// Pins this listener to an explicit TCP socket, for both binding and advertising.
@@ -185,11 +193,11 @@ impl<P: ListenerPort + 'static> ListenerOptions<P> {
             Some(addr.port()),
             false,
         ));
-        self.advertised_address = Some(
-            format!("http://{addr}")
-                .parse()
-                .expect("a socket address forms a valid http uri"),
-        );
+        // Deliberately not setting `advertised_address`: its scheme depends on whether
+        // fabric TLS is on, and tests configure TLS *after* the node is built. Setting
+        // advertised_host instead lets the node derive http:// or https:// itself, and
+        // keeps it pointing at the interface we actually bound.
+        self.advertised_host = Some(addr.ip().to_string());
     }
 
     pub fn advertised_address(&self, address_book: &AddressBook) -> AdvertisedAddress<P> {
@@ -211,6 +219,148 @@ impl<P: ListenerPort> Default for ListenerOptions<P> {
             advertised_address: None,
         }
     }
+}
+
+/// TLS mode for fabric inter-node communication.
+///
+/// The modes are ordered for safe rolling enablement (and rollback): certificate
+/// distribution is decoupled from advertising TLS, which is decoupled from
+/// requiring it. Roll the cluster forward one step at a time:
+/// `off` → `allow` → `prefer` → `require`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsMode {
+    /// TLS is disabled. Certificates are not loaded and the node behaves as if
+    /// `[tls]` were absent. Allows staging the TLS configuration on all nodes
+    /// before activating it.
+    #[default]
+    Off,
+    /// Certificates are loaded; both TLS and plaintext connections are
+    /// accepted, but the node still advertises a plaintext (`http://`)
+    /// address. Peers that have not loaded TLS configuration yet can still
+    /// connect to it — and it can be dialed by every node in the cluster.
+    Allow,
+    /// Both TLS and plaintext connections are accepted, and the node
+    /// advertises an `https://` address so peers connect with TLS. Only move
+    /// here once all nodes are at least in `allow` mode.
+    Prefer,
+    /// Only TLS connections are accepted; plaintext is rejected. Only move
+    /// here once all nodes are in `prefer` mode.
+    Require,
+}
+
+impl TlsMode {
+    /// Certificates are loaded and the TLS acceptor/connector machinery is active.
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, TlsMode::Off)
+    }
+
+    /// The node advertises an `https://` fabric address.
+    pub fn advertises_tls(&self) -> bool {
+        matches!(self, TlsMode::Prefer | TlsMode::Require)
+    }
+
+    /// Plaintext connections are accepted alongside TLS.
+    pub fn accepts_plaintext(&self) -> bool {
+        !matches!(self, TlsMode::Require)
+    }
+}
+
+/// TLS configuration for fabric inter-node communication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct FabricTlsOptions {
+    /// TLS enforcement mode: `off`, `allow`, `prefer`, or `require`.
+    /// Default: `off`. See [`TlsMode`] for the rolling-enablement sequence.
+    #[serde(default)]
+    pub mode: TlsMode,
+
+    /// Path to the PEM-encoded server certificate.
+    pub cert_file: PathBuf,
+
+    /// Path to the PEM-encoded private key.
+    pub key_file: PathBuf,
+
+    /// Paths to PEM-encoded CA certificates for verifying peer certificates.
+    pub ca_files: Vec<PathBuf>,
+
+    /// Require clients to present a valid certificate (mTLS). Default: `false`.
+    #[serde(default = "default_require_client_auth")]
+    pub require_client_auth: bool,
+
+    /// How often to reload certificates from disk. Default: `1h`.
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval: NonZeroFriendlyDuration,
+
+    /// Allowed subject names on peer certificates. After mTLS authentication
+    /// succeeds, the peer certificate's Subject Common Name (CN) and Subject
+    /// Alternative Names (DNS names and URIs) are checked against these patterns.
+    /// Supports `*` glob wildcards (e.g., `spiffe://domain/*`, `restate-*`).
+    ///
+    /// Required when `require-client-auth` is `true`. Use `["*"]` to explicitly
+    /// allow any authenticated peer (CA-only trust). An empty list is a
+    /// configuration error to prevent accidental fail-open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_subject_names: Vec<String>,
+}
+
+impl FabricTlsOptions {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if self.require_client_auth && self.allowed_subject_names.is_empty() {
+            anyhow::bail!(
+                "[tls] require-client-auth is true but allowed-subject-names is empty. \
+                 Specify allowed patterns (e.g., [\"spiffe://domain/*\"]) or set [\"*\"] \
+                 to explicitly allow any authenticated peer."
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_advertised_address(
+        &self,
+        address: &AdvertisedAddress<FabricPort>,
+    ) -> anyhow::Result<()> {
+        match self.mode {
+            TlsMode::Off | TlsMode::Allow => Ok(()),
+            TlsMode::Prefer => {
+                let Some(uri) = address.uri() else {
+                    warn!(
+                        "Tls mode is set to prefer, while the advertised address is a unix socket. TLS is currently not supported for unix sockets."
+                    );
+                    return Ok(());
+                };
+                if uri.scheme() != Some(&http::uri::Scheme::HTTPS) {
+                    warn!(
+                        "Advertised address '{address}' is not HTTPS, but TLS is in 'prefer' mode. Nodes will attempt to connect to this node in plaintext instead."
+                    );
+                }
+                Ok(())
+            }
+            TlsMode::Require => {
+                let Some(uri) = address.uri() else {
+                    bail!(
+                        "Tls mode is set to required, while the advertised address is a unix socket. TLS is currently not supported for unix sockets."
+                    );
+                };
+                if uri.scheme() != Some(&http::uri::Scheme::HTTPS) {
+                    bail!(
+                        "Advertised address '{address}' is not an HTTPS address, but TLS is in 'require' mode. Please either advertise an HTTPS address in the config or loosen the TLS mode."
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn default_require_client_auth() -> bool {
+    false
+}
+
+fn default_refresh_interval() -> NonZeroFriendlyDuration {
+    NonZeroFriendlyDuration::from_secs_unchecked(3600)
 }
 
 #[serde_as]
@@ -236,6 +386,17 @@ pub struct CommonOptions {
 
     #[serde(flatten)]
     pub(super) fabric_listener_options: ListenerOptions<FabricPort>,
+
+    /// # TLS Configuration
+    ///
+    /// Optional TLS/mTLS configuration for inter-node fabric communication.
+    /// When set, the fabric port uses TLS for both inbound and outbound connections.
+    /// Without this section, fabric communication remains plaintext (default behavior).
+    ///
+    /// Since v1.7.3
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    tls: Option<FabricTlsOptions>,
 
     /// # Node Location
     ///
@@ -303,8 +464,6 @@ pub struct CommonOptions {
     /// NOTE 1: This config entry only impacts the initial number of partitions, the
     /// value of this entry is ignored for provisioned nodes/clusters.
     ///
-    /// NOTE 2: This will be renamed to `default-num-partitions` by default as of v1.3+
-    ///
     /// Default: 24
     pub default_num_partitions: u16,
 
@@ -330,7 +489,17 @@ pub struct CommonOptions {
     /// Size of the default thread pool used to perform internal tasks.
     /// If not set, it defaults to the number of CPU cores.
     #[builder(setter(strip_option))]
-    default_thread_pool_size: Option<usize>,
+    default_thread_pool_size: Option<u32>,
+
+    /// # Default async runtime thread stack size
+    ///
+    /// Stack size of the worker threads of the default async runtime.
+    /// If not set, it defaults to tokio's default stack size.
+    ///
+    /// Since v1.7.1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub default_thread_stack_size: Option<NonZeroByteCount>,
 
     #[serde(flatten)]
     pub tracing: TracingOptions,
@@ -352,7 +521,7 @@ pub struct CommonOptions {
     pub log_disable_ansi_codes: bool,
 
     /// Address to bind for the tokio-console tracing subscriber. If unset and restate-server is
-    /// built with tokio-console support, it'll listen on `0.0.0.0:6669`.
+    /// built with tokio-console support, it'll listen on `[::]:6669`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub tokio_console_bind_address: Option<BindAddress<TokioConsolePort>>,
@@ -365,8 +534,11 @@ pub struct CommonOptions {
     )]
     tokio_console_listener_options: ListenerOptions<TokioConsolePort>,
 
-    #[serde(flatten)]
-    pub service_client: ServiceClientOptions,
+    // todo: remove in Restate v1.8
+    #[serde(flatten, skip_serializing)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    #[deprecated(since = "1.7.0", note = "Moved to `worker.invoker.service-client`")]
+    pub(crate) service_client: DeprecatedServiceClientOptions,
 
     /// Disable prometheus metric recording and reporting. Default is `false`.
     pub disable_prometheus: bool,
@@ -395,33 +567,64 @@ pub struct CommonOptions {
     #[cfg_attr(feature = "schemars", schemars(skip))]
     pub process_total_memory_size: Option<NonZeroUsize>,
 
+    /// # Rocksdb global disk write rate limiter
+    ///
+    /// This lets Rocksdb calibrates its IO operations to make the best use out of
+    /// the available IO bandwidth of the underlying storage device. Rocksdb will
+    /// auto-tune the rate according to the actual background IO workload and will
+    /// use this value as an upper bound.
+    ///
+    /// You can use a tool like `fio` to measure the actual IO bandwidth of your storage
+    /// device (use block size of 64k, direct IO, and iodepth of 32 across 4 jobs to get a
+    /// reasonable estimate).
+    ///
+    /// For instance, consider the output of the following command:
+    ///
+    /// ```text
+    /// fio --name=c --directory=/restate-data --rw=write --bs=1m --size=8g --numjobs=4 --direct=1 --group_reporting
+    /// ...
+    ///   WRITE: bw=601MiB/s (630MB/s), 601MiB/s-601MiB/s (630MB/s-630MB/s), io=32.0GiB (34.4GB), run=54560-54560msec
+    /// ```
+    ///
+    /// The default value assumes a fast NVMe with bandwidth of 7GiB (per second).
+    pub rocksdb_max_write_rate_per_second: NonZeroByteCount,
+
     /// # Total memory limit for rocksdb caches and memtables.
     ///
     /// This includes memory for uncompressed block cache and all memtables by all open databases.
-    /// The memory size used for rocksdb caches.
-    #[serde_as(as = "NonZeroByteCount")]
-    #[cfg_attr(feature = "schemars", schemars(with = "NonZeroByteCount"))]
-    pub rocksdb_total_memory_size: NonZeroUsize,
+    ///
+    /// The minimum supported is 256 MiB. Any value below this will be sanitized automatically to 256 MiB.
+    rocksdb_total_memory_size: NonZeroByteCount,
 
     /// # Rocksdb total memtable size ratio
     ///
-    /// The memory size used across all memtables (ratio between 0 to 1.0). This
+    /// The memory size used across all memtables (ratio between 0.1 to 1.0). This
     /// limits how much memory memtables can eat up from the value in rocksdb-total-memory-limit.
-    /// When set to 0, memtables can take all available memory up to the value specified
-    /// in rocksdb-total-memory-limit. This value will be sanitized to 1.0 if outside the valid bounds.
+    ///
+    /// The remaining memory will be dedicated to the block cache.
+    ///
+    /// This value will be sanitized to 1.0 if outside the valid bounds.
     rocksdb_total_memtables_ratio: f32,
 
-    /// # Rocksdb Background Threads
+    /// # Rocksdb Low Priority Background Threads
     ///
-    /// The number of threads to reserve to Rocksdb background tasks. Defaults to the number of
-    /// cores on the machine.
+    /// The number of threads to reserve to lower priority Rocksdb background tasks.
+    ///
+    /// Defaults to the remaining CPU cores not used by high-priority rocksdb threads
+    ///
+    /// Since v1.7.0 (renamed from `rocksdb-bg-threads`)
     #[serde(skip_serializing_if = "Option::is_none")]
-    rocksdb_bg_threads: Option<NonZeroU32>,
+    rocksdb_low_priority_threads: Option<NonZeroU32>,
 
     /// # Rocksdb High Priority Background Threads
     ///
     /// The number of threads to reserve to high priority Rocksdb background tasks.
-    pub rocksdb_high_priority_bg_threads: NonZeroU32,
+    ///
+    /// Defaults to 1/4 of the number of CPU cores.
+    ///
+    /// Since v1.7.0 (renamed from `rocksdb-high-priority-bg-threads`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rocksdb_high_priority_threads: Option<NonZeroU32>,
 
     /// # Rocksdb performance statistics level
     ///
@@ -466,14 +669,18 @@ pub struct CommonOptions {
     /// You can set this flag to true to disable this collection. It can also be set with the environment variable DO_NOT_TRACK=1.
     pub disable_telemetry: bool,
 
+    /// # Disable the config table
+    ///
+    /// Disables the `config` SQL table, which exposes the node's running
+    /// configuration via SQL queries.
+    ///
+    /// Since v1.7.1
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_config_sql_table: bool,
+
     /// Options of gossip-based failure detector
     #[serde(flatten)]
     pub gossip: GossipOptions,
-
-    /// Current in heavy development, do not enable this feature unless you are a contributor
-    #[cfg_attr(feature = "schemars", schemars(skip))]
-    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
-    pub experimental_enable_vqueues: bool,
 
     /// # HLC maximum drift
     ///
@@ -492,28 +699,170 @@ pub struct CommonOptions {
     #[serde(default)]
     hlc_max_drift: FriendlyDuration,
 
-    /// # Experimental Kafka batch ingestion
-    ///
-    /// Use the new experimental kafka ingestion path which leverages batching
-    /// for a faster kafka ingestion.
-    ///
-    /// Set to `true` to enable the experimental ingestion mechanism.
-    ///
-    /// The legacy path will be removed in v1.7.
-    ///
-    /// Defaults to `false` in v1.6.
-    pub experimental_kafka_batch_ingestion: bool,
+    #[serde(flatten)]
+    pub experimental: Experimental,
+}
 
-    /// # Experimental Shuffler batch ingestion
+/// Declares the [`Experimental`] feature-flag struct from a list of feature names.
+///
+/// Each entry is a bare identifier (optionally preceded by doc comments / attributes) inside
+/// `experimental! { ... }`. For a feature `foo` the macro generates:
+/// - a `experimental_enable_foo: bool` field on [`Experimental`] — this is the on-disk /
+///   JSON-schema name, so the configuration schema always exposes flags as
+///   `experimental_enable_<feature>`;
+/// - `Experimental::is_foo_enabled()` and `Experimental::set_foo(enable)` accessors;
+/// - an entry in [`Experimental::features`] keyed on the bare name `"foo"` (without the
+///   `experimental_enable_` prefix), which is what is surfaced through the admin `/version` API.
+///
+/// Adding a new experimental flag is therefore a one-line change at the invocation site below:
+/// no other code needs to be touched for the flag to show up in `/version`.
+macro_rules! experimental {
+    (@gen_struct [] -> [$($body:tt)*]) => {
+        #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+        #[cfg_attr(feature = "schemars", schemars(default))]
+        #[serde(rename_all = "kebab-case")]
+        pub struct Experimental {
+            $($body)*
+        }
+    };
+    (@gen_struct [$(#[$($attrss:meta)*])* $feat:ident $(, $($tail:tt)*)?] -> [$($body:tt)*]) => {
+        paste!{
+            experimental!(@gen_struct [$($($tail)*)?] -> [
+                $($body)*
+
+                $(#[$($attrss)*])*
+                #[cfg_attr(feature = "schemars", schemars(skip))]
+                #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+                [<experimental_enable_ $feat>]: bool,
+            ]);
+        }
+    };
+    (@gen_features [] -> [$($field:ident)*]) => {
+        impl Experimental {
+            pub fn features(&self) -> std::collections::HashMap<std::borrow::Cow<'static, str>, bool> {
+                let mut map = std::collections::HashMap::default();
+                $(
+                    paste!{
+                        map.insert(std::borrow::Cow::Borrowed(stringify!($field)), self.[<experimental_enable_ $field>]);
+                    }
+                )*
+                map
+            }
+        }
+    };
+    (@gen_features [$(#[$($attrss:meta)*])* $feat:ident $(, $($tail:tt)*)?] -> [$($acc:ident)*]) => {
+        experimental!(@gen_features [$($($tail)*)?] -> [$($acc)* $feat]);
+    };
+    (@gen_getters [] -> [$($field:ident)*]) => {
+        impl Experimental {
+            $(
+                paste!{
+                    pub fn [<is_ $field _enabled>](&self) -> bool {
+                        self.[<experimental_enable_ $field>]
+                    }
+
+                    pub fn [<set_ $field>](&mut self, enable: bool) {
+                        self.[<experimental_enable_ $field>] = enable;
+                    }
+                }
+            )*
+        }
+    };
+    (@gen_getters [$(#[$($attrss:meta)*])* $feat:ident $(, $($tail:tt)*)?] -> [$($acc:ident)*]) => {
+        experimental!(@gen_getters [$($($tail)*)?] -> [$($acc)* $feat]);
+    };
+
+
+    {$($tokens:tt)*} => {
+        experimental!(@gen_struct [$($tokens)*] -> []);
+        experimental!(@gen_features [$($tokens)*] -> []);
+        experimental!(@gen_getters [$($tokens)*] -> []);
+    };
+}
+
+// List of experimental features. Add a new identifier below to introduce a flag; the
+// `experimental!` macro will generate the `experimental_enable_<name>` config field, the
+// `is_<name>_enabled()` / `set_<name>()` accessors, and the entry exposed (under the bare
+// name, without the `experimental_enable_` prefix) by the admin `/version` API.
+experimental! {
+    /// # Migrate the unscoped promise table into its scoped variant
     ///
-    /// Use the new experimental batch ingestion path.
+    /// When enabled, partition stores migrate every entry of the legacy unscoped
+    /// promise table into its scoped variant (with `scope = None`)
+    /// on open, and route all subsequent promise reads and writes through
+    /// the scoped tables.
     ///
-    /// Set to `true` to enable the experimental ingestion mechanism.
+    /// Once enabled, you **cannot** roll back to a Restate-server version that
+    /// did not yet recognize the resulting on-disk schema version.
     ///
-    /// The legacy path will be removed in v1.7.
+    /// Since v1.7.9
+    scoped_promise_table_migration,
+
+    /// # Migrate the unscoped state table into its scoped variant
     ///
-    /// Defaults to `false` in v1.6.
-    pub experimental_shuffler_batch_ingestion: bool,
+    /// When enabled, partition stores migrate every entry of the legacy unscoped
+    /// state table into its scoped variant (with `scope = None`)
+    /// on open, and route all subsequent promise reads and writes through
+    /// the scoped tables.
+    ///
+    /// Once enabled, you **cannot** roll back to a Restate-server version that
+    /// did not yet recognize the resulting on-disk schema version.
+    ///
+    /// Since v1.7.9
+    scoped_state_table_migration,
+
+    /// # Enables Kafka header support for scoped invocations
+    ///
+    /// When enabled, Kafka subscriptions read `x-restate-scope` and
+    /// `x-restate-limit-key` record headers to drive vqueue scope and
+    /// hierarchical limit-key routing.
+    ///
+    /// Since v1.7.0
+    kafka_scope,
+
+    /// Apply completion and journal retention when terminating a preflight invocation.
+    ///
+    /// Since v1.7.8
+    preflight_invocation_termination_retention,
+
+    /// # Asynchronous VQueue refills
+    ///
+    /// Moves VQueue storage refills to Tokio's blocking thread pool when the required data is not
+    /// already cached by RocksDB.
+    ///
+    /// Since v1.7.9
+    vqueues_async_refill,
+
+    /// # Use bilrost encoding for schemas
+    ///
+    /// When enabled, will use zstd compressed bilrost encoding
+    /// encoding instead of the default flexbuffers
+    ///
+    /// This will be default from v1.9.0
+    ///
+    /// NOTE: Hot change of this config has no effect. A change
+    /// will only take effect on restart.
+    ///
+    /// Since v1.8.0
+    schema_bilrost_encoding,
+
+    /// # Enable cleanup of obsolete VQueue metadata
+    ///
+    /// Enabling this is safe and is recommended if the cluster nodes run
+    /// restate >= v1.7.10.
+    ///
+    /// The cleanup is enabled unconditionally from v1.9.0.
+    ///
+    /// Since v1.7.10
+    vqueue_obsolete_cleanup,
+
+    /// # Enables the new invocation::Source::Ingestion
+    ///
+    /// This new source can be set by the ingestion API.
+    ///
+    /// Since v1.8.0
+    invocation_source_ingestion,
 }
 
 serde_with::with_prefix!(pub prefix_tokio_console "tokio_console_");
@@ -531,6 +880,21 @@ pub(crate) mod schema {
 impl CommonOptions {
     pub fn fabric_listener_options(&self) -> &ListenerOptions<FabricPort> {
         &self.fabric_listener_options
+    }
+
+    /// The fabric TLS options, unless TLS is disabled (section absent or
+    /// `mode = "off"`). Use this instead of accessing `tls` directly so that
+    /// `off` behaves exactly like an absent section.
+    pub fn fabric_tls(&self) -> Option<&FabricTlsOptions> {
+        self.tls.as_ref().filter(|t| t.mode.is_enabled())
+    }
+
+    pub fn fabric_tls_mut(&mut self) -> &mut Option<FabricTlsOptions> {
+        &mut self.tls
+    }
+
+    pub fn fabric_tls_mode(&self) -> TlsMode {
+        self.tls.as_ref().map(|t| t.mode).unwrap_or_default()
     }
 
     pub fn tokio_listener_options(&self) -> &ListenerOptions<TokioConsolePort> {
@@ -613,49 +977,53 @@ impl CommonOptions {
         self.process_total_memory_size
     }
 
-    pub fn rocksdb_actual_total_memtables_size(&self) -> usize {
-        let sanitized = self.rocksdb_total_memtables_ratio.clamp(0.0, 1.0) as f64;
-        let total_mem = self.rocksdb_total_memory_size.get() as f64;
-        (total_mem * sanitized) as usize
+    pub fn rocksdb_total_memory_size(&self) -> NonZeroByteCount {
+        self.rocksdb_total_memory_size.max(MIN_ROCKSDB_MEMORY)
     }
 
-    pub fn rocksdb_safe_total_memtables_size(&self) -> usize {
-        // %5 safety margin
-        (self.rocksdb_actual_total_memtables_size() as f64 * 0.95).floor() as usize
+    pub fn rocksdb_total_memtables_size(&self) -> NonZeroByteCount {
+        let sanitized = self.rocksdb_total_memtables_ratio.clamp(0.1, 1.0) as f64;
+        let total_mem = self.rocksdb_total_memory_size().as_usize() as f64;
+        let memtables =
+            ((total_mem * sanitized) as usize).max(MIN_MEMTABLE_TOTAL_BUDGET.as_usize());
+        NonZeroByteCount::from(NonZeroUsize::new(memtables).unwrap())
     }
 
     pub fn storage_high_priority_bg_threads(&self) -> NonZeroUsize {
-        self.storage_high_priority_bg_threads.unwrap_or(
-            std::thread::available_parallelism()
-                // Shouldn't really fail, but just in case.
-                .unwrap_or(NonZeroUsize::new(4).unwrap()),
-        )
+        self.storage_high_priority_bg_threads
+            .unwrap_or_else(|| (*CPU_COUNT).try_into().unwrap())
     }
 
     pub fn default_thread_pool_size(&self) -> usize {
-        self.default_thread_pool_size.unwrap_or(
-            std::thread::available_parallelism()
-                // Shouldn't really fail, but just in case.
-                .unwrap_or(NonZeroUsize::new(4).unwrap())
-                .get(),
-        )
+        self.default_thread_pool_size
+            .unwrap_or_else(|| CPU_COUNT.get()) as usize
+    }
+
+    pub fn default_thread_stack_size(&self) -> Option<usize> {
+        self.default_thread_stack_size.map(|s| s.as_usize())
     }
 
     pub fn storage_low_priority_bg_threads(&self) -> NonZeroUsize {
-        self.storage_low_priority_bg_threads.unwrap_or(
-            std::thread::available_parallelism()
-                // Shouldn't really fail, but just in case.
-                .unwrap_or(NonZeroUsize::new(4).unwrap()),
-        )
+        self.storage_low_priority_bg_threads
+            .unwrap_or_else(|| (*CPU_COUNT).try_into().unwrap())
     }
 
-    pub fn rocksdb_bg_threads(&self) -> NonZeroU32 {
-        self.rocksdb_bg_threads.unwrap_or(
-            std::thread::available_parallelism()
-                .unwrap_or(NonZeroUsize::new(3).unwrap())
-                .try_into()
-                .expect("number of cpu cores fits in u32"),
-        )
+    pub fn rocksdb_high_priority_bg_threads(&self) -> NonZeroU32 {
+        // Give 1/4 of the CPUs to flushes unless the user specifies a value.
+        self.rocksdb_high_priority_threads
+            .unwrap_or_else(|| CPU_COUNT.div_ceil(NonZeroU32::new(4).unwrap()))
+    }
+
+    pub fn rocksdb_low_priority_bg_threads(&self) -> NonZeroU32 {
+        self.rocksdb_low_priority_threads.unwrap_or_else(|| {
+            // how many cpu threads are assigned for high-priority background tasks?
+            let remaining = CPU_COUNT
+                .get()
+                .saturating_sub(self.rocksdb_high_priority_bg_threads().get())
+                .max(1);
+            // Safe because of max(1) above.
+            NonZeroU32::new(remaining).unwrap()
+        })
     }
 
     /// set derived values if they are not configured to reduce verbose configurations
@@ -667,23 +1035,6 @@ impl CommonOptions {
             .merge(&self.fabric_listener_options);
 
         self.metadata_client.merge(network_options);
-
-        if self.service_client.additional_request_headers.is_none() {
-            let cluster_name_visible_ascii = self
-                .cluster_name()
-                .chars()
-                .filter(|c| *c >= ' ' && *c <= '~')
-                .collect::<String>();
-
-            self.service_client.additional_request_headers = Some(
-                std::collections::HashMap::from_iter([(
-                    X_RESTATE_CLUSTER_NAME,
-                    http::HeaderValue::from_str(&cluster_name_visible_ascii)
-                        .expect("a visible ascii string must be a valid header value"),
-                )])
-                .into(),
-            )
-        }
 
         Ok(())
     }
@@ -715,9 +1066,11 @@ impl Default for CommonOptions {
             base_dir: None,
             metadata_client: MetadataClientOptions::default(),
             fabric_listener_options: Default::default(),
+            tls: None,
             default_num_partitions: 24,
             default_replication: ReplicationProperty::new_unchecked(1),
             disable_prometheus: false,
+            #[allow(deprecated)]
             service_client: Default::default(),
             shutdown_timeout: NonZeroFriendlyDuration::from_secs_unchecked(60),
             tracing: TracingOptions::default(),
@@ -727,13 +1080,16 @@ impl Default for CommonOptions {
             tokio_console_bind_address: None,
             tokio_console_listener_options: Default::default(),
             default_thread_pool_size: None,
+            default_thread_stack_size: None,
             storage_high_priority_bg_threads: None,
             storage_low_priority_bg_threads: None,
             process_total_memory_size: None,
-            rocksdb_total_memory_size: NonZeroUsize::new(6 * 1024 * 1024 * 1024).unwrap(), // 6GiB
-            rocksdb_total_memtables_ratio: 0.5, // (50% of rocksdb-total-memory-size)
-            rocksdb_bg_threads: None,
-            rocksdb_high_priority_bg_threads: NonZeroU32::new(2).unwrap(),
+            rocksdb_max_write_rate_per_second: NonZeroByteCount::try_from(7 * 1024 * 1024 * 1024)
+                .unwrap(),
+            rocksdb_total_memory_size: NonZeroByteCount::try_from(2 * 1024 * 1024 * 1024).unwrap(), // 2GiB
+            rocksdb_total_memtables_ratio: 0.85, // (85% of rocksdb-total-memory-size)
+            rocksdb_low_priority_threads: None,
+            rocksdb_high_priority_threads: None,
             rocksdb_perf_level: PerfStatsLevel::EnableCount,
             rocksdb: Default::default(),
             metadata_update_interval: NonZeroFriendlyDuration::from_secs_unchecked(10),
@@ -746,49 +1102,12 @@ impl Default for CommonOptions {
             ),
             initialization_timeout: NonZeroFriendlyDuration::from_secs_unchecked(5 * 60),
             disable_telemetry: false,
+            disable_config_sql_table: false,
             gossip: GossipOptions::default(),
-            experimental_enable_vqueues: false,
             hlc_max_drift: FriendlyDuration::from_millis(5000),
-            experimental_kafka_batch_ingestion: false,
-            experimental_shuffler_batch_ingestion: false,
+            experimental: Experimental::default(),
         }
     }
-}
-
-/// # Service Client options
-#[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize, derive_builder::Builder)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[cfg_attr(
-    feature = "schemars",
-    schemars(rename = "ServiceClientOptions", default)
-)]
-#[builder(default)]
-#[derive(Default)]
-#[serde(rename_all = "kebab-case")]
-pub struct ServiceClientOptions {
-    #[serde(flatten)]
-    pub http: HttpOptions,
-    #[serde(flatten)]
-    pub lambda: AwsLambdaOptions,
-
-    /// # Request identity private key PEM file
-    ///
-    /// A path to a file, such as "/var/secrets/key.pem", which contains exactly one ed25519 private
-    /// key in PEM format. Such a file can be generated with `openssl genpkey -algorithm ed25519`.
-    /// If provided, this key will be used to attach JWTs to requests from this client which
-    /// SDKs may optionally verify, proving that the caller is a particular Restate instance.
-    ///
-    /// This file is currently only read on client creation, but this may change in future.
-    /// Parsed public keys will be logged at INFO level in the same format that SDKs expect.
-    pub request_identity_private_key_pem_file: Option<PathBuf>,
-
-    /// # Additional request headers
-    ///
-    /// Headers that should be applied to all outgoing requests (HTTP and Lambda).
-    /// Defaults to `x-restate-cluster-name: <cluster name>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub additional_request_headers: Option<SerdeableHeaderHashMap>,
 }
 
 /// # Log format
@@ -835,9 +1154,16 @@ pub struct MetadataClientOptions {
     pub connect_timeout: NonZeroFriendlyDuration,
 
     /// # Metadata Store Keep Alive Interval
+    ///
+    /// Interval at which keep-alive probes are sent on the connection to the
+    /// metadata store, to keep it alive and to detect a store that has become
+    /// unreachable.
     pub keep_alive_interval: NonZeroFriendlyDuration,
 
     /// # Metadata Store Keep Alive Timeout
+    ///
+    /// How long to wait for a keep-alive probe to be acknowledged by the
+    /// metadata store before treating the connection as dead and closing it.
     pub keep_alive_timeout: NonZeroFriendlyDuration,
 
     /// # Backoff policy used by the metadata client
@@ -942,11 +1268,22 @@ pub enum MetadataClientKind {
         object_store: ObjectStoreOptions,
 
         /// # Error retry policy
+        ///
+        /// Retry policy for the object store requests the metadata client
+        /// makes, covering both reads of the current metadata version and the
+        /// conditional writes used to update it.
+        ///
+        /// Retries here absorb the transient errors and throttling responses
+        /// object stores return under load, so a short or non-retrying policy
+        /// can surface those as metadata operation failures.
         #[serde(default = "MetadataClientKind::default_object_store_retry_policy")]
         object_store_retry_policy: RetryPolicy,
     },
 
     #[display("dynamo-db")]
+    // Don't include the DynamoDB variant in our publicly released configuration schema because it
+    // is a paid product only feature atm.
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     DynamoDb {
         /// # DynamoDB table name
         ///
@@ -1181,10 +1518,10 @@ impl Default for IngestionOptions {
                 NonZeroUsize::new(1024 * 1024).expect("non zero"),
             ), //1 MiB
             connection_retry_policy: RetryPolicy::exponential(
-                Duration::from_millis(10),
+                Duration::from_millis(250),
                 2.0,
                 None,
-                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(3)),
             ),
             request_batch_size: NonZeroByteCount::new(
                 NonZeroUsize::new(50 * 1024).expect("non zero"),
@@ -1197,11 +1534,86 @@ impl Default for IngestionOptions {
 mod tests {
     use std::str::FromStr;
 
+    use googletest::prelude::eq;
+    use googletest::{assert_that, elements_are, pat};
+
     use crate::config::MetadataClientKind;
     use crate::config_loader::ConfigLoaderBuilder;
     use crate::net::address::AdvertisedAddress;
-    use googletest::prelude::eq;
-    use googletest::{assert_that, elements_are, pat};
+
+    use super::*;
+
+    fn minimal_tls_config() -> FabricTlsOptions {
+        toml::from_str(
+            r#"
+            cert-file = "/certs/node.crt"
+            key-file = "/certs/node.key"
+            ca-files = ["/certs/ca.crt"]
+        "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tls_config_defaults() {
+        assert!(CommonOptions::default().tls.is_none());
+
+        let opts = minimal_tls_config();
+        assert_eq!(opts.mode, TlsMode::Off);
+        assert_eq!(opts.cert_file, PathBuf::from("/certs/node.crt"));
+        assert_eq!(opts.key_file, PathBuf::from("/certs/node.key"));
+        assert_eq!(opts.ca_files, vec![PathBuf::from("/certs/ca.crt")]);
+        assert!(!opts.require_client_auth);
+        assert_eq!(*opts.refresh_interval, Duration::from_secs(3600));
+        assert!(opts.allowed_subject_names.is_empty());
+
+        let common = CommonOptions {
+            tls: Some(opts),
+            ..CommonOptions::default()
+        };
+        let serialized = toml::to_string(&common).unwrap();
+        assert!(serialized.contains("[tls]"));
+        assert!(!serialized.contains("[networking.tls]"));
+        let deserialized: CommonOptions = toml::from_str(&serialized).unwrap();
+        assert!(deserialized.tls.is_some());
+    }
+
+    #[test]
+    fn tls_mode_rollout_semantics() {
+        for (mode, enabled, advertises, plaintext) in [
+            (TlsMode::Off, false, false, true),
+            (TlsMode::Allow, true, false, true),
+            (TlsMode::Prefer, true, true, true),
+            (TlsMode::Require, true, true, false),
+        ] {
+            assert_eq!(mode.is_enabled(), enabled, "{mode:?}");
+            assert_eq!(mode.advertises_tls(), advertises, "{mode:?}");
+            assert_eq!(mode.accepts_plaintext(), plaintext, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn tls_config_validation() {
+        let mut opts = minimal_tls_config();
+        assert!(opts.validate().is_ok());
+
+        opts.require_client_auth = true;
+        let err = opts.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("allowed-subject-names is empty"),
+            "unexpected validation error: {err}"
+        );
+
+        opts.allowed_subject_names = vec!["*".to_owned()];
+        assert!(opts.validate().is_ok());
+
+        opts.allowed_subject_names = vec!["spiffe://domain/restate-*".to_owned()];
+        assert!(opts.validate().is_ok());
+
+        opts.require_client_auth = false;
+        opts.allowed_subject_names.clear();
+        assert!(opts.validate().is_ok());
+    }
 
     #[test]
     #[ignore]

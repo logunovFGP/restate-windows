@@ -17,6 +17,8 @@ use std::time::{Duration, SystemTime};
 // Note: BilrostNewType and NetSerde derives are not used since both MillisSinceEpoch
 // and NanosSinceEpoch have custom implementations for niche optimization.
 
+use restate_platform::network::NetSerde;
+
 use crate::WallClock;
 
 /// Milliseconds since the unix epoch.
@@ -46,7 +48,7 @@ impl fmt::Debug for MillisSinceEpoch {
     }
 }
 
-impl restate_encoding::NetSerde for MillisSinceEpoch {}
+impl NetSerde for MillisSinceEpoch {}
 
 // Static assertions to ensure that MillisSinceEpoch is the same size as u64
 // and that niche optimization works.
@@ -64,6 +66,9 @@ const _: () = {
 
 impl MillisSinceEpoch {
     pub const UNIX_EPOCH: Self = Self::new(0);
+    /// RESTATE_EPOCH -> (2022-01-01 00:00:00 GMT)
+    pub const RESTATE_EPOCH: Self = crate::RESTATE_EPOCH;
+
     /// The maximum representable timestamp. Note: This is `u64::MAX - 1` because
     /// `u64::MAX` cannot be represented due to the internal NonZeroU64 representation.
     /// This is ~584 million years from Unix epoch, so it's not a practical limitation.
@@ -89,8 +94,8 @@ impl MillisSinceEpoch {
     ///
     /// This method uses the cached [`WallClock::recent_ms()`] timestamp when available,
     /// providing ~100x better performance than a direct `SystemTime::now()` syscall.
-    /// The cached value is refreshed every 500μs by [`ClockUpkeep`](crate::ClockUpkeep),
-    /// so it may be up to ~1ms stale.
+    /// The cached value is refreshed every 1ms by [`ClockUpkeep`](crate::ClockUpkeep),
+    /// so it may be up to ~2ms stale.
     ///
     /// # Fallback Behavior
     ///
@@ -188,8 +193,7 @@ impl Add<Duration> for MillisSinceEpoch {
     type Output = MillisSinceEpoch;
 
     fn add(self, rhs: Duration) -> Self::Output {
-        let millis =
-            u64::try_from(rhs.as_millis()).expect("millis since Unix epoch should fit in u64");
+        let millis = u64::try_from(rhs.as_millis()).unwrap_or(u64::MAX);
         MillisSinceEpoch::new(self.as_u64().saturating_add(millis))
     }
 }
@@ -198,8 +202,7 @@ impl Sub<Duration> for MillisSinceEpoch {
     type Output = MillisSinceEpoch;
 
     fn sub(self, rhs: Duration) -> Self::Output {
-        let millis =
-            u64::try_from(rhs.as_millis()).expect("millis since Unix epoch should fit in u64");
+        let millis = u64::try_from(rhs.as_millis()).unwrap_or(u64::MAX);
         MillisSinceEpoch::new(self.as_u64().saturating_sub(millis))
     }
 }
@@ -345,6 +348,13 @@ mod bilrost_encoding {
         to encode proxied type (MillisSinceEpoch)
         with general encodings including distinguished
     );
+
+    bilrost::delegate_proxied_encoding!(
+        use encoding (bilrost::encoding::Fixed)
+        to encode proxied type (MillisSinceEpoch)
+        with encoding (bilrost::encoding::Fixed)
+        including distinguished
+    );
 }
 
 /// Nanos since the unix epoch. Used internally to get rough latency measurements across nodes.
@@ -376,7 +386,7 @@ impl fmt::Debug for NanosSinceEpoch {
     }
 }
 
-impl restate_encoding::NetSerde for NanosSinceEpoch {}
+impl NetSerde for NanosSinceEpoch {}
 
 // Static assertions to ensure that NanosSinceEpoch is the same size as u64
 // and that niche optimization works.
@@ -394,6 +404,8 @@ const _: () = {
 
 impl NanosSinceEpoch {
     pub const UNIX_EPOCH: Self = Self::new(0);
+    /// RESTATE_EPOCH -> (2022-01-01 00:00:00 GMT)
+    pub const RESTATE_EPOCH: Self = Self::new(1_640_995_200_000_000_000);
     /// The maximum representable timestamp. Note: This is `u64::MAX - 1` because
     /// `u64::MAX` cannot be represented due to the internal NonZeroU64 representation.
     /// This is ~584 years from Unix epoch, so it's not a practical limitation.
@@ -823,6 +835,12 @@ mod tests {
     #[test]
     fn nanos_unix_epoch_is_zero() {
         assert_eq!(NanosSinceEpoch::UNIX_EPOCH.as_u64(), 0);
+    }
+
+    #[test]
+    fn nanos_restate_epoch_is_equivalent_in_millis() {
+        let nanos_to_millis = MillisSinceEpoch::from(NanosSinceEpoch::RESTATE_EPOCH);
+        assert_eq!(nanos_to_millis, MillisSinceEpoch::RESTATE_EPOCH);
     }
 
     #[test]

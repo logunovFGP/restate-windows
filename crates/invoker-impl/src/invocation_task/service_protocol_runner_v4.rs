@@ -8,7 +8,6 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::pin::Pin;
@@ -21,22 +20,25 @@ use futures::{Stream, StreamExt};
 use gardal::futures::StreamExt as GardalStreamExt;
 use http::uri::PathAndQuery;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use http_body::Frame;
-use opentelemetry::trace::TraceFlags;
+use metrics::{Counter, counter};
+use opentelemetry::KeyValue;
+use opentelemetry::trace::{Span, SpanContext, Status, TraceFlags};
+use prost::Message as ProstMessage;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace, warn};
 
 use restate_errors::warn_it;
-use restate_invoker_api::JournalMetadata;
-use restate_invoker_api::invocation_reader::{EagerState, JournalEntry};
+use restate_memory::{LocalMemoryLease, LocalMemoryPool, PinnableMemoryStream};
 use restate_service_client::{Endpoint, Method, Parts, Request};
 use restate_service_protocol::codec::ProtobufRawEntryCodec;
 use restate_service_protocol_v4::entry_codec::ServiceProtocolV4Codec;
 use restate_service_protocol_v4::message_codec::{
-    Decoder, Encoder, Message, MessageHeader, MessageType, proto,
+    Decoder, Encoder, Message, MessageHeader, MessageType, StateEntry, proto,
 };
-use restate_types::errors::InvocationError;
+use restate_service_protocol_v4::proto_lite;
+use restate_tracing_instrumentation::ServiceSpan;
+use restate_types::Scope;
+use restate_types::errors::{GenericError, InvocationError};
 use restate_types::identifiers::InvocationId;
 use restate_types::invocation::{
     Header, InvocationTarget, InvocationTargetType, ServiceInvocationSpanContext, ServiceType,
@@ -48,34 +50,52 @@ use restate_types::journal_v2::command::{
 };
 use restate_types::journal_v2::raw::{RawCommand, RawEntry, RawNotification};
 use restate_types::journal_v2::{
-    CommandIndex, CommandType, Entry, EntryType, NotificationId, RunCompletion, RunResult, SignalId,
+    CommandIndex, CommandType, Entry, EntryMetadata, EntryType, RunCommand, RunCompletion,
+    RunResult, SleepCommand, UnresolvedFuture,
 };
+use restate_types::limit_key::LimitKey;
 use restate_types::schema::deployment::{Deployment, DeploymentType, ProtocolType};
-use restate_types::schema::invocation_target::{DeploymentStatus, InvocationTargetResolver};
+use restate_types::schema::invocation_target::{
+    DeploymentStatus, InvocationTargetResolver, StatePreloadPolicy,
+};
 use restate_types::service_protocol::ServiceProtocolVersion;
+use restate_util_string::{ReString, RestateString, RestrictedValue, StringLike, ToReString};
+use restate_worker_api::invoker::JournalMetadata;
+use restate_worker_api::invoker::invocation_reader::{
+    EagerState, InvocationReader, InvocationReaderError, InvocationReaderTransaction, JournalEntry,
+    JournalKind,
+};
 
-use crate::Notification;
 use crate::error::{
-    CommandPreconditionError, InvocationErrorRelatedCommandV2, InvokerError, SdkInvocationErrorV2,
+    CommandPreconditionError, InvocationErrorRelatedCommandV2, InvokerError,
+    RequestedErrorBehavior, SdkInvocationErrorV2,
 };
 use crate::invocation_task::{
-    InvocationTask, InvocationTaskOutputInner, InvokerBodyStream, InvokerRequestStreamSender,
-    ResponseChunk, ResponseStream, TerminalLoopState, X_RESTATE_SERVER,
-    invocation_id_to_header_value, service_protocol_version_to_header_value,
+    InvocationTask, InvocationTaskOutputInner, InvokerBodySender, InvokerBodyType, ResponseChunk,
+    ResponseStream, TerminalLoopState, X_RESTATE_SERVER, collect_eager_state,
+    invocation_id_to_header_value, leased_frame, new_invoker_body, retry_after,
+    service_protocol_version_to_header_value,
 };
+use crate::metric_definitions::{
+    INVOKER_CLIENT_REQUESTS, INVOKER_RECEIVED_BYTES, INVOKER_SENT_BYTES,
+};
+use crate::{Notification, shortcircuit};
 
 ///  Provides the value of the invocation id
 const INVOCATION_ID_HEADER_NAME: HeaderName = HeaderName::from_static("x-restate-invocation-id");
+const SERVICE_KEY_HEADER_NAME: HeaderName = HeaderName::from_static("x-restate-service-key");
 
-const GATEWAY_ERRORS_CODES: [StatusCode; 3] = [
-    StatusCode::BAD_GATEWAY,
+const GATEWAY_ERRORS_CODES: [StatusCode; 2] =
+    [StatusCode::BAD_GATEWAY, StatusCode::GATEWAY_TIMEOUT];
+
+const RATE_LIMITED_CODES: [StatusCode; 2] = [
     StatusCode::SERVICE_UNAVAILABLE,
-    StatusCode::GATEWAY_TIMEOUT,
+    StatusCode::TOO_MANY_REQUESTS,
 ];
 
 /// Runs the interaction between the server and the service endpoint.
-pub struct ServiceProtocolRunner<'a, IR, EE, Schemas> {
-    invocation_task: &'a mut InvocationTask<IR, EE, Schemas>,
+pub struct ServiceProtocolRunner<'a, Schemas> {
+    invocation_task: &'a mut InvocationTask<Schemas>,
 
     service_protocol_version: ServiceProtocolVersion,
 
@@ -84,15 +104,21 @@ pub struct ServiceProtocolRunner<'a, IR, EE, Schemas> {
 
     // task state
     command_index: CommandIndex,
+
+    deployment_type_str: &'static str,
+
+    max_awaited_future_depth: usize,
 }
 
-impl<'a, IR, EE, Schemas> ServiceProtocolRunner<'a, IR, EE, Schemas>
+impl<'a, Schemas> ServiceProtocolRunner<'a, Schemas>
 where
     Schemas: InvocationTargetResolver,
 {
     pub fn new(
-        invocation_task: &'a mut InvocationTask<IR, EE, Schemas>,
+        invocation_task: &'a mut InvocationTask<Schemas>,
         service_protocol_version: ServiceProtocolVersion,
+        deployment_type: &DeploymentType,
+        max_awaited_future_depth: usize,
     ) -> Self {
         let encoder = Encoder::new(service_protocol_version);
 
@@ -101,20 +127,39 @@ where
             service_protocol_version,
             encoder,
             command_index: 0,
+            deployment_type_str: deployment_type.as_static_str(),
+            max_awaited_future_depth,
         }
     }
 
-    pub async fn run<JournalStream, StateIter>(
+    /// How often to release excess outbound budget capacity during the bidi-stream phase.
+    const BUDGET_RELEASE_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// Run the service protocol interaction. `state_read` is `Some` to preload state upfront per
+    /// its config, or `None` for fully lazy state.
+    pub async fn run<Txn, IR>(
         mut self,
+        txn: Txn,
         journal_metadata: JournalMetadata,
+        state_read: Option<StatePreloadPolicy>,
         deployment: Deployment,
-        journal_stream: JournalStream,
-        state_iter: EagerState<StateIter>,
+        invocation_reader: IR,
+        outbound_budget: &mut LocalMemoryPool,
     ) -> TerminalLoopState<()>
     where
-        JournalStream: Stream<Item = JournalEntry> + Unpin,
-        StateIter: Iterator<Item = (Bytes, Bytes)>,
+        Txn: InvocationReaderTransaction,
+        IR: InvocationReader,
     {
+        let mut attempt_span = restate_tracing_instrumentation::create_invocation_attempt_span(
+            &self.invocation_task.invocation_id,
+            &self.invocation_task.invocation_target,
+            deployment.id,
+            &deployment.address_display(),
+            self.service_protocol_version,
+            // The attempt span has as parent the invocation start span created by the PP.
+            &journal_metadata.span_context,
+        );
+
         // Figure out the protocol type. Force RequestResponse if inactivity_timeout is zero
         let protocol_type = if self.invocation_task.inactivity_timeout.is_zero() {
             ProtocolType::RequestResponse
@@ -135,8 +180,6 @@ where
         .try_into()
         .expect("must be able to build a valid invocation path");
 
-        let journal_size = journal_metadata.length;
-
         debug!(
             restate.invocation.id = %self.invocation_task.invocation_id,
             deployment.address = %deployment.address_display(),
@@ -145,33 +188,20 @@ where
             "Executing invocation at deployment"
         );
 
-        // Create an arc of the parent SpanContext.
-        // We send this with every journal entry to correctly link new spans generated from journal entries.
-        let service_invocation_span_context = journal_metadata.span_context;
-
-        // Prepare the request and send start message
-        let (mut http_stream_tx, request) = Self::prepare_request(
+        let deployment_id = deployment.id;
+        let deployment_type_str = deployment.ty.as_static_str();
+        // Prepare the request
+        let (http_stream_tx, request) = Self::prepare_request(
             path,
             deployment,
             self.service_protocol_version,
             &self.invocation_task.invocation_id,
-            &service_invocation_span_context,
-        );
-
-        crate::shortcircuit!(
-            self.write_start(
-                &mut http_stream_tx,
-                journal_size,
-                state_iter,
-                self.invocation_task.retry_count_since_last_stored_entry,
-                journal_metadata.last_modification_date.elapsed(),
-                journal_metadata.random_seed
-            )
-            .await
+            attempt_span.span_context(),
+            self.invocation_task.invocation_target.key(),
         );
 
         // Initialize the response stream state
-        let http_stream_rx = ResponseStream::initialize(&self.invocation_task.client, request);
+        let http_stream_rx = ResponseStream::new(self.invocation_task.client.call(request));
 
         let mut decoder_stream = std::pin::pin!(
             DecoderStream::new(
@@ -179,35 +209,200 @@ where
                 self.service_protocol_version,
                 self.invocation_task.message_size_warning,
                 self.invocation_task.message_size_limit,
+                deployment_type_str,
             )
             .throttle(self.invocation_task.action_token_bucket.take())
         );
 
-        // Execute the replay
-        crate::shortcircuit!(
-            self.replay_loop(
-                &mut http_stream_tx,
+        let result = self
+            .run_inner(
+                txn,
+                protocol_type,
+                journal_metadata,
+                state_read,
+                http_stream_tx,
                 &mut decoder_stream,
-                journal_stream,
-                journal_metadata.length
+                invocation_reader,
+                outbound_budget,
+                &mut attempt_span,
             )
-            .await
-        );
+            .await;
+
+        // After successful termination decoder should
+        // not have any remaining buffer
+        if result.is_closed() || result.is_suspend() {
+            // Sanity check of the stream decoder
+            if decoder_stream.inner().has_remaining() {
+                warn_it!(
+                    InvokerError::WriteAfterEndOfStream,
+                    restate.invocation.id = %self.invocation_task.invocation_id,
+                    deployment.id = %deployment_id,
+                    deployment.service_protocol_version = %self.service_protocol_version.as_repr(),
+                    "The read buffer is non empty after the stream has been closed."
+                );
+            }
+        }
+
+        let mut inner_stream = decoder_stream.inner_pin_mut().project().inner;
+
+        if tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match inner_stream.next().await {
+                    None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => {
+                        debug!(%err, "Error while draining invocation response stream");
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .is_err()
+        {
+            warn!(
+                restate.invocation.id = %self.invocation_task.invocation_id,
+                deployment.id = %deployment_id,
+                deployment.service_protocol_version = %self.service_protocol_version.as_repr(),
+                "Response stream draining timeout!"
+            );
+        }
+
+        // End attempt span
+        match &result {
+            TerminalLoopState::Closed => {
+                attempt_span.set_status(Status::Ok);
+            }
+
+            TerminalLoopState::SuspendedV2(_) | TerminalLoopState::SuspendedV3(_) => {
+                attempt_span.add_event(
+                    restate_tracing_instrumentation::semconv::event::RESTATE_INVOCATION_LIFECYCLE_SUSPENDED,
+                    vec![],
+                );
+                attempt_span.set_status(Status::Unset);
+            }
+            TerminalLoopState::Failed(_) => {
+                attempt_span.set_status(Status::Error {
+                    description: "transient failure".into(),
+                });
+            }
+            TerminalLoopState::ShouldYield(_) => {
+                attempt_span.add_event(
+                    restate_tracing_instrumentation::semconv::event::RESTATE_INVOCATION_LIFECYCLE_YIELDED,
+                    vec![],
+                );
+                attempt_span.set_status(Status::Unset);
+            }
+            _ => {}
+        }
+
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_inner<Txn, S, IR>(
+        &mut self,
+        mut txn: Txn,
+        protocol_type: ProtocolType,
+        journal_metadata: JournalMetadata,
+        state_read: Option<StatePreloadPolicy>,
+        mut http_stream_tx: InvokerBodySender,
+        decoder_stream: &mut S,
+        invocation_reader: IR,
+        outbound_budget: &mut LocalMemoryPool,
+        attempt_span: &mut ServiceSpan,
+    ) -> TerminalLoopState<()>
+    where
+        Txn: InvocationReaderTransaction,
+        S: Stream<Item = Result<DecoderStreamItem, InvokerError>> + Unpin,
+        IR: InvocationReader,
+    {
+        let journal_size = journal_metadata.length;
+        // === Replay phase (transaction alive) ===
+        {
+            // Read state for the START message. `Eager` preloads the full state; a lazy default with
+            // a whitelist preloads only those keys. Both return the same `EagerState` stream type, so
+            // the collection (inside `write_start`) is uniform.
+            // Budget-gated: each entry takes a lease from the outbound budget.
+            // Only keyed targets have state to preload; resolve (and clone) the ServiceId here, and
+            // skip the read entirely when the target is not keyed.
+            let state = if let Some(policy) = &state_read
+                && let Some(service_id) =
+                    self.invocation_task.invocation_target.as_keyed_service_id()
+            {
+                Some(shortcircuit!(
+                    txn.read_state_budgeted(&service_id, policy, outbound_budget)
+                        .map_err(InvokerError::from_state_reader)
+                ))
+            } else {
+                None
+            };
+
+            // Send start message with the collected state (its merged lease travels with the frame)
+            shortcircuit!(
+                self.write_start(
+                    &mut http_stream_tx,
+                    journal_size,
+                    state,
+                    self.invocation_task.retry_count_since_last_stored_entry,
+                    journal_metadata.last_modification_date.elapsed(),
+                    journal_metadata.random_seed
+                )
+                .await
+            );
+
+            // Read journal stream from storage and execute the replay.
+            // LocalMemoryPool-gated: each entry acquires a lease before it's sent.
+            let journal_stream = shortcircuit!(
+                txn.read_journal_budgeted(
+                    &self.invocation_task.invocation_id,
+                    journal_size,
+                    journal_metadata.journal_kind,
+                    outbound_budget,
+                )
+                .map_err(InvokerError::from_journal_reader)
+            );
+            shortcircuit!(
+                self.replay_loop(
+                    &mut http_stream_tx,
+                    decoder_stream,
+                    journal_stream,
+                    journal_metadata.length
+                )
+                .await
+            );
+        }
+        // === End replay phase - streams dropped, transaction can be dropped ===
+
+        // Transaction dropped - RocksDB snapshot released!
+        drop(txn);
+
+        // Release excess local capacity accumulated during replay back to the
+        // global pool before entering the bidi stream phase.
+        outbound_budget.release_excess();
 
         // If we have the invoker_rx and the protocol type is bidi stream,
         // then we can use the bidi_stream loop reading the invoker_rx and the http_stream_rx
         if protocol_type == ProtocolType::BidiStream {
             trace!("Protocol is in bidi stream mode, will now start the send/receive loop");
-            crate::shortcircuit!(
+            shortcircuit!(
                 self.bidi_stream_loop(
-                    &service_invocation_span_context,
                     http_stream_tx,
-                    &mut decoder_stream
+                    decoder_stream,
+                    invocation_reader,
+                    // The bidi stream loop will never read from a journal v1 as it will be migrated
+                    // by the time the bidi stream loop needs to read notifications from it.
+                    // todo remove once we drop support for journal v1
+                    JournalKind::V2,
+                    outbound_budget,
+                    attempt_span
                 )
                 .await
             );
         } else {
-            trace!("Protocol is in bidi stream mode, will now drop the sender side of the request");
+            trace!(
+                "Protocol is not in bidi stream mode, will now drop the sender side of the request"
+            );
             // Drop the http_stream_tx.
             // This is required in HTTP/1.1 to let the deployment send the headers back
             drop(http_stream_tx)
@@ -215,19 +410,9 @@ where
 
         // We don't have the invoker_rx, so we simply consume the response
         trace!("Sender side of the request has been dropped, now processing the response");
-        let result = self
-            .response_stream_loop(&service_invocation_span_context, &mut decoder_stream)
-            .await;
 
-        // Sanity check of the stream decoder
-        if decoder_stream.inner().has_remaining() {
-            warn_it!(
-                InvokerError::WriteAfterEndOfStream,
-                "The read buffer is non empty after the stream has been closed."
-            );
-        }
-
-        result
+        self.response_stream_loop(decoder_stream, attempt_span)
+            .await
     }
 
     fn prepare_request(
@@ -235,11 +420,14 @@ where
         deployment_metadata: Deployment,
         service_protocol_version: ServiceProtocolVersion,
         invocation_id: &InvocationId,
-        parent_span_context: &ServiceInvocationSpanContext,
-    ) -> (InvokerRequestStreamSender, Request<InvokerBodyStream>) {
-        // Just an arbitrary buffering size
-        let (http_stream_tx, http_stream_rx) = mpsc::channel(10);
-        let req_body = InvokerBodyStream::new(ReceiverStream::new(http_stream_rx));
+        parent_span_context: &SpanContext,
+        service_key: Option<&ByteString>,
+    ) -> (InvokerBodySender, Request<InvokerBodyType>) {
+        // Use an unbounded channel: backpressure is provided by the memory budget
+        // (each frame's Bytes embeds a LocalMemoryLease via from_owner) rather than
+        // channel capacity.
+        let (http_stream_tx, http_stream_rx) = mpsc::unbounded_channel();
+        let req_body = new_invoker_body(http_stream_rx);
 
         let service_protocol_header_value =
             service_protocol_version_to_header_value(service_protocol_version);
@@ -254,31 +442,31 @@ where
             (http::header::ACCEPT, service_protocol_header_value),
             (INVOCATION_ID_HEADER_NAME, invocation_id_header_value),
         ]);
-
-        // Inject OpenTelemetry context into the headers
-        // The parent span as seen by the SDK will be the service invocation span context
-        // which is emitted at INFO level representing the invocation, *not* the DEBUG level
-        // `invoker_invocation_task` which wraps this code. This is so that headers will be sent
-        // when in INFO level, not just in DEBUG level.
+        if let Some(service_key) = service_key
+            && let Ok(service_key_header) =
+                HeaderValue::from_str(urlencoding::encode(service_key.as_str()).as_str())
         {
-            let span_context = parent_span_context.span_context();
-            if span_context.is_valid() {
-                const SUPPORTED_VERSION: u8 = 0;
-                let header_value = format!(
-                    "{:02x}-{}-{}-{:02x}",
-                    SUPPORTED_VERSION,
-                    span_context.trace_id(),
-                    span_context.span_id(),
-                    span_context.trace_flags() & TraceFlags::SAMPLED
-                );
-                if let Ok(header_value) = HeaderValue::try_from(header_value) {
-                    headers.insert("traceparent", header_value);
-                }
-                if let Ok(tracestate) =
-                    HeaderValue::from_str(span_context.trace_state().header().as_ref())
-                {
-                    headers.insert("tracestate", tracestate);
-                }
+            headers.insert(SERVICE_KEY_HEADER_NAME, service_key_header);
+        }
+
+        // Inject OpenTelemetry context into the headers so the SDK sees the
+        // per-attempt span as its parent.
+        if parent_span_context.is_valid() {
+            const SUPPORTED_VERSION: u8 = 0;
+            let header_value = format!(
+                "{:02x}-{}-{}-{:02x}",
+                SUPPORTED_VERSION,
+                parent_span_context.trace_id(),
+                parent_span_context.span_id(),
+                parent_span_context.trace_flags() & TraceFlags::SAMPLED
+            );
+            if let Ok(header_value) = HeaderValue::try_from(header_value) {
+                headers.insert("traceparent", header_value);
+            }
+            if let Ok(tracestate) =
+                HeaderValue::from_str(parent_span_context.trace_state().header().as_ref())
+            {
+                headers.insert("tracestate", tracestate);
             }
         }
 
@@ -291,31 +479,35 @@ where
             DeploymentType::Http {
                 address,
                 http_version,
+                auth,
                 ..
-            } => Endpoint::Http(address, Some(http_version)),
+            } => Endpoint::Http(address, Some(http_version), auth),
         };
 
         headers.extend(deployment_metadata.additional_headers);
 
-        (
-            http_stream_tx,
-            Request::new(Parts::new(Method::POST, address, path, headers), req_body),
-        )
+        let mut request_parts = Parts::new(Method::Post, address, path, headers);
+        if let Some(service_key) = service_key {
+            request_parts = request_parts.with_request_identity_sub_field(service_key.clone());
+        }
+
+        (http_stream_tx, Request::new(request_parts, req_body))
     }
 
     // --- Loops
 
     /// This loop concurrently pushes journal entries and waits for the response headers and end of replay.
-    async fn replay_loop<JournalStream, S>(
+    async fn replay_loop<JournalStream, S, E>(
         &mut self,
-        http_stream_tx: &mut InvokerRequestStreamSender,
+        http_stream_tx: &mut InvokerBodySender,
         http_stream_rx: &mut S,
         journal_stream: JournalStream,
         expected_entries_count: u32,
     ) -> TerminalLoopState<()>
     where
-        JournalStream: Stream<Item = JournalEntry> + Unpin,
+        JournalStream: Stream<Item = Result<(JournalEntry, LocalMemoryLease), E>> + Unpin,
         S: Stream<Item = Result<DecoderStreamItem, InvokerError>> + Unpin,
+        E: InvocationReaderError,
     {
         let mut journal_stream = journal_stream.fuse();
         let mut got_headers = false;
@@ -327,12 +519,12 @@ where
                     // The reason we want to poll headers in this function is
                     // to exit early in case an error is returned during replays.
                     got_headers = true;
-                    match crate::shortcircuit!(got_headers_res.transpose()) {
+                    match shortcircuit!(got_headers_res.transpose()) {
                         None => {
                             return TerminalLoopState::Failed(InvokerError::SdkV2(SdkInvocationErrorV2::unknown()))
                         },
                         Some(DecoderStreamItem::Parts(headers)) => {
-                            crate::shortcircuit!(self.handle_response_headers(headers));
+                            shortcircuit!(self.handle_response_headers(headers));
                         }
                         Some(DecoderStreamItem::Message(_, _)) => {
                             panic!("Unexpected poll after the headers have been resolved already")
@@ -341,25 +533,34 @@ where
                 },
                 opt_je = journal_stream.next() => {
                     match opt_je {
-                        Some(JournalEntry::JournalV2(entry)) => {
+                        Some(Ok((JournalEntry::JournalV2(entry), lease))) => {
                             sent_entries += 1;
-                            crate::shortcircuit!(self.write_entry(http_stream_tx, entry.inner).await);
+                            shortcircuit!(self.write_entry_with_lease(http_stream_tx, entry.inner, Some(lease)));
                         }
-                        Some(JournalEntry::JournalV1(old_entry)) => {
+                        Some(Ok((JournalEntry::JournalV1(old_entry), lease))) => {
                             sent_entries += 1;
-                            if let journal::Entry::Input(input_entry) = crate::shortcircuit!(old_entry.deserialize_entry::<ProtobufRawEntryCodec>()) {
-                                crate::shortcircuit!(self.write_entry(
+                            if let journal::Entry::Input(input_entry) = shortcircuit!(old_entry.deserialize_entry::<ProtobufRawEntryCodec>()) {
+                                shortcircuit!(self.write_entry_with_lease(
                                     http_stream_tx,
                                     Entry::Command(InputCommand {
                                         headers: input_entry.headers,
                                         payload: input_entry.value,
                                         name: Default::default()
-                                    }.into()).encode::<ServiceProtocolV4Codec>()
-                                ).await);
+                                    }.into()).encode::<ServiceProtocolV4Codec>(),
+                                    Some(lease),
+                                ));
                             } else {
                                 panic!("This is unexpected, when an entry is stored with journal v1, only input entry is allowed!")
                             }
                         },
+                        Some(Ok((JournalEntry::JournalV1Completion(_), _))) => {
+                            panic!("Unexpected JournalV1Completion during replay: completion arrived before entry was stored")
+                        }
+                        Some(Err(e)) => {
+                            return TerminalLoopState::from(
+                                Err::<(), _>(InvokerError::from_journal_reader(e)),
+                            );
+                        }
                         None => {
                             // Let's verify if we sent all the entries we promised, otherwise the stream will hang in a bad way!
                             if sent_entries < expected_entries_count {
@@ -380,29 +581,61 @@ where
     }
 
     /// This loop concurrently reads the http response stream and journal completions from the invoker.
-    async fn bidi_stream_loop<S>(
+    async fn bidi_stream_loop<S, IR>(
         &mut self,
-        parent_span_context: &ServiceInvocationSpanContext,
-        mut http_stream_tx: InvokerRequestStreamSender,
+        mut http_stream_tx: InvokerBodySender,
         http_stream_rx: &mut S,
+        mut invocation_reader: IR,
+        journal_kind: JournalKind,
+        outbound_budget: &mut LocalMemoryPool,
+        attempt_span: &mut ServiceSpan,
     ) -> TerminalLoopState<()>
     where
         S: Stream<Item = Result<DecoderStreamItem, InvokerError>> + Unpin,
+        IR: InvocationReader,
     {
+        let mut release_interval = tokio::time::interval(Self::BUDGET_RELEASE_INTERVAL);
+        release_interval.tick().await; // consume initial immediate tick
+        let mut inactivity_timeout =
+            std::pin::pin!(tokio::time::sleep(self.invocation_task.inactivity_timeout));
         loop {
             tokio::select! {
                 opt_completion = self.invocation_task.invoker_rx.recv() => {
                     match opt_completion {
-                        Some(Notification::Entry(entry)) => {
+                        Some(Notification::Entry(entry_index)) => {
+                            trace!(restate.journal.index = entry_index, "Reading entry from storage");
+                            let (journal_entry, lease) = shortcircuit!(
+                                invocation_reader
+                                    .read_journal_entry_budgeted(
+                                        &self.invocation_task.invocation_id,
+                                        entry_index,
+                                        journal_kind,
+                                        outbound_budget,
+                                    )
+                                    .await
+                                    .map_err(InvokerError::from_journal_reader)
+                                    .and_then(|opt| opt.ok_or_else(|| InvokerError::JournalReader(
+                                        anyhow::anyhow!(
+                                            "journal entry {entry_index} not found for notification read"
+                                        ),
+                                    )))
+                            );
+                            let raw_entry = match journal_entry {
+                                JournalEntry::JournalV2(stored) => stored.inner,
+                                other => {
+                                    panic!("v4+ protocol runner expected JournalV2 entry but got {other:?}")
+                                }
+                            };
                             trace!("Sending the entry to the wire");
-                            crate::shortcircuit!(self.write_entry(&mut http_stream_tx, entry).await);
+                            shortcircuit!(self.write_entry_with_lease(&mut http_stream_tx, raw_entry, Some(lease)));
                         }
-                        Some(Notification::Completion(_)) => {
-                            panic!("We don't expect to receive Notification::Completion, this is an invoker bug.")
-                        },
-                        Some(Notification::Ack(entry_index)) => {
+                        Some(Notification::CommandAck(entry_index)) => {
                             trace!("Sending the ack to the wire");
-                            crate::shortcircuit!(self.write(&mut http_stream_tx, Message::new_command_ack(entry_index)).await);
+                            shortcircuit!(self.write(&mut http_stream_tx, Message::new_command_ack(entry_index)));
+                        },
+                        Some(Notification::ProposeRunCompletionAck(completion_id)) => {
+                            trace!("Sending ProposeRunCompletionAck to the wire");
+                            shortcircuit!(self.write(&mut http_stream_tx, Message::new_propose_run_completion_ack(completion_id)));
                         },
                         None => {
                             // Completion channel is closed,
@@ -411,19 +644,26 @@ where
                             return TerminalLoopState::Continue(())
                         },
                     }
+
+                    inactivity_timeout.as_mut().reset(tokio::time::Instant::now() + self.invocation_task.inactivity_timeout);
                 },
                 chunk = http_stream_rx.next() => {
-                    match crate::shortcircuit!(chunk.transpose()) {
+                    match shortcircuit!(chunk.transpose()) {
                         None => {
                             return TerminalLoopState::Failed(InvokerError::SdkV2(SdkInvocationErrorV2::unknown()));
                         }
-                        Some(DecoderStreamItem::Parts(parts)) => crate::shortcircuit!(self.handle_response_headers(parts)),
+                        Some(DecoderStreamItem::Parts(parts)) => shortcircuit!(self.handle_response_headers(parts)),
                         Some(DecoderStreamItem::Message(message_header, message)) => {
-                            crate::shortcircuit!(self.handle_message(parent_span_context, message_header, message));
+                            shortcircuit!(self.handle_message(message_header, message, attempt_span));
                         }
                     }
+
+                    inactivity_timeout.as_mut().reset(tokio::time::Instant::now() + self.invocation_task.inactivity_timeout);
                 },
-                _ = tokio::time::sleep(self.invocation_task.inactivity_timeout) => {
+                _ = release_interval.tick() => {
+                    outbound_budget.release_excess();
+                },
+                _ = &mut inactivity_timeout => {
                     debug!("Inactivity detected, going to suspend invocation");
                     // Just return. This will drop the invoker_rx and http_stream_tx,
                     // closing the request stream and the invoker input channel.
@@ -435,8 +675,8 @@ where
 
     async fn response_stream_loop<S>(
         &mut self,
-        parent_span_context: &ServiceInvocationSpanContext,
         http_stream_rx: &mut S,
+        attempt_span: &mut ServiceSpan,
     ) -> TerminalLoopState<()>
     where
         S: Stream<Item = Result<DecoderStreamItem, InvokerError>> + Unpin,
@@ -447,12 +687,14 @@ where
                     // don't read again until all buffered messages has been consumed
                     // to force a back pressure on the read stream
 
-                    match crate::shortcircuit!(chunk.transpose()) {
+                    match shortcircuit!(chunk.transpose()) {
                         None => {
                             return TerminalLoopState::Failed(InvokerError::SdkV2(SdkInvocationErrorV2::unknown()));
                         }
-                        Some(DecoderStreamItem::Parts(parts)) => crate::shortcircuit!(self.handle_response_headers(parts)),
-                        Some(DecoderStreamItem::Message(message_header, message)) => crate::shortcircuit!(self.handle_message(parent_span_context, message_header, message)),
+                        Some(DecoderStreamItem::Parts(parts)) => shortcircuit!(self.handle_response_headers(parts)),
+                        Some(DecoderStreamItem::Message(message_header, message)) => {
+                            shortcircuit!(self.handle_message(message_header, message, attempt_span));
+                        }
                     }
                 },
                 _ = tokio::time::sleep(self.invocation_task.abort_timeout) => {
@@ -465,20 +707,28 @@ where
 
     // --- Read and write methods
 
-    async fn write_start<I: Iterator<Item = (Bytes, Bytes)>>(
+    async fn write_start<S, E>(
         &mut self,
-        http_stream_tx: &mut InvokerRequestStreamSender,
+        http_stream_tx: &mut InvokerBodySender,
         journal_size: u32,
-        state_entries: EagerState<I>,
+        state: Option<EagerState<S>>,
         retry_count_since_last_stored_entry: u32,
         duration_since_last_stored_entry: Duration,
         random_seed: u64,
-    ) -> Result<(), InvokerError> {
-        let is_partial = state_entries.is_partial();
+    ) -> Result<(), InvokerError>
+    where
+        S: PinnableMemoryStream<Item = Result<(Bytes, Bytes, LocalMemoryLease), E>> + Send,
+        E: InvocationReaderError,
+    {
+        // Collect state entries with size limit
+        let (partial_state, state_map, state_lease) = collect_eager_state(
+            state,
+            self.invocation_task.eager_state_size_limit,
+            |(key, value)| StateEntry { key, value },
+        )
+        .await?;
 
-        // Send the invoke frame
-        self.write(
-            http_stream_tx,
+        let start_message = if self.service_protocol_version >= ServiceProtocolVersion::V7 {
             Message::new_start_message(
                 Bytes::copy_from_slice(&self.invocation_task.invocation_id.to_bytes()),
                 self.invocation_task.invocation_id.to_string(),
@@ -487,70 +737,109 @@ where
                     .key()
                     .map(|bs| bs.as_bytes().clone()),
                 journal_size,
-                is_partial,
-                state_entries,
+                partial_state,
+                state_map,
                 retry_count_since_last_stored_entry,
                 duration_since_last_stored_entry,
                 random_seed,
-            ),
-        )
-        .await
+                self.invocation_task.invocation_target.scope(),
+                &self.invocation_task.limit_key,
+                self.invocation_task.idempotency_key.as_ref(),
+            )
+        } else {
+            Message::new_start_message(
+                Bytes::copy_from_slice(&self.invocation_task.invocation_id.to_bytes()),
+                self.invocation_task.invocation_id.to_string(),
+                self.invocation_task
+                    .invocation_target
+                    .key()
+                    .map(|bs| bs.as_bytes().clone()),
+                journal_size,
+                partial_state,
+                state_map,
+                retry_count_since_last_stored_entry,
+                duration_since_last_stored_entry,
+                random_seed,
+                // those fields were only introduced with service protocol V7
+                None,
+                &LimitKey::None,
+                None,
+            )
+        };
+
+        // Send the invoke frame with the merged state lease
+        self.write_with_lease(http_stream_tx, start_message, state_lease)
     }
 
-    async fn write_entry(
+    fn write_entry_with_lease(
         &mut self,
-        http_stream_tx: &mut InvokerRequestStreamSender,
+        http_stream_tx: &mut InvokerBodySender,
         entry: RawEntry,
+        lease: Option<LocalMemoryLease>,
     ) -> Result<(), InvokerError> {
         // TODO(slinkydeveloper) could this code be improved a tad bit more introducing something to our magic macro in message_codec?
         match entry {
             RawEntry::Command(cmd) => {
-                self.write_raw(
+                self.write_raw_with_lease(
                     http_stream_tx,
                     cmd.command_type().into(),
                     cmd.into_serialized_content(),
-                )
-                .await?;
+                    lease,
+                )?;
                 self.command_index += 1;
             }
             RawEntry::Notification(notif) => {
-                self.write_raw(
+                self.write_raw_with_lease(
                     http_stream_tx,
                     notif.ty().into(),
                     notif.into_serialized_content(),
-                )
-                .await?;
+                    lease,
+                )?;
             }
         }
         Ok(())
     }
 
-    async fn write(
+    fn write(
         &mut self,
-        http_stream_tx: &mut InvokerRequestStreamSender,
+        http_stream_tx: &mut InvokerBodySender,
         msg: Message,
+    ) -> Result<(), InvokerError> {
+        self.write_with_lease(http_stream_tx, msg, None)
+    }
+
+    fn write_with_lease(
+        &mut self,
+        http_stream_tx: &mut InvokerBodySender,
+        msg: Message,
+        lease: Option<LocalMemoryLease>,
     ) -> Result<(), InvokerError> {
         trace!(restate.protocol.message = ?msg, "Sending message");
         let buf = self.encoder.encode(msg);
 
-        if http_stream_tx.send(Ok(Frame::data(buf))).await.is_err() {
+        let len = buf.len();
+        if http_stream_tx.send(Ok(leased_frame(buf, lease))).is_err() {
             return Err(InvokerError::UnexpectedClosedRequestStream);
         };
+        counter!(INVOKER_SENT_BYTES, "type" => self.deployment_type_str).increment(len as u64);
         Ok(())
     }
 
-    async fn write_raw(
+    fn write_raw_with_lease(
         &mut self,
-        http_stream_tx: &mut InvokerRequestStreamSender,
+        http_stream_tx: &mut InvokerBodySender,
         ty: MessageType,
         buf: Bytes,
+        lease: Option<LocalMemoryLease>,
     ) -> Result<(), InvokerError> {
         trace!(restate.protocol.message = ?ty, "Sending message");
         let buf = self.encoder.encode_raw(ty, buf);
+        let len = buf.len();
 
-        if http_stream_tx.send(Ok(Frame::data(buf))).await.is_err() {
+        if http_stream_tx.send(Ok(leased_frame(buf, lease))).is_err() {
             return Err(InvokerError::UnexpectedClosedRequestStream);
         };
+        counter!(INVOKER_SENT_BYTES, "type" => self.deployment_type_str).increment(len as u64);
         Ok(())
     }
 
@@ -561,8 +850,19 @@ where
         // if service is running behind a gateway, the service can be down
         // but we still get a response code from the gateway itself. In that
         // case we still need to return the proper error
+        counter!(INVOKER_CLIENT_REQUESTS,
+            "type" => self.deployment_type_str,
+            "status_code" => parts.status.as_str().to_restring())
+        .increment(1);
         if GATEWAY_ERRORS_CODES.contains(&parts.status) {
             return Err(InvokerError::ServiceUnavailable(parts.status));
+        }
+
+        if RATE_LIMITED_CODES.contains(&parts.status) {
+            return Err(InvokerError::RateLimited {
+                code: parts.status,
+                retry_after: retry_after::parse_retry_after(&parts),
+            });
         }
 
         // otherwise we return generic UnexpectedResponse
@@ -614,13 +914,38 @@ where
         Ok(())
     }
 
-    fn handle_new_command(&mut self, mh: MessageHeader, command: RawCommand) {
+    fn handle_new_command(
+        &mut self,
+        mh: MessageHeader,
+        command: RawCommand,
+        attempt_span: &mut ServiceSpan,
+        cmd_name: Option<String>,
+    ) {
+        if attempt_span.is_recording() {
+            let mut attributes = vec![KeyValue::new(
+                restate_tracing_instrumentation::semconv::attribute::RESTATE_JOURNAL_COMMAND_TYPE,
+                command.ty().prometheus_label(),
+            )];
+            if let Some(cmd_name) = cmd_name
+                && !cmd_name.is_empty()
+            {
+                attributes.push(KeyValue::new(
+                    restate_tracing_instrumentation::semconv::attribute::RESTATE_JOURNAL_COMMAND_NAME,
+                    cmd_name,
+                ));
+            }
+
+            attempt_span.add_event(
+                restate_tracing_instrumentation::semconv::event::RESTATE_INVOCATION_LIFECYCLE_NEW_COMMAND,
+                attributes
+            );
+        }
         self.invocation_task
             .send_invoker_tx(InvocationTaskOutputInner::NewCommand {
                 command_index: self.command_index,
-                requires_ack: mh
-                    .requires_ack()
-                    .expect("All command messages support requires_ack"),
+                requested_ack: mh
+                    .requested_ack()
+                    .expect("All command messages support requested_ack"),
                 command,
             });
         self.command_index += 1;
@@ -628,9 +953,9 @@ where
 
     fn handle_message(
         &mut self,
-        parent_span_context: &ServiceInvocationSpanContext,
         mh: MessageHeader,
         message: Message,
+        attempt_span: &mut ServiceSpan,
     ) -> TerminalLoopState<()> {
         trace!(
             restate.protocol.message_header = ?mh,
@@ -645,7 +970,11 @@ where
             Message::CommandAck(_) => TerminalLoopState::Failed(InvokerError::UnexpectedMessageV4(
                 MessageType::CommandAck,
             )),
+            Message::ProposeRunCompletionAck(_) => TerminalLoopState::Failed(
+                InvokerError::UnexpectedMessageV4(MessageType::ProposeRunCompletionAck),
+            ),
             Message::Suspension(suspension) => self.handle_suspension_message(suspension),
+            Message::AwaitingOn(awaiting_on) => self.handle_awaiting_on_message(awaiting_on),
             Message::Error(e) => self.handle_error_message(e),
             Message::End(_) => TerminalLoopState::Closed,
 
@@ -653,7 +982,7 @@ where
             Message::ProposeRunCompletion(run_completion) => {
                 let notification: Entry = RunCompletion {
                     completion_id: run_completion.result_completion_id,
-                    result: match crate::shortcircuit!(
+                    result: match shortcircuit!(
                         run_completion
                             .result
                             .ok_or(InvokerError::MalformedProposeRunCompletion)
@@ -672,10 +1001,20 @@ where
                     .encode::<ServiceProtocolV4Codec>()
                     .try_into()
                     .expect("a raw notification");
+                attempt_span.add_event(
+                    restate_tracing_instrumentation::semconv::event::RESTATE_INVOCATION_LIFECYCLE_RUN_ENDED,
+                    vec![KeyValue::new(
+                        restate_tracing_instrumentation::semconv::attribute::RESTATE_JOURNAL_NOTIFICATION_ID,
+                        raw_notification.id().to_string(),
+                    )],
+                );
 
                 self.invocation_task.send_invoker_tx(
                     InvocationTaskOutputInner::NewNotificationProposal {
                         notification: raw_notification,
+                        requested_ack: mh
+                            .requested_ack()
+                            .expect("ProposeRunCompletion message supports requested_ack"),
                     },
                 );
 
@@ -684,47 +1023,89 @@ where
 
             // Commands
             Message::OutputCommand(cmd) => {
-                self.handle_new_command(mh, RawCommand::new(CommandType::Output, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::Output, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::InputCommand(cmd) => {
-                self.handle_new_command(mh, RawCommand::new(CommandType::Input, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::Input, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::GetInvocationOutputCommand(cmd) => {
-                // Verify the provided InvocationId is valid
-                let _: Entry = crate::shortcircuit!(
-                    RawCommand::new(CommandType::GetInvocationOutput, cmd.clone())
-                        .decode::<ServiceProtocolV4Codec, _>()
+                // The macro registers `GetInvocationOutput Command` as `noparse`, so `cmd` is
+                // the raw bytes from the wire. We decode a lite shadow type that only
+                // covers the fields we actually validate (target/scope) and forward the
+                // original bytes downstream to avoid a re-encode round trip.
+                let parsed = crate::shortcircuit!(
+                    proto_lite::GetInvocationOutputCommandMessageLite::decode(cmd.as_ref())
+                        .map_err(|err| InvokerError::Encoding(GenericError::from(err).into()))
                 );
-                self.handle_new_command(mh, RawCommand::new(CommandType::GetInvocationOutput, cmd));
+                if let Some(target) = parsed.target.as_ref() {
+                    shortcircuit!(Self::validate_target(target).map_err(|err| {
+                        InvokerError::CommandPrecondition(
+                            self.command_index,
+                            EntryType::Command(CommandType::GetInvocationOutput),
+                            err,
+                        )
+                    }));
+                }
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::GetInvocationOutput, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::AttachInvocationCommand(cmd) => {
-                // Verify the provided InvocationId is valid
-                let _: Entry = crate::shortcircuit!(
-                    RawCommand::new(CommandType::AttachInvocation, cmd.clone())
-                        .decode::<ServiceProtocolV4Codec, _>()
+                // See `Message::GetInvocationOutputCommand` above for why we decode-then-forward.
+                let parsed = shortcircuit!(
+                    proto_lite::AttachInvocationCommandMessageLite::decode(cmd.as_ref())
+                        .map_err(|err| InvokerError::Encoding(GenericError::from(err).into()))
                 );
-                self.handle_new_command(mh, RawCommand::new(CommandType::AttachInvocation, cmd));
+                if let Some(target) = parsed.target.as_ref() {
+                    shortcircuit!(Self::validate_target(target).map_err(|err| {
+                        InvokerError::CommandPrecondition(
+                            self.command_index,
+                            EntryType::Command(CommandType::AttachInvocation),
+                            err,
+                        )
+                    }));
+                }
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::AttachInvocation, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::RunCommand(cmd) => {
-                self.handle_new_command(mh, RawCommand::new(CommandType::Run, cmd));
+                let raw = RawCommand::new(CommandType::Run, cmd);
+                let run_cmd: RunCommand = shortcircuit!(raw.decode::<ServiceProtocolV4Codec, _>());
+                self.handle_new_command(mh, raw, attempt_span, Some(run_cmd.name.to_string()));
                 TerminalLoopState::Continue(())
             }
             Message::SendSignalCommand(cmd) => {
                 // Verify the provided InvocationId is valid
-                let _: Entry = crate::shortcircuit!(
-                    RawCommand::new(CommandType::SendSignal, cmd.clone())
-                        .decode::<ServiceProtocolV4Codec, _>()
-                );
-                self.handle_new_command(mh, RawCommand::new(CommandType::SendSignal, cmd));
+                let raw = RawCommand::new(CommandType::SendSignal, cmd);
+                let _: Entry = shortcircuit!(raw.decode::<ServiceProtocolV4Codec, _>());
+                self.handle_new_command(mh, raw, attempt_span, None);
                 TerminalLoopState::Continue(())
             }
             Message::OneWayCallCommand(cmd) => {
+                let name = cmd.name;
                 let entry: Entry = OneWayCallCommand {
-                    request: crate::shortcircuit!(
+                    request: shortcircuit!(
                         resolve_call_request(
                             self.invocation_task.schemas.live_load(),
                             InvokeRequest {
@@ -734,7 +1115,11 @@ where
                                 headers: cmd.headers.into_iter().map(Into::into).collect(),
                                 key: cmd.key.into(),
                                 idempotency_key: cmd.idempotency_key.map(|s| s.into()),
-                                span_relation: parent_span_context.as_linked()
+                                scope: cmd.scope,
+                                limit_key: cmd.limit_key,
+                                span_relation: SpanRelation::Linked(
+                                    attempt_span.span_context().clone().into()
+                                )
                             }
                         )
                         .map_err(|e| InvokerError::CommandPrecondition(
@@ -745,7 +1130,7 @@ where
                     ),
                     invoke_time: cmd.invoke_time.into(),
                     invocation_id_completion_id: cmd.invocation_id_notification_idx,
-                    name: cmd.name.into(),
+                    name: name.clone().into(),
                 }
                 .into();
                 self.handle_new_command(
@@ -754,12 +1139,15 @@ where
                         .encode::<ServiceProtocolV4Codec>()
                         .try_into()
                         .expect("a raw command"),
+                    attempt_span,
+                    Some(name),
                 );
                 TerminalLoopState::Continue(())
             }
             Message::CallCommand(cmd) => {
+                let name = cmd.name;
                 let entry: Entry = CallCommand {
-                    request: crate::shortcircuit!(
+                    request: shortcircuit!(
                         resolve_call_request(
                             self.invocation_task.schemas.live_load(),
                             InvokeRequest {
@@ -769,7 +1157,11 @@ where
                                 headers: cmd.headers.into_iter().map(Into::into).collect(),
                                 key: cmd.key.into(),
                                 idempotency_key: cmd.idempotency_key.map(|s| s.into()),
-                                span_relation: parent_span_context.as_parent()
+                                scope: cmd.scope,
+                                limit_key: cmd.limit_key,
+                                span_relation: SpanRelation::Parent(
+                                    attempt_span.span_context().clone().into()
+                                )
                             }
                         )
                         .map_err(|e| InvokerError::CommandPrecondition(
@@ -780,7 +1172,7 @@ where
                     ),
                     invocation_id_completion_id: cmd.invocation_id_notification_idx,
                     result_completion_id: cmd.result_completion_id,
-                    name: cmd.name.into(),
+                    name: name.clone().into(),
                 }
                 .into();
                 self.handle_new_command(
@@ -789,42 +1181,62 @@ where
                         .encode::<ServiceProtocolV4Codec>()
                         .try_into()
                         .expect("a raw command"),
+                    attempt_span,
+                    Some(name),
                 );
                 TerminalLoopState::Continue(())
             }
             Message::SleepCommand(cmd) => {
-                self.handle_new_command(mh, RawCommand::new(CommandType::Sleep, cmd));
+                let raw = RawCommand::new(CommandType::Sleep, cmd);
+                let sleep_cmd: SleepCommand =
+                    shortcircuit!(raw.decode::<ServiceProtocolV4Codec, _>());
+                self.handle_new_command(mh, raw, attempt_span, Some(sleep_cmd.name.to_string()));
                 TerminalLoopState::Continue(())
             }
             Message::CompletePromiseCommand(cmd) => {
-                crate::shortcircuit!(check_workflow_type(
+                shortcircuit!(check_workflow_type(
                     self.command_index,
                     &EntryType::Command(CommandType::CompletePromise),
                     &self.invocation_task.invocation_target.service_ty(),
                 ));
-                self.handle_new_command(mh, RawCommand::new(CommandType::CompletePromise, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::CompletePromise, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::PeekPromiseCommand(cmd) => {
-                crate::shortcircuit!(check_workflow_type(
+                shortcircuit!(check_workflow_type(
                     self.command_index,
                     &EntryType::Command(CommandType::PeekPromise),
                     &self.invocation_task.invocation_target.service_ty(),
                 ));
-                self.handle_new_command(mh, RawCommand::new(CommandType::PeekPromise, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::PeekPromise, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::GetPromiseCommand(cmd) => {
-                crate::shortcircuit!(check_workflow_type(
+                shortcircuit!(check_workflow_type(
                     self.command_index,
                     &EntryType::Command(CommandType::GetPromise),
                     &self.invocation_task.invocation_target.service_ty(),
                 ));
-                self.handle_new_command(mh, RawCommand::new(CommandType::GetPromise, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::GetPromise, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::GetEagerStateKeysCommand(cmd) => {
-                crate::shortcircuit!(can_read_state(
+                shortcircuit!(can_read_state(
                     self.command_index,
                     &EntryType::Command(CommandType::GetEagerStateKeys),
                     &self
@@ -832,11 +1244,16 @@ where
                         .invocation_target
                         .invocation_target_ty(),
                 ));
-                self.handle_new_command(mh, RawCommand::new(CommandType::GetEagerStateKeys, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::GetEagerStateKeys, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::GetEagerStateCommand(cmd) => {
-                crate::shortcircuit!(can_read_state(
+                shortcircuit!(can_read_state(
                     self.command_index,
                     &EntryType::Command(CommandType::GetEagerState),
                     &self
@@ -844,11 +1261,16 @@ where
                         .invocation_target
                         .invocation_target_ty(),
                 ));
-                self.handle_new_command(mh, RawCommand::new(CommandType::GetEagerState, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::GetEagerState, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::GetLazyStateKeysCommand(cmd) => {
-                crate::shortcircuit!(can_read_state(
+                shortcircuit!(can_read_state(
                     self.command_index,
                     &EntryType::Command(CommandType::GetLazyStateKeys),
                     &self
@@ -856,11 +1278,16 @@ where
                         .invocation_target
                         .invocation_target_ty(),
                 ));
-                self.handle_new_command(mh, RawCommand::new(CommandType::GetLazyStateKeys, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::GetLazyStateKeys, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::ClearAllStateCommand(cmd) => {
-                crate::shortcircuit!(can_write_state(
+                shortcircuit!(can_write_state(
                     self.command_index,
                     &EntryType::Command(CommandType::ClearAllState),
                     &self
@@ -868,11 +1295,16 @@ where
                         .invocation_target
                         .invocation_target_ty(),
                 ));
-                self.handle_new_command(mh, RawCommand::new(CommandType::ClearAllState, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::ClearAllState, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::ClearStateCommand(cmd) => {
-                crate::shortcircuit!(can_write_state(
+                shortcircuit!(can_write_state(
                     self.command_index,
                     &EntryType::Command(CommandType::ClearState),
                     &self
@@ -880,11 +1312,16 @@ where
                         .invocation_target
                         .invocation_target_ty(),
                 ));
-                self.handle_new_command(mh, RawCommand::new(CommandType::ClearState, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::ClearState, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::SetStateCommand(cmd) => {
-                crate::shortcircuit!(can_write_state(
+                shortcircuit!(can_write_state(
                     self.command_index,
                     &EntryType::Command(CommandType::SetState),
                     &self
@@ -892,11 +1329,16 @@ where
                         .invocation_target
                         .invocation_target_ty(),
                 ));
-                self.handle_new_command(mh, RawCommand::new(CommandType::SetState, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::SetState, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::GetLazyStateCommand(cmd) => {
-                crate::shortcircuit!(can_read_state(
+                shortcircuit!(can_read_state(
                     self.command_index,
                     &EntryType::Command(CommandType::GetLazyState),
                     &self
@@ -904,16 +1346,19 @@ where
                         .invocation_target
                         .invocation_target_ty(),
                 ));
-                self.handle_new_command(mh, RawCommand::new(CommandType::GetLazyState, cmd));
+                self.handle_new_command(
+                    mh,
+                    RawCommand::new(CommandType::GetLazyState, cmd),
+                    attempt_span,
+                    None,
+                );
                 TerminalLoopState::Continue(())
             }
             Message::CompleteAwakeableCommand(cmd) => {
                 // Verify the provided InvocationId is valid
-                let _: Entry = crate::shortcircuit!(
-                    RawCommand::new(CommandType::CompleteAwakeable, cmd.clone())
-                        .decode::<ServiceProtocolV4Codec, _>()
-                );
-                self.handle_new_command(mh, RawCommand::new(CommandType::CompleteAwakeable, cmd));
+                let raw = RawCommand::new(CommandType::CompleteAwakeable, cmd);
+                let _: Entry = shortcircuit!(raw.decode::<ServiceProtocolV4Codec, _>());
+                self.handle_new_command(mh, raw, attempt_span, None);
                 TerminalLoopState::Continue(())
             }
             Message::SignalNotification(_) => TerminalLoopState::Failed(
@@ -968,37 +1413,83 @@ where
         }
     }
 
+    fn handle_awaiting_on_message(
+        &mut self,
+        awaiting_on: proto::AwaitingOnMessage,
+    ) -> TerminalLoopState<()> {
+        // this message should mark this invocation as suspendable.
+        // if it's not running any side effects.
+
+        let Some(awaiting_on) = awaiting_on.awaiting_on else {
+            return TerminalLoopState::Failed(InvokerError::EmptyAwaitingOnMessage);
+        };
+
+        if awaiting_on.is_too_deep(self.max_awaited_future_depth) {
+            return TerminalLoopState::Failed(InvokerError::MaxFutureDepthReached {
+                limit: self.max_awaited_future_depth,
+            });
+        }
+
+        let unresolved_future: UnresolvedFuture = shortcircuit!(
+            awaiting_on
+                .try_into()
+                .map_err(|e| InvokerError::Encoding(GenericError::from(e).into()))
+        );
+        self.invocation_task
+            .send_invoker_tx(InvocationTaskOutputInner::AwaitingOn { unresolved_future });
+
+        // todo(azmy): Handle awaiting on message
+        //  Also verify that we keep correctly updated the InvocationStatusReportInner.last_awaiting_on_unresolved_future field!
+        TerminalLoopState::Continue(())
+    }
+
     fn handle_suspension_message(
         &mut self,
         suspension: proto::SuspensionMessage,
     ) -> TerminalLoopState<()> {
-        let suspension_indexes: HashSet<_> = suspension
-            .waiting_completions
-            .into_iter()
-            .map(NotificationId::for_completion)
-            .chain(
-                suspension
-                    .waiting_signals
-                    .into_iter()
-                    .map(SignalId::for_index)
-                    .map(NotificationId::for_signal),
-            )
-            .chain(
-                suspension
-                    .waiting_named_signals
-                    .into_iter()
-                    .map(|s| SignalId::for_name(s.into()))
-                    .map(NotificationId::for_signal),
-            )
-            .collect();
-        // We currently don't support empty suspension_indexes set
-        if suspension_indexes.is_empty() {
+        let Some(awaiting_on) = suspension.awaiting_on else {
+            return TerminalLoopState::Failed(InvokerError::EmptySuspensionMessage);
+        };
+
+        if awaiting_on.is_too_deep(self.max_awaited_future_depth) {
+            return TerminalLoopState::Failed(InvokerError::MaxFutureDepthReached {
+                limit: self.max_awaited_future_depth,
+            });
+        }
+
+        let future: UnresolvedFuture = shortcircuit!(
+            awaiting_on
+                .try_into()
+                .map_err(|e| InvokerError::Encoding(GenericError::from(e).into()))
+        );
+
+        // We currently don't support empty future set
+        if future.is_empty() {
             return TerminalLoopState::Failed(InvokerError::EmptySuspensionMessage);
         }
-        TerminalLoopState::SuspendedV2(suspension_indexes)
+
+        match self.service_protocol_version {
+            ServiceProtocolVersion::Unspecified => unreachable!(),
+            ServiceProtocolVersion::V1
+            | ServiceProtocolVersion::V2
+            | ServiceProtocolVersion::V3
+            | ServiceProtocolVersion::V4
+            | ServiceProtocolVersion::V5
+            | ServiceProtocolVersion::V6 => TerminalLoopState::SuspendedV2(future.flatten()),
+            ServiceProtocolVersion::V7 => TerminalLoopState::SuspendedV3(future),
+        }
     }
 
     fn handle_error_message(&mut self, error: proto::ErrorMessage) -> TerminalLoopState<()> {
+        let requested_error_behavior = match proto::ErrorBehavior::try_from(error.behavior)
+            .unwrap_or(proto::ErrorBehavior::Retry)
+        {
+            proto::ErrorBehavior::Retry => {
+                RequestedErrorBehavior::retry(error.next_retry_delay.map(Duration::from_millis))
+            }
+            proto::ErrorBehavior::Pause => RequestedErrorBehavior::Pause,
+            proto::ErrorBehavior::Fail => RequestedErrorBehavior::Fail,
+        };
         TerminalLoopState::Failed(InvokerError::SdkV2(SdkInvocationErrorV2 {
             related_command: Some(InvocationErrorRelatedCommandV2 {
                 related_command_index: error.related_command_index,
@@ -1012,9 +1503,41 @@ where
                     .related_command_index
                     .is_some_and(|entry_idx| entry_idx < self.command_index),
             }),
-            next_retry_interval_override: error.next_retry_delay.map(Duration::from_millis),
+            requested_error_behavior,
             error: InvocationError::from(error).into(),
         }))
+    }
+
+    /// Validates the target of a `GetInvocationOutput` command.
+    ///
+    /// We only validate the syntactic shape of the target (invocation id parses, scope is a
+    /// valid `RestrictedValue`). We do not check that the service/handler/workflow currently
+    /// exists in the schema, because the user may legitimately query the output of an invocation
+    /// whose service has since been removed from the registry.
+    fn validate_target(target: &proto_lite::TargetLite) -> Result<(), CommandPreconditionError> {
+        match target {
+            proto_lite::TargetLite::InvocationId(invocation_id) => {
+                invocation_id.parse::<InvocationId>().map_err(|err| {
+                    CommandPreconditionError::InvalidInvocationId(invocation_id.clone(), err)
+                })?;
+            }
+            proto_lite::TargetLite::IdempotentRequestTarget(idempotent_request_target) => {
+                if let Some(scope) = idempotent_request_target.scope.as_ref() {
+                    let _ = RestrictedValue::new(scope.as_str()).map_err(|e| {
+                        CommandPreconditionError::InvalidScope(scope.to_string(), e)
+                    })?;
+                }
+            }
+            proto_lite::TargetLite::WorkflowTarget(workflow_target) => {
+                if let Some(scope) = workflow_target.scope.as_ref() {
+                    let _ = RestrictedValue::new(scope.as_str()).map_err(|e| {
+                        CommandPreconditionError::InvalidScope(scope.to_string(), e)
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1027,6 +1550,8 @@ pub struct InvokeRequest {
     /// whether the key is none or empty.
     key: ByteString,
     idempotency_key: Option<ByteString>,
+    scope: Option<String>,
+    limit_key: Option<String>,
     span_relation: SpanRelation,
     parameter: Bytes,
 }
@@ -1063,19 +1588,29 @@ fn resolve_call_request(
         }
         InvocationTargetType::VirtualObject(h_ty) => InvocationTarget::virtual_object(
             request.service_name.clone(),
-            ByteString::try_from(request.key.clone().into_bytes())
-                .map_err(CommandPreconditionError::BadRequestKey)?,
+            request.key.clone(),
             request.handler_name,
             h_ty,
         ),
         InvocationTargetType::Workflow(h_ty) => InvocationTarget::workflow(
             request.service_name.clone(),
-            ByteString::try_from(request.key.clone().into_bytes())
-                .map_err(CommandPreconditionError::BadRequestKey)?,
+            request.key.clone(),
             request.handler_name,
             h_ty,
         ),
-    };
+    }
+    .with_scope(
+        if let Some(scope) = request.scope
+            && !scope.is_empty()
+        {
+            Some(
+                Scope::try_new(&scope)
+                    .map_err(|e| CommandPreconditionError::InvalidScope(scope, e))?,
+            )
+        } else {
+            None
+        },
+    );
 
     let idempotency_key = if let Some(idempotency_key) = &request.idempotency_key {
         if idempotency_key.is_empty() {
@@ -1085,6 +1620,19 @@ fn resolve_call_request(
     } else {
         None
     };
+    let limit_key: LimitKey<ReString> = if let Some(limit_key) = request.limit_key {
+        limit_key
+            .parse()
+            .map_err(|e| CommandPreconditionError::InvalidLimitKey(limit_key, e))?
+    } else {
+        LimitKey::None
+    };
+
+    // Validate invariant: limit_key requires scope
+    if !limit_key.is_empty() && invocation_target.scope().is_none() {
+        return Err(CommandPreconditionError::LimitKeyWithoutScope);
+    }
+
     let invocation_retention = meta.compute_retention(idempotency_key.is_some());
     let invocation_id = InvocationId::generate(&invocation_target, idempotency_key);
 
@@ -1100,6 +1648,7 @@ fn resolve_call_request(
         idempotency_key: request.idempotency_key,
         completion_retention_duration: invocation_retention.completion_retention,
         journal_retention_duration: invocation_retention.journal_retention,
+        limit_key,
     })
 }
 
@@ -1162,6 +1711,7 @@ pin_project_lite::pin_project! {
         #[pin]
         inner: S,
         decoder: Decoder,
+        rx_counter: Counter,
     }
 }
 
@@ -1171,6 +1721,7 @@ impl<S> DecoderStream<S> {
         service_protocol_version: ServiceProtocolVersion,
         message_size_warning: NonZeroUsize,
         message_size_limit: NonZeroUsize,
+        deployment_type_str: &'static str,
     ) -> Self {
         Self {
             inner,
@@ -1179,6 +1730,7 @@ impl<S> DecoderStream<S> {
                 message_size_warning,
                 message_size_limit,
             ),
+            rx_counter: counter!(INVOKER_RECEIVED_BYTES, "type" => deployment_type_str),
         }
     }
 
@@ -1189,7 +1741,7 @@ impl<S> DecoderStream<S> {
 
 impl<S> Stream for DecoderStream<S>
 where
-    S: Stream<Item = Result<ResponseChunk, InvokerError>> + Unpin,
+    S: Stream<Item = Result<ResponseChunk, InvokerError>>,
 {
     type Item = Result<DecoderStreamItem, InvokerError>;
 
@@ -1206,6 +1758,7 @@ where
                             return Poll::Ready(Some(Ok(DecoderStreamItem::Parts(parts))));
                         }
                         ResponseChunk::Data(buf) => {
+                            this.rx_counter.increment(buf.len() as u64);
                             this.decoder.push(buf);
                         }
                     },

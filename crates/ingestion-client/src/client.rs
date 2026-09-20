@@ -21,24 +21,26 @@ use restate_core::{
 use restate_types::{
     identifiers::PartitionKey,
     live::Live,
-    logs::{HasRecordKeys, Keys},
+    logs::{BodyWithKeys, HasRecordKeys, Keys},
     net::ingest::IngestRecord,
     partitions::{FindPartition, PartitionTable, PartitionTableError},
     storage::{StorageCodec, StorageEncode},
 };
 
 use crate::{
-    RecordCommit, SessionOptions,
+    Ingestion, RecordCommit, SessionOptions,
     session::{SessionHandle, SessionManager},
 };
 
 /// Errors that can be observed when interacting with the ingestion facade.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestionError {
-    #[error("Ingestion closed")]
-    Closed,
+    #[error("Ingestion client closed: {0}")]
+    Closed(&'static str),
     #[error(transparent)]
     PartitionTableError(#[from] PartitionTableError),
+    #[error("Record of size {size} bytes exceeds maximum allowed size of {limit} bytes")]
+    RecordMaxSizeExceeded { size: usize, limit: usize },
 }
 
 /// High-level ingestion entry point that allocates permits and hands out session handles per partition.
@@ -78,7 +80,7 @@ impl<T, V> IngestionClient<T, V> {
         partition_table: Live<PartitionTable>,
         partition_routing: PartitionRouting,
         memory_budget: NonZeroUsize,
-        opts: Option<SessionOptions>,
+        opts: SessionOptions,
     ) -> Self {
         Self {
             manager: SessionManager::new(networking, partition_routing, opts),
@@ -94,7 +96,6 @@ impl<T, V> IngestionClient<T, V> {
 impl<T, V> IngestionClient<T, V>
 where
     T: TransportConnect,
-    V: StorageEncode,
 {
     pub fn partition_routing(&self) -> &PartitionRouting {
         self.manager.partition_routing()
@@ -108,14 +109,34 @@ where
         self.manager.networking()
     }
 
-    /// Ingest a record with `partition_key`.
-    #[must_use]
-    pub fn ingest(
+    /// Once closed, calls to ingest will return [`IngestionError::Closed`].
+    /// Inflight records might still get committed.
+    pub fn close(&self) {
+        self.permits.close();
+        self.manager.close();
+    }
+}
+
+impl<T, V> Ingestion<V> for IngestionClient<T, V>
+where
+    T: TransportConnect,
+    V: StorageEncode,
+{
+    type Future = IngestFuture;
+
+    fn ingest(
         &mut self,
         partition_key: PartitionKey,
         record: impl Into<InputRecord<V>>,
-    ) -> IngestFuture {
+    ) -> Self::Future {
         let record = record.into().into_record(&mut self.arena);
+
+        if record.estimate_size() > self.manager.options().record_size_limit.get() {
+            return IngestFuture::error(IngestionError::RecordMaxSizeExceeded {
+                size: record.estimate_size(),
+                limit: self.manager.options().record_size_limit.get(),
+            });
+        }
 
         let budget = record.estimate_size().min(self.memory_budget.get());
 
@@ -133,13 +154,6 @@ where
         let acquire = self.permits.clone().acquire_many_owned(budget as u32);
 
         IngestFuture::awaiting_permits(record, handle, acquire)
-    }
-
-    /// Once closed, calls to ingest will return [`IngestionError::Closed`].
-    /// Inflight records might still get committed.
-    pub fn close(&self) {
-        self.permits.close();
-        self.manager.close();
     }
 }
 
@@ -207,9 +221,9 @@ impl Future for IngestFuture {
                         let record = record.take().unwrap();
                         handle
                             .ingest(permit, record)
-                            .map_err(|_| IngestionError::Closed)
+                            .map_err(|_| IngestionError::Closed("partition session closed"))
                     }
-                    Err(_) => Err(IngestionError::Closed),
+                    Err(_) => Err(IngestionError::Closed("permits semaphore closed")),
                 };
 
                 Poll::Ready(output)
@@ -225,8 +239,8 @@ impl Future for IngestFuture {
 }
 
 pub struct InputRecord<T> {
-    keys: Keys,
-    record: T,
+    pub(crate) keys: Keys,
+    pub(crate) record: T,
 }
 
 impl<T> InputRecord<T>
@@ -254,11 +268,21 @@ where
 
 impl InputRecord<String> {
     #[cfg(test)]
-    fn from_str(s: impl Into<String>) -> Self {
+    pub fn from_str(s: impl Into<String>) -> Self {
         InputRecord {
             keys: Keys::None,
             record: s.into(),
         }
+    }
+}
+
+impl<T> From<BodyWithKeys<T>> for InputRecord<T>
+where
+    T: StorageEncode,
+{
+    fn from(value: BodyWithKeys<T>) -> Self {
+        let (keys, record) = value.split();
+        Self { keys, record }
     }
 }
 
@@ -278,8 +302,9 @@ mod test {
         },
         partitions::PartitionRouting,
     };
+
     use restate_types::{
-        Version,
+        GenerationalNodeId, Version,
         identifiers::{LeaderEpoch, PartitionId},
         net::{
             self, RpcRequest,
@@ -292,13 +317,27 @@ mod test {
         },
     };
 
-    use crate::{CancelledError, IngestionClient, SessionOptions, client::InputRecord};
+    use crate::{CancelledError, Ingestion, IngestionClient, SessionOptions, client::InputRecord};
 
     async fn init_env(
         batch_size: usize,
     ) -> (
         ServiceStream<PartitionLeaderService>,
         IngestionClient<FailingConnector, String>,
+    ) {
+        let (incoming, client, _states, _my_node_id) = init_env_with_states(batch_size).await;
+        (incoming, client)
+    }
+
+    /// Like [`init_env`] but also returns the partition replica-set states (so tests can simulate
+    /// leadership changes via `note_observed_leader`) and the node id acting as leader.
+    async fn init_env_with_states(
+        batch_size: usize,
+    ) -> (
+        ServiceStream<PartitionLeaderService>,
+        IngestionClient<FailingConnector, String>,
+        PartitionReplicaSetStates,
+        GenerationalNodeId,
     ) {
         let mut builder = TestCoreEnvBuilder::with_incoming_only_connector()
             .add_mock_nodes_config()
@@ -321,26 +360,25 @@ mod test {
         let svc = builder
             .router_builder
             .register_service::<net::partition_processor::PartitionLeaderService>(
-                10,
                 BackPressureMode::PushBack,
             );
 
         let incoming = svc.start();
 
+        let my_node_id = builder.my_node_id;
         let env = builder.build().await;
         let client = IngestionClient::new(
             env.networking,
             env.metadata.updateable_partition_table(),
-            PartitionRouting::new(partition_replica_set_states, TaskCenter::current()),
+            PartitionRouting::new(partition_replica_set_states.clone(), TaskCenter::current()),
             NonZeroUsize::new(10 * 1024 * 1024).unwrap(), // 10MB
-            SessionOptions {
-                batch_size,
-                ..Default::default()
-            }
-            .into(),
+            SessionOptions::builder()
+                .batch_size(NonZeroUsize::new(batch_size).unwrap())
+                .build()
+                .unwrap(),
         );
 
-        (incoming, client)
+        (incoming, client, partition_replica_set_states, my_node_id)
     }
 
     async fn must_next(
@@ -355,7 +393,7 @@ mod test {
     }
 
     #[test(restate_core::test)]
-    async fn test_client_single_record() {
+    async fn client_single_record() {
         let (mut incoming, mut client) = init_env(10).await;
         let mut buf = BytesMut::new();
 
@@ -382,7 +420,7 @@ mod test {
     }
 
     #[test(restate_core::test)]
-    async fn test_client_single_record_retry() {
+    async fn client_single_record_retry() {
         let (mut incoming, mut client) = init_env(10).await;
         let mut buf = BytesMut::new();
 
@@ -415,8 +453,41 @@ mod test {
         commit.await.expect("to resolve");
     }
 
+    // A persistent `NotLeader` rejection must not produce a busy reconnect loop: the
+    // session backs off (escalating) before replaying the in-flight batch. With the
+    // clock paused, the elapsed virtual time proves a sleep was inserted between the
+    // rejection and the replay; an `Ack` then resolves the commit.
+    #[test(restate_core::test(start_paused = true))]
+    async fn not_leader_backs_off_before_replay() {
+        let (mut incoming, mut client) = init_env(10).await;
+
+        let mut commit = client
+            .ingest(0, InputRecord::from_str("hello world"))
+            .await
+            .unwrap();
+
+        // First attempt reaches the (stale) leader and is rejected.
+        let msg = must_next(&mut incoming).await;
+        let (rx, _) = msg.split();
+        rx.send(ResponseStatus::NotLeader { of: 0.into() }.into());
+        assert!((&mut commit).now_or_never().is_none());
+
+        // The replay must be preceded by a backoff (>= the 25ms first step) rather than
+        // an immediate resend that would tight-loop while routing is stale.
+        let start = tokio::time::Instant::now();
+        let msg = must_next(&mut incoming).await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(25),
+            "expected a backoff before replay, but the resend was immediate"
+        );
+
+        let (rx, _) = msg.split();
+        rx.send(ResponseStatus::Ack.into());
+        commit.await.expect("to resolve");
+    }
+
     #[test(restate_core::test)]
-    async fn test_client_close() {
+    async fn client_close() {
         let (_, mut client) = init_env(10).await;
 
         let commit = client
@@ -430,7 +501,7 @@ mod test {
     }
 
     #[test(restate_core::test(start_paused = true))]
-    async fn test_client_dispatch() {
+    async fn client_dispatch() {
         let (mut incoming, mut client) = init_env(10).await;
 
         let pt = Metadata::with_current(|p| p.partition_table_snapshot());
@@ -440,7 +511,7 @@ mod test {
             let partition = pt.get(&partition_id).unwrap();
             client
                 .ingest(
-                    *partition.key_range.start(),
+                    partition.key_range.start(),
                     InputRecord::from_str(format!("partition {p}")),
                 )
                 .await
@@ -467,5 +538,139 @@ mod test {
                 contains(eq(Some(3))),
             )
         );
+    }
+
+    // Sequential mode is the only mode the session runs today (see `connected_sequential_mode`):
+    // it keeps at most one batch in flight, sending the next batch only after the head is acked.
+    // This pins that invariant — the tail batch must not reach the wire while the head is unacked —
+    // and that every batch carries the leader epoch. It is the dual of the (ignored)
+    // `pipelines_multiple_unacked_batches`.
+    #[test(restate_core::test(start_paused = true))]
+    async fn sequential_mode_one_batch_in_flight() {
+        let mut buf = BytesMut::new();
+        // Cap fits exactly one record, so r0 and r1 form two separate batches.
+        let one_record = InputRecord::from_str("r0")
+            .into_record(&mut buf)
+            .estimate_size();
+        let (mut incoming, mut client) = init_env(one_record).await;
+
+        // Queue both records before the session forms a batch: `ingest().await` does not yield to
+        // the session task, so both are in the channel when the chunker first runs.
+        let c0 = client.ingest(0, InputRecord::from_str("r0")).await.unwrap();
+        let c1 = client.ingest(0, InputRecord::from_str("r1")).await.unwrap();
+
+        // Only the head batch B1=[r0] reaches the wire; r1 is held back by the chunker.
+        let head = must_next(&mut incoming).await;
+        let (head_rx, head_body) = head.split();
+        assert_that!(
+            head_body.records,
+            all!(
+                len(eq(1)),
+                contains(eq(InputRecord::from_str("r0").into_record(&mut buf)))
+            )
+        );
+
+        // While the head is unacked, the tail must not be sent. Advance time to let the session
+        // settle, then assert nothing else is on the wire.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            incoming.next().now_or_never().is_none(),
+            "tail batch must not be sent before the head is acked"
+        );
+
+        // Ack the head; only now does the tail batch B2=[r1] reach the wire.
+        head_rx.send(ResponseStatus::Ack.into());
+        c0.await.expect("r0 commits");
+
+        let tail = must_next(&mut incoming).await;
+        let (tail_rx, tail_body) = tail.split();
+        assert_that!(
+            tail_body.records,
+            all!(
+                len(eq(1)),
+                contains(eq(InputRecord::from_str("r1").into_record(&mut buf)))
+            )
+        );
+
+        tail_rx.send(ResponseStatus::Ack.into());
+        c1.await.expect("r1 commits");
+    }
+
+    // Regression coverage for #4810 under sequential mode (the mode in force today): a leadership
+    // transition must not reorder or drop records. The head batch is rejected with
+    // `NotLeaderWithEpoch`; the session carries it over together with the record the chunker
+    // over-pulled, then replays both — in produced order — against the new epoch, still one batch
+    // at a time. Nothing is failed/cancelled (the Kafka ingress and shuffle have no cheap retry),
+    // so out-of-order appends the dedup high-water-mark would silently drop cannot happen. This is
+    // the sequential dual of the (ignored) `leadership_change_replays_inflight_in_order`.
+    #[test(restate_core::test(start_paused = true))]
+    async fn sequential_mode_leadership_change_replays_in_order() {
+        // Cap fits exactly one record, so r0 and r1 form two separate batches.
+        let mut buf = BytesMut::new();
+        let one_record = InputRecord::from_str("r0")
+            .into_record(&mut buf)
+            .estimate_size();
+        let (mut incoming, mut client, states, my_node_id) = init_env_with_states(one_record).await;
+
+        let c0 = client.ingest(0, InputRecord::from_str("r0")).await.unwrap();
+        let c1 = client.ingest(0, InputRecord::from_str("r1")).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Sequential mode: only the head batch B1=[r0] is on the wire; r1 is held by the chunker.
+        let b1 = must_next(&mut incoming).await;
+        let (b1_rx, b1_body) = b1.split();
+        assert_that!(
+            b1_body.records,
+            all!(
+                len(eq(1)),
+                contains(eq(InputRecord::from_str("r0").into_record(&mut buf)))
+            )
+        );
+
+        // No second batch is in flight while the head is unacked.
+        assert!(
+            incoming.next().now_or_never().is_none(),
+            "tail batch must not be in flight under sequential mode"
+        );
+
+        // A new leader wins the election. Make routing observe the new epoch so the session can
+        // reconnect, then reject the head with the new epoch.
+        let new_epoch = LeaderEpoch::INITIAL.next();
+        let leadership_state = LeadershipState {
+            current_leader: my_node_id,
+            current_leader_epoch: new_epoch,
+        };
+        states.note_observed_leader(PartitionId::from(0), leadership_state);
+
+        b1_rx.send(ResponseStatus::NotLeader { of: 0.into() }.into());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Replay re-sends B1=[r0] then B2=[r1] in produced order at the new epoch — and still one
+        // at a time, so B2 only appears after B1 is acked.
+        let b1 = must_next(&mut incoming).await;
+        let (b1_rx, b1_body) = b1.split();
+        assert_that!(
+            b1_body.records,
+            all!(
+                len(eq(1)),
+                contains(eq(InputRecord::from_str("r0").into_record(&mut buf)))
+            )
+        );
+        b1_rx.send(ResponseStatus::Ack.into());
+
+        let b2 = must_next(&mut incoming).await;
+        let (b2_rx, b2_body) = b2.split();
+        assert_that!(
+            b2_body.records,
+            all!(
+                len(eq(1)),
+                contains(eq(InputRecord::from_str("r1").into_record(&mut buf)))
+            )
+        );
+        b2_rx.send(ResponseStatus::Ack.into());
+
+        // Nothing was failed/cancelled: both records eventually commit, in order.
+        c0.await.expect("r0 commits");
+        c1.await.expect("r1 commits");
     }
 }

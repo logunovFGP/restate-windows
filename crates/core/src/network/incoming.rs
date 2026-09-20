@@ -11,11 +11,11 @@
 use std::marker::PhantomData;
 
 use bytes::Bytes;
-use opentelemetry::Context;
 use tokio::sync::{oneshot, watch};
-use tracing::Span;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use restate_platform::memory::EstimatedMemorySize;
+
+pub use restate_memory::MemoryLease;
 use restate_types::GenerationalNodeId;
 use restate_types::net::codec::{WireDecode, WireEncode};
 use restate_types::net::{ProtocolVersion, Service, UnaryMessage, WatchResponse};
@@ -25,13 +25,12 @@ use super::protobuf::network::{rpc_reply, watch_update};
 use super::{ConnectionClosed, PeerMetadataVersion, Verdict};
 
 /// A wrapper for incoming messages over a network connection.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Incoming<M> {
     protocol_version: ProtocolVersion,
     inner: M,
     peer: GenerationalNodeId,
     metadata_version: PeerMetadataVersion,
-    parent_context: Option<Context>,
 }
 
 impl<M> Incoming<M> {
@@ -40,14 +39,12 @@ impl<M> Incoming<M> {
         inner: M,
         peer: GenerationalNodeId,
         metadata_version: PeerMetadataVersion,
-        parent_context: Option<Context>,
     ) -> Self {
         Self {
             protocol_version,
             inner,
             peer,
             metadata_version,
-            parent_context,
         }
     }
 
@@ -59,40 +56,6 @@ impl<M> Incoming<M> {
     /// The sender's node-id if known
     pub fn peer(&self) -> GenerationalNodeId {
         self.peer
-    }
-
-    /// Returns an open telemetry Context which is
-    /// traced over from the sender of the message
-    pub fn parent_context(&self) -> Option<&Context> {
-        self.parent_context.as_ref()
-    }
-
-    /// A shortcut to set current tracing [`Span`] parent
-    /// to remote caller span context
-    ///
-    /// This only works on the first call. Subsequent calls
-    /// has no effect on the current [`Span`].
-    ///
-    /// If you need to create `parallel` spans for the same
-    /// incoming message, use [`Self::parent_context()`] instead
-    pub fn follow_from_sender(&mut self) {
-        if let Some(context) = self.parent_context.take() {
-            let _ = Span::current().set_parent(context);
-        }
-    }
-
-    /// A shortcut to set given [`Span`] parent
-    /// to remote caller span context
-    ///
-    /// This only works on the first call. Subsequent calls
-    /// has no effect on the current [`Span`].
-    ///
-    /// If you need to create `parallel` spans for the same
-    /// incoming message, use [`Self::parent_context()`] instead
-    pub fn follow_from_sender_for(&mut self, span: &Span) {
-        if let Some(context) = self.parent_context.take() {
-            let _ = span.set_parent(context);
-        }
     }
 }
 
@@ -110,6 +73,7 @@ pub struct Rpc<M> {
     reply_port: RpcReplyPort,
     payload: Bytes,
     sort_code: Option<u64>,
+    reservation: MemoryLease,
     _phantom: PhantomData<M>,
 }
 
@@ -121,7 +85,6 @@ pub struct Oneshot<O: RpcResponse> {
 
 pub struct ReplyEnvelope {
     pub(crate) body: rpc_reply::Body,
-    pub(crate) span: Span,
 }
 // one-shot rpc reply
 pub(crate) struct RpcReplyPort(oneshot::Sender<ReplyEnvelope>);
@@ -129,6 +92,15 @@ impl RpcReplyPort {
     pub fn new() -> (RpcReplyPort, oneshot::Receiver<ReplyEnvelope>) {
         let (tx, rx) = oneshot::channel();
         (Self(tx), rx)
+    }
+
+    pub fn reply_with_verdict(verdict: Verdict) -> oneshot::Receiver<ReplyEnvelope> {
+        let (tx, rx) = oneshot::channel();
+        let status = rpc_reply::Status::from(verdict);
+        let _ = tx.send(ReplyEnvelope {
+            body: rpc_reply::Body::Status(status.into()),
+        });
+        rx
     }
 }
 
@@ -141,6 +113,9 @@ pub struct RawRpc {
     pub(super) payload: Bytes,
     pub(super) sort_code: Option<u64>,
     pub(super) msg_type: String,
+    /// Memory reservation for this message, used for backpressure.
+    #[debug(skip)]
+    pub(super) reservation: MemoryLease,
 }
 
 /// Untyped RPC message bound to a certain service type
@@ -152,6 +127,8 @@ pub struct RawSvcRpc<S> {
     pub(super) payload: Bytes,
     pub(super) sort_code: Option<u64>,
     msg_type: String,
+    #[debug(skip)]
+    reservation: MemoryLease,
     _phantom: PhantomData<S>,
 }
 // --- END RPC ---
@@ -165,6 +142,10 @@ pub struct Watch<M> {
     #[debug("Bytes({} bytes)", payload.len())]
     payload: Bytes,
     sort_code: Option<u64>,
+    /// Memory reservation held until the message is processed (RAII).
+    #[debug(skip)]
+    #[allow(dead_code)]
+    reservation: MemoryLease,
     _phantom: PhantomData<M>,
 }
 
@@ -183,48 +164,62 @@ pub struct WatchUpdateEnvelope {
 // streaming watch updates
 pub(crate) struct WatchUpdatePort(watch::Sender<WatchUpdateEnvelope>);
 
+#[derive(derive_more::Debug)]
 pub struct RawSvcWatch<S> {
+    #[debug(skip)]
     updates_port: WatchUpdatePort,
+    #[debug("Bytes({} bytes)", payload.len())]
     pub(super) payload: Bytes,
     pub(super) sort_code: Option<u64>,
     msg_type: String,
+    #[debug(skip)]
+    reservation: MemoryLease,
     _phantom: PhantomData<S>,
 }
 
 pub struct RawWatch {
-    reply_port: WatchUpdatePort,
-    payload: Bytes,
-    sort_code: Option<u64>,
-    msg_type: String,
+    pub(super) reply_port: WatchUpdatePort,
+    pub(super) payload: Bytes,
+    pub(super) sort_code: Option<u64>,
+    pub(super) msg_type: String,
+    pub(super) reservation: MemoryLease,
 }
 
 // --- END WATCH ---
 
 // --- BEGIN UNARY ---
 /// A typed Unary message
-#[derive(Clone, derive_more::Debug)]
+#[derive(derive_more::Debug)]
 pub struct Unary<M> {
     #[debug("Bytes({} bytes)", payload.len())]
     pub(super) payload: Bytes,
     pub(super) sort_code: Option<u64>,
+    /// Memory reservation held until the message is processed (RAII).
+    #[debug(skip)]
+    #[allow(dead_code)]
+    reservation: MemoryLease,
     pub(super) _phantom: PhantomData<M>,
 }
 
 /// Untyped Unary message
-#[derive(Clone, derive_more::Debug)]
+#[derive(derive_more::Debug)]
 pub struct RawUnary {
     #[debug("Bytes({} bytes)", payload.len())]
     pub(super) payload: Bytes,
     pub(super) sort_code: Option<u64>,
     pub(super) msg_type: String,
+    #[debug(skip)]
+    pub(super) reservation: MemoryLease,
 }
 
-#[derive(Clone, derive_more::Debug)]
+#[derive(derive_more::Debug)]
 pub struct RawSvcUnary<S> {
     #[debug("Bytes({} bytes)", payload.len())]
     pub(super) payload: Bytes,
     pub(super) sort_code: Option<u64>,
     msg_type: String,
+    #[debug(skip)]
+    reservation: MemoryLease,
     _phantom: PhantomData<S>,
 }
 
@@ -250,8 +245,28 @@ impl<S> Incoming<RawSvcRpc<S>> {
         let status = rpc_reply::Status::from(status);
         let _ = self.inner.reply_port.0.send(ReplyEnvelope {
             body: rpc_reply::Body::Status(status.into()),
-            span: Span::current(),
         });
+    }
+}
+
+impl EstimatedMemorySize for Incoming<RawRpc> {
+    #[inline]
+    fn estimated_memory_size(&self) -> usize {
+        self.inner.payload.estimated_memory_size()
+    }
+}
+
+impl<S> EstimatedMemorySize for Incoming<RawSvcRpc<S>> {
+    #[inline]
+    fn estimated_memory_size(&self) -> usize {
+        self.inner.payload.estimated_memory_size()
+    }
+}
+
+impl<S> EstimatedMemorySize for Incoming<Rpc<S>> {
+    #[inline]
+    fn estimated_memory_size(&self) -> usize {
+        self.inner.payload.estimated_memory_size()
     }
 }
 
@@ -270,11 +285,27 @@ impl<S: Service> Incoming<RawSvcRpc<S>> {
                 payload: raw.inner.payload,
                 sort_code: raw.inner.sort_code,
                 msg_type: raw.inner.msg_type,
+                reservation: raw.inner.reservation,
                 _phantom: PhantomData,
             },
             peer: raw.peer,
             metadata_version: raw.metadata_version,
-            parent_context: raw.parent_context,
+        }
+    }
+
+    #[cfg(feature = "message-util")]
+    pub(crate) fn into_raw_rpc(self) -> Incoming<RawRpc> {
+        Incoming {
+            protocol_version: self.protocol_version,
+            inner: RawRpc {
+                reply_port: self.inner.reply_port,
+                payload: self.inner.payload,
+                sort_code: self.inner.sort_code,
+                msg_type: self.inner.msg_type,
+                reservation: self.inner.reservation,
+            },
+            peer: self.peer,
+            metadata_version: self.metadata_version,
         }
     }
 
@@ -312,12 +343,12 @@ impl<S: Service> Incoming<RawSvcRpc<S>> {
                 reply_port: self.inner.reply_port,
                 payload: self.inner.payload,
                 sort_code: self.inner.sort_code,
+                reservation: self.inner.reservation,
                 _phantom: PhantomData,
             },
             protocol_version: self.protocol_version,
             peer: self.peer,
             metadata_version: self.metadata_version,
-            parent_context: self.parent_context,
         }
     }
 }
@@ -336,6 +367,27 @@ impl<S> Incoming<RawSvcUnary<S>> {
     }
 }
 
+impl EstimatedMemorySize for Incoming<RawUnary> {
+    #[inline]
+    fn estimated_memory_size(&self) -> usize {
+        self.inner.payload.estimated_memory_size()
+    }
+}
+
+impl<S> EstimatedMemorySize for Incoming<RawSvcUnary<S>> {
+    #[inline]
+    fn estimated_memory_size(&self) -> usize {
+        self.inner.payload.estimated_memory_size()
+    }
+}
+
+impl<S> EstimatedMemorySize for Incoming<Unary<S>> {
+    #[inline]
+    fn estimated_memory_size(&self) -> usize {
+        self.inner.payload.estimated_memory_size()
+    }
+}
+
 impl Incoming<RawUnary> {
     pub fn msg_type(&self) -> &str {
         &self.inner.msg_type
@@ -350,11 +402,26 @@ impl<S: Service> Incoming<RawSvcUnary<S>> {
                 payload: raw.inner.payload,
                 sort_code: raw.inner.sort_code,
                 msg_type: raw.inner.msg_type,
+                reservation: raw.inner.reservation,
                 _phantom: PhantomData,
             },
             peer: raw.peer,
             metadata_version: raw.metadata_version,
-            parent_context: raw.parent_context,
+        }
+    }
+
+    #[cfg(feature = "message-util")]
+    pub(crate) fn into_raw_unary(self) -> Incoming<RawUnary> {
+        Incoming {
+            protocol_version: self.protocol_version,
+            inner: RawUnary {
+                payload: self.inner.payload,
+                sort_code: self.inner.sort_code,
+                msg_type: self.inner.msg_type,
+                reservation: self.inner.reservation,
+            },
+            peer: self.peer,
+            metadata_version: self.metadata_version,
         }
     }
 
@@ -391,12 +458,12 @@ impl<S: Service> Incoming<RawSvcUnary<S>> {
             inner: Unary {
                 payload: self.inner.payload,
                 sort_code: self.inner.sort_code,
+                reservation: self.inner.reservation,
                 _phantom: PhantomData,
             },
             protocol_version: self.protocol_version,
             peer: self.peer,
             metadata_version: self.metadata_version,
-            parent_context: self.parent_context,
         }
     }
 }
@@ -404,6 +471,27 @@ impl<S: Service> Incoming<RawSvcUnary<S>> {
 impl Incoming<RawWatch> {
     pub fn msg_type(&self) -> &str {
         &self.inner.msg_type
+    }
+}
+
+impl EstimatedMemorySize for Incoming<RawWatch> {
+    #[inline]
+    fn estimated_memory_size(&self) -> usize {
+        self.inner.payload.estimated_memory_size()
+    }
+}
+
+impl<S> EstimatedMemorySize for Incoming<RawSvcWatch<S>> {
+    #[inline]
+    fn estimated_memory_size(&self) -> usize {
+        self.inner.payload.estimated_memory_size()
+    }
+}
+
+impl<S> EstimatedMemorySize for Incoming<Watch<S>> {
+    #[inline]
+    fn estimated_memory_size(&self) -> usize {
+        self.inner.payload.estimated_memory_size()
     }
 }
 
@@ -430,11 +518,27 @@ impl<S: Service> Incoming<RawSvcWatch<S>> {
                 payload: raw.inner.payload,
                 sort_code: raw.inner.sort_code,
                 msg_type: raw.inner.msg_type,
+                reservation: raw.inner.reservation,
                 _phantom: PhantomData,
             },
             peer: raw.peer,
             metadata_version: raw.metadata_version,
-            parent_context: raw.parent_context,
+        }
+    }
+
+    #[cfg(feature = "message-util")]
+    pub(crate) fn into_raw_watch(self) -> Incoming<RawWatch> {
+        Incoming {
+            protocol_version: self.protocol_version,
+            inner: RawWatch {
+                reply_port: self.inner.updates_port,
+                payload: self.inner.payload,
+                sort_code: self.inner.sort_code,
+                msg_type: self.inner.msg_type,
+                reservation: self.inner.reservation,
+            },
+            peer: self.peer,
+            metadata_version: self.metadata_version,
         }
     }
 
@@ -483,12 +587,12 @@ impl<S: Service> Incoming<RawSvcWatch<S>> {
                 updates_port: self.inner.updates_port,
                 payload: self.inner.payload,
                 sort_code: self.inner.sort_code,
+                reservation: self.inner.reservation,
                 _phantom: PhantomData,
             },
             protocol_version: self.protocol_version,
             peer: self.peer,
             metadata_version: self.metadata_version,
-            parent_context: self.parent_context,
         }
     }
 }
@@ -521,6 +625,9 @@ impl<M: RpcRequest + WireDecode> Incoming<Rpc<M>> {
     /// Consumes the message and returns a tuple of a reciprocal (reply port) and the decoded body
     /// of the message.
     ///
+    /// Note: This method drops any attached memory reservation. If you need to preserve the
+    /// reservation, use [`Self::split_with_reservation()`] instead.
+    ///
     /// **Panics** if message decoding failed
     pub fn split(self) -> (Reciprocal<Oneshot<M::Response>>, M) {
         let body = M::decode(self.inner.payload, self.protocol_version);
@@ -534,6 +641,28 @@ impl<M: RpcRequest + WireDecode> Incoming<Rpc<M>> {
                 _phantom: PhantomData,
             },
             body,
+        )
+    }
+
+    /// Like [`Self::split()`], but also returns the memory reservation.
+    ///
+    /// Use this when you need to hold the memory reservation until processing is complete
+    /// (e.g., until data has been persisted to storage).
+    ///
+    /// **Panics** if message decoding failed
+    pub fn split_with_reservation(self) -> (Reciprocal<Oneshot<M::Response>>, M, MemoryLease) {
+        let body = M::decode(self.inner.payload, self.protocol_version);
+        (
+            Reciprocal {
+                protocol_version: self.protocol_version,
+                reply_port: Oneshot {
+                    inner: self.inner.reply_port,
+                    _phantom: PhantomData,
+                },
+                _phantom: PhantomData,
+            },
+            body,
+            self.inner.reservation,
         )
     }
 
@@ -633,7 +762,6 @@ impl<O: RpcResponse + WireEncode> Reciprocal<Oneshot<O>> {
             .0
             .send(ReplyEnvelope {
                 body: rpc_reply::Body::Payload(reply),
-                span: Span::current(),
             })
             .map_err(|_| ConnectionClosed)
     }
@@ -650,7 +778,6 @@ impl<O: RpcResponse + WireEncode> Reciprocal<Oneshot<O>> {
         let status = rpc_reply::Status::from(v);
         let _ = self.reply_port.inner.0.send(ReplyEnvelope {
             body: rpc_reply::Body::Status(status.into()),
-            span: Span::current(),
         });
     }
 }
@@ -721,10 +848,14 @@ pub mod test_util {
 
     impl<O: RpcResponse + WireEncode + WireDecode> Reciprocal<Oneshot<O>> {
         pub fn mock() -> (Self, OneshotRxMock<O>) {
+            Self::mock_with_version(restate_types::net::CURRENT_PROTOCOL_VERSION)
+        }
+
+        pub fn mock_with_version(protocol_version: ProtocolVersion) -> (Self, OneshotRxMock<O>) {
             let (tx, rx) = RpcReplyPort::new();
             (
                 Reciprocal {
-                    protocol_version: Default::default(),
+                    protocol_version,
                     reply_port: Oneshot {
                         inner: tx,
                         _phantom: PhantomData,

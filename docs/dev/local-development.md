@@ -42,23 +42,6 @@ If you choose to install OpenJDK via homebrew, you'll also need to link it so th
 sudo ln -sfn /opt/homebrew/opt/openjdk/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk.jdk
 ```
 
-### Building on MacOS (M1)
-
-In order to build the runtime on MacOS (M1) you need to export `CMAKE_OSX_ARCHITECTURES="arm64"`.
-This will prevent `librdkafka` from building a [fat binary that fails to be linked on MacOS (M1)](https://github.com/rust-lang/cargo/issues/8875).
-
-You can also add the following section to your `~/.cargo/config.toml` to make cargo always run with this environment variable:
-
-```toml
-[env]
-# Fix architecture to arm64 to make rdkafka build. Without this env var, the
-# librdkafka build script will generate a fat binary that fails to be linked
-# on MacOS. See https://github.com/rust-lang/cargo/issues/8875 and
-# https://github.com/rust-lang/rust/issues/50220#issuecomment-433070637 for
-# more details.
-CMAKE_OSX_ARCHITECTURES = "arm64"
-```
-
 ### Building the binaries
 
 In order to build the `restate-server` binary run:
@@ -208,3 +191,28 @@ When that resolves the issue, you can make `clang` the default compiler by addin
 CC = "clang"
 CXX = "clang++"
 ```
+
+### krb5 and clang issues
+If you faced an issue building krb5 with clang version `>21` please do the following
+
+Update the `~/.cargo/config.toml` one more time as following:
+`# cat ~/.cargo/config.toml`
+
+```toml
+ 
+[env]
+# krb5-src 0.3.4 fails in vendored Kerberos C sources here unless we use clang
+# and append a warning override after its own -Werror flags.
+CC = { value = ".cargo/cc-clang-wrapper.sh", relative = true, force = true }
+CXX = "clang++"
+```
+
+Then create the following file 
+`# cat ~/.cargo/cc-clang-wrapper.sh`
+
+```bash
+#!/usr/bin/env sh
+exec clang "$@" -Wno-error=incompatible-pointer-types-discards-qualifiers
+```
+
+This forces override of krb5 `-Werror` flags by making sure the `-Wno-error` appears after theirs on the command line

@@ -8,18 +8,21 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{DeserializeAs, serde_as};
 use tracing::warn;
 
-use restate_serde_util::NonZeroByteCount;
-use restate_time_util::NonZeroFriendlyDuration;
+use restate_util_bytecount::NonZeroByteCount;
+use restate_util_time::NonZeroFriendlyDuration;
 
 use super::{
-    CommonOptions, Configuration, RocksDbOptions, RocksDbOptionsBuilder, StructWithDefaults,
+    BackgroundWorkBudget, CommonOptions, Configuration, RocksDbOptions, StructWithDefaults,
 };
+
+const MIN_ROCKSDB_MEMORY: NonZeroByteCount =
+    NonZeroByteCount::new(NonZeroUsize::new(8 * 1024 * 1024).unwrap());
 
 /// # Metadata store options
 #[serde_as]
@@ -41,9 +44,7 @@ pub struct MetadataServerOptions {
     ///
     /// If this value is set, it overrides the ratio defined in `rocksdb-memory-ratio`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde_as(as = "Option<NonZeroByteCount>")]
-    #[cfg_attr(feature = "schemars", schemars(with = "Option<NonZeroByteCount>"))]
-    rocksdb_memory_budget: Option<NonZeroUsize>,
+    rocksdb_memory_budget: Option<NonZeroByteCount>,
 
     /// The memory budget for rocksdb memtables as ratio
     ///
@@ -65,6 +66,24 @@ pub struct MetadataServerOptions {
     /// Defines whether this node should auto join the metadata store cluster when being started
     /// for the first time.
     pub auto_join: bool,
+
+    /// # Max background flushes
+    ///
+    /// Maximum number of concurrent flush operations for this database.
+    ///
+    /// If unset, defaults to 1 (metadata-server has a lightweight workload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    rocksdb_max_background_flushes: Option<NonZeroU32>,
+
+    /// # Max background compactions
+    ///
+    /// Maximum number of concurrent compaction operations for this database.
+    ///
+    /// If unset, defaults to 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    rocksdb_max_background_compactions: Option<NonZeroU32>,
 }
 
 impl MetadataServerOptions {
@@ -77,52 +96,60 @@ impl MetadataServerOptions {
 
         if self.rocksdb_memory_budget.is_none() {
             self.rocksdb_memory_budget = Some(
-                // 1MB minimum
-                NonZeroUsize::new(
-                    (common.rocksdb_safe_total_memtables_size() as f64
-                        * self.rocksdb_memory_ratio as f64)
-                        .floor()
-                        .max(1024.0 * 1024.0) as usize,
+                NonZeroByteCount::try_from(
+                    ((common.rocksdb_total_memtables_size().as_u64() as f64
+                        * self.rocksdb_memory_ratio as f64) as u64)
+                        .max(MIN_ROCKSDB_MEMORY.as_u64()),
                 )
                 .unwrap(),
             );
         }
     }
 
-    pub fn rocksdb_memory_budget(&self) -> usize {
+    pub fn rocksdb_memory_budget(&self) -> NonZeroByteCount {
         self.rocksdb_memory_budget
             .unwrap_or_else(|| {
-                warn!("metadata-server rocksdb_memory_budget is not set, defaulting to 1MB");
-                // 1MB minimum
-                NonZeroUsize::new(1024 * 1024).unwrap()
+                warn!("metadata-server rocksdb_memory_budget is not set, defaulting to {MIN_ROCKSDB_MEMORY}");
+                MIN_ROCKSDB_MEMORY
             })
-            .get()
+    }
+
+    pub fn apply_background_work_budget(&mut self, budget: &BackgroundWorkBudget) {
+        if self.rocksdb_max_background_flushes.is_none() {
+            self.rocksdb_max_background_flushes = Some(budget.max_background_flushes);
+        }
+        if self.rocksdb_max_background_compactions.is_none() {
+            self.rocksdb_max_background_compactions = Some(budget.max_background_compactions);
+        }
+    }
+
+    pub fn rocksdb_max_background_flushes(&self) -> NonZeroU32 {
+        self.rocksdb_max_background_flushes
+            .unwrap_or(NonZeroU32::new(1).unwrap())
+    }
+
+    pub fn rocksdb_max_background_compactions(&self) -> NonZeroU32 {
+        self.rocksdb_max_background_compactions
+            .unwrap_or(NonZeroU32::new(1).unwrap())
     }
 
     pub fn request_queue_length(&self) -> usize {
         self.request_queue_length.get()
     }
-
-    fn rocksdb_defaults() -> RocksDbOptionsBuilder {
-        let mut builder = RocksDbOptionsBuilder::default();
-        builder.rocksdb_disable_wal(Some(false));
-        builder
-    }
 }
 
 impl Default for MetadataServerOptions {
     fn default() -> Self {
-        let rocksdb = Self::rocksdb_defaults()
-            .build()
-            .expect("valid RocksDbOptions");
         Self {
             request_queue_length: NonZeroUsize::new(32).unwrap(),
             // set by apply_common in runtime
             rocksdb_memory_budget: None,
             rocksdb_memory_ratio: 0.01,
-            rocksdb,
+            rocksdb: RocksDbOptions::default(),
             raft_options: RaftOptions::default(),
             auto_join: true,
+            rocksdb_max_background_flushes: None,
+            rocksdb_max_background_compactions: None,
         }
     }
 }
@@ -194,7 +221,7 @@ impl<'de> DeserializeAs<'de, MetadataServerOptions>
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{Configuration, MetadataServerOptions};
+    use crate::config::{Configuration, MetadataServerOptions, RocksDbOptionsBuilder};
     use crate::config_loader::ConfigLoaderBuilder;
     use std::fs;
     use std::num::NonZeroUsize;
@@ -246,7 +273,7 @@ mod tests {
             .disable_apply_cascading_values(true)
             .build()?;
         let configuration = config_loader.load_once()?;
-        let mut rocksdb_defaults = MetadataServerOptions::rocksdb_defaults();
+        let mut rocksdb_defaults = RocksDbOptionsBuilder::default();
         rocksdb_defaults.rocksdb_disable_direct_io_for_reads(Some(false));
         let rocksdb = rocksdb_defaults.build().expect("should build");
 

@@ -13,7 +13,7 @@
 mod platform {
     use std::io::Write;
 
-    use restate_rocksdb::RocksDbManager;
+    use restate_rocksdb::{ManualCompactionOptions, RocksDbManager};
     use tokio::signal::unix::{SignalKind, signal};
     use tracing::{info, warn};
 
@@ -67,11 +67,20 @@ mod platform {
                     ),
                 };
                 let db_name = db.name().to_owned();
-                db.compact_all().await;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "Database '{db_name}' compaction requested",
-                );
+                match db.compact_all(ManualCompactionOptions::default()).await {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "Database '{db_name}' compaction completed",
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "Database '{db_name}' compaction failed: {e}",
+                        );
+                    }
+                }
             }
         }
     }

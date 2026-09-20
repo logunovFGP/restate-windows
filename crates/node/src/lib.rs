@@ -8,18 +8,19 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-mod cluster_marker;
 mod failure_detector;
 mod init;
+mod introspection;
 mod metric_definitions;
 mod network_server;
 mod roles;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use enumset::EnumSet;
 use prost_dto::IntoProst;
-use std::sync::Arc;
 use tracing::{debug, info, trace, warn};
 
 use codederror::CodedError;
@@ -28,17 +29,26 @@ use restate_core::network::{
     GrpcConnector, MessageRouterBuilder, NetworkServerBuilder, Networking, Swimlane,
 };
 use restate_core::partitions::PartitionRouting;
-use restate_core::{Metadata, MetadataKind, MetadataWriter, TaskKind};
+use restate_core::{Metadata, MetadataKind, MetadataWriter, TaskKind, migrate_metadata};
 use restate_core::{MetadataBuilder, MetadataManager, TaskCenter, spawn_metadata_manager};
 use restate_futures_util::overdue::OverdueLoggingExt;
 use restate_ingestion_client::{IngestionClient, SessionOptions};
+use restate_limiter::rule_book::RuleBookObserver;
 use restate_log_server::LogServerService;
+use restate_storage_query_datafusion::context::{NoTables, QueryContext};
+use restate_storage_query_datafusion::remote_query_scanner_client::create_remote_scanner_service;
+use restate_storage_query_datafusion::remote_query_scanner_manager::{
+    RemoteScannerManager, create_partition_locator,
+};
+use restate_storage_query_datafusion::remote_query_scanner_server::RemoteQueryScannerServer;
+
 use restate_metadata_server::{
     BoxedMetadataServer, MetadataServer, MetadataStoreClient, ReadModifyWriteError,
 };
 use restate_metadata_store::{ReadWriteError, WriteError, retry_on_retryable_error};
 use restate_partition_store::PartitionStoreManager;
 use restate_tracing_instrumentation::prometheus_metrics::Prometheus;
+use restate_types::cluster_marker::{ClusterMarker, ClusterValidationError};
 use restate_types::config::{CommonOptions, Configuration};
 use restate_types::errors::IntoMaybeRetryable;
 use restate_types::health::NodeStatus;
@@ -48,16 +58,17 @@ use restate_types::logs::metadata::{Logs, LogsConfiguration, ProviderConfigurati
 use restate_types::logs::{self, RecordCache};
 use restate_types::metadata::{GlobalMetadata, Precondition};
 use restate_types::net::listener::AddressBook;
-use restate_types::nodes_config::{ClusterFingerprint, NodeConfig, NodesConfiguration, Role};
+use restate_types::nodes_config::{
+    ClusterFeature, ClusterFingerprint, NodeConfig, NodesConfiguration, Role,
+};
 use restate_types::partition_table::{PartitionReplication, PartitionTable, PartitionTableBuilder};
 use restate_types::partitions::state::PartitionReplicaSetStates;
 use restate_types::protobuf::common::{
     AdminStatus, IngressStatus, LogServerStatus, NodeRpcStatus, WorkerStatus,
 };
-use restate_types::{GenerationalNodeId, Version, Versioned};
+use restate_types::{GenerationalNodeId, RestateVersion, Version, Versioned};
 
 use self::failure_detector::FailureDetector;
-use crate::cluster_marker::ClusterValidationError;
 use crate::init::NodeInit;
 use crate::network_server::NetworkServer;
 use crate::roles::{AdminRole, IngressRole, WorkerRole};
@@ -138,6 +149,7 @@ pub struct Node {
     worker_role: Option<WorkerRole<GrpcConnector>>,
     ingress_role: Option<IngressRole<GrpcConnector>>,
     log_server: Option<LogServerService>,
+    datafusion_remote_scanner: RemoteQueryScannerServer,
     networking: Networking<GrpcConnector>,
     is_provisioned: bool,
     prometheus: Prometheus,
@@ -162,8 +174,12 @@ impl Node {
         let tc = TaskCenter::current();
         debug_assert!(is_set, "Global metadata was already set");
 
-        let is_provisioned =
-            cluster_marker::validate_and_update_cluster_marker(config.common.cluster_name())?;
+        let marker = ClusterMarker::validate_or_create(
+            config.common.cluster_name(),
+            config.worker.use_multi_db_layout,
+        )?;
+
+        let is_provisioned = marker.provisioned();
 
         // If MetadataServerKind::Local and Role::MetadataServer are configured,
         // we use an in-memory client, ignoring the rest of the client config.
@@ -186,6 +202,38 @@ impl Node {
             )));
         };
 
+        // Initialize fabric TLS if configured. This must happen before any
+        // channel to a fabric peer is created (including the metadata-store
+        // client below, which eagerly builds its initial channels): channels
+        // pick up the identity/verifier via the process-wide client config.
+        let tls_server_config = config
+            .common
+            .fabric_tls()
+            .map(|tls_opts| {
+                use restate_core::network::tls::{
+                    TlsClientConfig, TlsServerConfig, spawn_reloader,
+                };
+                tls_opts.validate()?;
+                tls_opts.validate_advertised_address(
+                    &config.common.advertised_address(&address_book),
+                )?;
+                let server_config = TlsServerConfig::new(tls_opts)?;
+                let client_config = TlsClientConfig::from_fabric_options(tls_opts)?;
+                spawn_reloader(
+                    tls_opts.clone(),
+                    &server_config,
+                    &client_config,
+                    *tls_opts.refresh_interval,
+                )?;
+                // register process-wide so channels created via create_tonic_channel
+                // (metadata-store, raft, control) can dial https:// fabric peers
+                assert!(client_config.set_global());
+                Ok(server_config)
+            })
+            .transpose()
+            .map_err(BuildError::InvalidConfiguration)?;
+        server_builder.set_tls(tls_server_config);
+
         let (metadata_store_role, metadata_store_client) = if config.has_role(Role::MetadataServer)
         {
             restate_metadata_server::create_metadata_server_and_client(
@@ -206,7 +254,13 @@ impl Node {
 
         let mut metadata_manager =
             MetadataManager::new(metadata_builder, metadata_store_client.clone());
-        let mut router_builder = MessageRouterBuilder::default();
+        let default_pool = TaskCenter::with_current(|tc| {
+            tc.memory_controller().create_pool("fabric-default", || {
+                Configuration::pinned().networking.fabric_memory_limit()
+            })
+        });
+        let mut router_builder = MessageRouterBuilder::with_default_pool(default_pool);
+
         let networking = Networking::with_grpc_connector();
         metadata_manager.register_in_message_router(&mut router_builder);
         let replica_set_states = PartitionReplicaSetStates::default();
@@ -241,7 +295,8 @@ impl Node {
 
         let bifrost = bifrost_svc.handle();
 
-        let partition_store_manager = PartitionStoreManager::create().await?;
+        let partition_store_manager =
+            PartitionStoreManager::create(marker.uses_multi_db_layout()).await?;
 
         let log_server = if config.has_role(Role::LogServer) {
             Some(
@@ -268,11 +323,32 @@ impl Node {
                 .ingestion
                 .inflight_memory_budget
                 .as_non_zero_usize(),
-            Some(SessionOptions {
-                batch_size: config.ingress.ingestion.request_batch_size.as_usize(),
-                connection_retry_policy: config.ingress.ingestion.connection_retry_policy.clone(),
-                swimlane: Swimlane::IngressData,
-            }),
+            SessionOptions::builder()
+                .batch_size(
+                    config
+                        .ingress
+                        .ingestion
+                        .request_batch_size
+                        .as_non_zero_usize(),
+                )
+                .record_size_limit(config.ingress.request_size_limit())
+                .connection_retry_policy(config.ingress.ingestion.connection_retry_policy.clone())
+                .swimlane(Swimlane::IngressData)
+                .build()
+                .expect("Ingestion session options to build"),
+        );
+
+        // Create a node-level RemoteScannerManager shared across all roles.
+        // The partition locator routes partition-scoped scan RPCs to the right
+        // node, and the RemoteQueryScannerServer below serves scan RPCs for
+        // all registered scanners regardless of role.
+        let remote_scanner_manager = RemoteScannerManager::new(
+            create_remote_scanner_service(networking.clone()),
+            create_partition_locator(
+                PartitionRouting::new(replica_set_states.clone(), TaskCenter::current()),
+                metadata.clone(),
+            ),
+            metadata.clone(),
         );
 
         let worker_role = if config.has_role(Role::Worker) {
@@ -286,6 +362,7 @@ impl Node {
                     bifrost_svc.handle(),
                     ingestion_client.clone(),
                     metadata_manager.writer(),
+                    remote_scanner_manager.clone(),
                 )
                 .await?,
             )
@@ -293,12 +370,54 @@ impl Node {
             None
         };
 
+        // Register loglet_workers local scanner if the log-server role is present.
+        if let Some(log_server) = &log_server {
+            let local_scanner = introspection::loglet_workers::create_local_scanner(
+                log_server.state_map().clone(),
+                log_server.active_worker_map().clone(),
+                metadata.clone(),
+            );
+            remote_scanner_manager.register_node_scanner("loglet_workers", local_scanner);
+        }
+
+        // Register bifrost_read_streams scanner — available on every node since
+        // any node with bifrost can have active read streams.
+        {
+            let local_scanner = introspection::bifrost_read_streams::create_local_scanner(
+                bifrost.read_stream_registry().clone(),
+                metadata.clone(),
+            );
+            remote_scanner_manager.register_node_scanner("bifrost_read_streams", local_scanner);
+        }
+
+        // Register config scanner — available on every node.
+        if !Configuration::pinned().common.disable_config_sql_table {
+            let local_scanner = restate_storage_query_datafusion::config::create_scanner(
+                metadata.clone(),
+                Configuration::live(),
+            );
+            remote_scanner_manager.register_node_scanner("config", local_scanner);
+        }
+
+        // Create a minimal QueryContext for the remote scanner server — it only
+        // needs task_ctx() for physical expression deserialization.
+        let scanner_query_context = QueryContext::create(&config.admin.query_engine, NoTables)
+            .await
+            .expect("creating minimal QueryContext should not fail");
+
+        let datafusion_remote_scanner = RemoteQueryScannerServer::new(
+            scanner_query_context,
+            remote_scanner_manager,
+            &mut router_builder,
+        );
+
         let ingress_role = if config.has_role(Role::HttpIngress) {
             Some(IngressRole::create(
                 updateable_config
                     .clone()
                     .map(|config| &config.ingress)
                     .boxed(),
+                ingestion_client.clone(),
                 &mut address_book,
                 tc.health().ingress_status(),
                 networking.clone(),
@@ -311,6 +430,10 @@ impl Node {
         };
 
         let admin_role = if config.has_role(Role::Admin) {
+            let local_rule_book_observer = worker_role.as_ref().map(|worker_role| {
+                Arc::new(worker_role.rule_book_cache_handle()) as Arc<dyn RuleBookObserver>
+            });
+
             Some(
                 AdminRole::create(
                     tc.health().admin_status(),
@@ -329,6 +452,7 @@ impl Node {
                     worker_role
                         .as_ref()
                         .map(|worker_role| worker_role.storage_query_context().clone()),
+                    local_rule_book_observer,
                 )
                 .await?,
             )
@@ -363,6 +487,7 @@ impl Node {
             ingress_role,
             worker_role,
             log_server,
+            datafusion_remote_scanner,
             server_builder,
             networking,
             is_provisioned,
@@ -420,11 +545,13 @@ impl Node {
                     let cluster_configuration = ClusterConfiguration::from_configuration(&config);
                     let metadata_writer = metadata_writer.clone();
                     let common_opts = config.common.clone();
+
                     async move {
                         let response = provision_cluster_metadata(
                             &metadata_writer,
                             &common_opts,
                             &cluster_configuration,
+                            ClusterFeature::default_features(),
                         )
                         .await;
 
@@ -467,6 +594,16 @@ impl Node {
             .context("Giving up trying to initialize the node. Make sure that it can reach the metadata store and don't forget to provision the cluster on a fresh start")?
             .context("Failed initializing the node")?;
 
+        if metadata
+            .nodes_config_ref()
+            .features()
+            .contains(ClusterFeature::ControlledIdempotentSharding)
+        {
+            restate_types::identifiers::enable_controlled_idempotent_sharding();
+        } else {
+            debug!("Feature `controlled-idempotent-sharding` is disabled");
+        }
+
         self.failure_detector
             .start(self.updateable_config.clone().map(|c| &c.common.gossip))?;
 
@@ -508,7 +645,7 @@ impl Node {
             location = %my_node_config.location,
             nodes_config_version = %metadata.nodes_config_version(),
             cluster_name = %nodes_config.cluster_name(),
-            cluster_fingerprint = %nodes_config.cluster_fingerprint().to_string(),
+            cluster_fingerprint = ?nodes_config.cluster_fingerprint(),
             %partition_table_version,
             %logs_version,
             "My Node ID is {}", my_node_config.current_generation,
@@ -524,6 +661,16 @@ impl Node {
             &config,
         )
         .await?;
+
+        migrate_metadata(&metadata_writer).await?;
+
+        // Start the DataFusion remote scanner server — serves scan RPCs from
+        // the admin node for node-level and partition-level tables.
+        TaskCenter::spawn(
+            TaskKind::SystemService,
+            "datafusion-scan-server",
+            self.datafusion_remote_scanner.run(),
+        )?;
 
         if let Some(log_server) = self.log_server {
             log_server.start(metadata_writer).await?;
@@ -639,9 +786,10 @@ async fn provision_cluster_metadata(
     metadata_writer: &MetadataWriter,
     common_opts: &CommonOptions,
     cluster_configuration: &ClusterConfiguration,
+    features: EnumSet<ClusterFeature>,
 ) -> anyhow::Result<bool> {
     let (initial_nodes_configuration, initial_partition_table, initial_logs) =
-        generate_initial_metadata(common_opts, cluster_configuration);
+        generate_initial_metadata(common_opts, cluster_configuration, features);
 
     let result = retry_on_retryable_error(common_opts.network_error_retry_policy.clone(), || {
         metadata_writer
@@ -673,12 +821,16 @@ async fn provision_cluster_metadata(
     Ok(result)
 }
 
-fn create_initial_nodes_configuration(common_opts: &CommonOptions) -> NodesConfiguration {
+fn create_initial_nodes_configuration(
+    common_opts: &CommonOptions,
+    features: EnumSet<ClusterFeature>,
+) -> NodesConfiguration {
     let mut initial_nodes_configuration = NodesConfiguration::new(
         Version::MIN,
         common_opts.cluster_name().to_owned(),
         ClusterFingerprint::generate(),
     );
+    initial_nodes_configuration.set_features(features);
     let my_advertised_address =
         TaskCenter::with_current(|tc| common_opts.advertised_address(tc.address_book()));
 
@@ -693,6 +845,7 @@ fn create_initial_nodes_configuration(common_opts: &CommonOptions) -> NodesConfi
         .location(common_opts.location().clone())
         .address(my_advertised_address)
         .roles(common_opts.roles)
+        .binary_version(RestateVersion::current())
         .build();
     initial_nodes_configuration.upsert_node(node_config);
     initial_nodes_configuration
@@ -701,6 +854,7 @@ fn create_initial_nodes_configuration(common_opts: &CommonOptions) -> NodesConfi
 fn generate_initial_metadata(
     common_opts: &CommonOptions,
     cluster_configuration: &ClusterConfiguration,
+    features: EnumSet<ClusterFeature>,
 ) -> (NodesConfiguration, PartitionTable, Logs) {
     let mut initial_partition_table_builder = PartitionTableBuilder::default();
     initial_partition_table_builder
@@ -714,7 +868,7 @@ fn generate_initial_metadata(
         cluster_configuration.bifrost_provider.clone(),
     ));
 
-    let initial_nodes_configuration = create_initial_nodes_configuration(common_opts);
+    let initial_nodes_configuration = create_initial_nodes_configuration(common_opts, features);
 
     (
         initial_nodes_configuration,

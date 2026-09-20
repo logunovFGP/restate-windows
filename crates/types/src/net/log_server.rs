@@ -15,6 +15,7 @@ use bitflags::bitflags;
 use prost_dto::{FromProst, IntoProst};
 
 use restate_encoding::{ArcedSlice, BilrostNewType, NetSerde};
+use restate_platform::memory::EstimatedMemorySize;
 
 use super::{RpcResponse, ServiceTag};
 use crate::GenerationalNodeId;
@@ -125,7 +126,16 @@ macro_rules! define_logserver_unary {
 }
 
 #[derive(
-    Debug, Clone, Copy, Eq, PartialEq, IntoProst, FromProst, bilrost::Enumeration, NetSerde,
+    Debug,
+    Clone,
+    Copy,
+    Eq,
+    PartialEq,
+    IntoProst,
+    FromProst,
+    bilrost::Enumeration,
+    NetSerde,
+    derive_more::Display,
 )]
 #[prost(target = "crate::protobuf::log_server_common::Status")]
 #[repr(u8)]
@@ -310,6 +320,13 @@ impl From<Vec<Record>> for Payloads {
     }
 }
 
+impl EstimatedMemorySize for Payloads {
+    #[inline]
+    fn estimated_memory_size(&self) -> usize {
+        self.0.estimated_memory_size()
+    }
+}
+
 /// Store one or more records on a log-server
 #[derive(Debug, Clone, bilrost::Message, NetSerde)]
 pub struct Store {
@@ -353,6 +370,12 @@ impl Store {
             .iter()
             .map(|p| p.estimated_encode_size())
             .sum()
+    }
+}
+
+impl EstimatedMemorySize for Store {
+    fn estimated_memory_size(&self) -> usize {
+        self.payloads.estimated_memory_size()
     }
 }
 

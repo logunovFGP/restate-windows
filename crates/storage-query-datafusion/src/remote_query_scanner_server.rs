@@ -27,24 +27,28 @@ use restate_types::net::remote_query_scanner::{
     RemoteQueryScannerOpened, ScannerId,
 };
 
+use crate::context::QueryContext;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::scanner_task::{ScannerHandle, ScannerTask};
 
 pub(super) type ScannerMap = DashMap<ScannerId, ScannerHandle, ahash::RandomState>;
 
 pub struct RemoteQueryScannerServer {
+    query_context: QueryContext,
     remote_scanner_manager: RemoteScannerManager,
     network_rx: ServiceReceiver<RemoteDataFusionService>,
 }
 
 impl RemoteQueryScannerServer {
     pub fn new(
+        query_context: QueryContext,
         remote_scanner_manager: RemoteScannerManager,
         router_builder: &mut MessageRouterBuilder,
     ) -> Self {
-        let network_rx = router_builder.register_service(64, BackPressureMode::PushBack);
+        let network_rx = router_builder.register_service(BackPressureMode::Lossy);
 
         Self {
+            query_context,
             remote_scanner_manager,
             network_rx,
         }
@@ -52,6 +56,7 @@ impl RemoteQueryScannerServer {
 
     pub async fn run(self) -> anyhow::Result<()> {
         let RemoteQueryScannerServer {
+            query_context,
             remote_scanner_manager,
             network_rx,
         } = self;
@@ -72,9 +77,7 @@ impl RemoteQueryScannerServer {
                     match msg {
                         ServiceMessage::Rpc(msg) if msg.msg_type() == RemoteQueryScannerOpen::TYPE => {
                             let scan_req = msg.into_typed::<RemoteQueryScannerOpen>();
-                            next_scanner_id += 1;
-                            let scanner_id = ScannerId(my_node_id(), next_scanner_id);
-                            Self::on_open(scanner_id, scan_req, &scanners, &remote_scanner_manager);
+                            Self::on_open(&mut next_scanner_id, &query_context, scan_req, &scanners, &remote_scanner_manager);
                         }
                         ServiceMessage::Rpc(msg) if msg.msg_type() == RemoteQueryScannerNext::TYPE => {
                             Self::on_next(
@@ -99,7 +102,8 @@ impl RemoteQueryScannerServer {
     }
 
     fn on_open(
-        scanner_id: ScannerId,
+        next_scanner_id: &mut u64,
+        query_context: &QueryContext,
         scan_req: Incoming<Rpc<RemoteQueryScannerOpen>>,
         scanners: &Arc<ScannerMap>,
         remote_scanner_manager: &RemoteScannerManager,
@@ -107,17 +111,37 @@ impl RemoteQueryScannerServer {
         let peer = scan_req.peer();
         let (reciprocal, body) = scan_req.split();
         let partition_id = body.partition_id;
+        let scanner_id = body.scanner_id.unwrap_or_else(|| {
+            *next_scanner_id += 1;
+            ScannerId(my_node_id(), *next_scanner_id)
+        });
 
-        if let Err(e) = ScannerTask::spawn(scanner_id, remote_scanner_manager, peer, scanners, body)
-        {
-            warn!("Unable to create a scanner in partition {partition_id}:  {e}");
-            let response = RemoteQueryScannerOpened::Failure;
-            reciprocal.send(response);
+        // Reject duplicate scanner ids. With client-side allocation each (peer, seq)
+        // pair must already be unique; if the same id resurfaces it's a client bug
+        // (e.g. counter wraparound or replay) and we surface it as a failure rather
+        // than clobber an in-flight scanner.
+        if scanners.contains_key(&scanner_id) {
+            warn!(
+                "Refusing to open scanner {scanner_id} in partition {partition_id}: id already in use",
+            );
+            reciprocal.send(RemoteQueryScannerOpened::Failure);
             return;
         }
 
-        let response = RemoteQueryScannerOpened::Success { scanner_id };
-        reciprocal.send(response);
+        if let Err(e) = ScannerTask::spawn(
+            scanner_id,
+            query_context,
+            remote_scanner_manager,
+            peer,
+            scanners,
+            body,
+        ) {
+            warn!("Unable to create a scanner in partition {partition_id}:  {e}");
+            reciprocal.send(RemoteQueryScannerOpened::Failure);
+            return;
+        }
+
+        reciprocal.send(RemoteQueryScannerOpened::Success { scanner_id });
     }
 
     fn on_next(scanners: &ScannerMap, req: Incoming<Rpc<RemoteQueryScannerNext>>) {

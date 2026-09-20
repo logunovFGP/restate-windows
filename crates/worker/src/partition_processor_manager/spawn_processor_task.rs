@@ -11,72 +11,51 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
-use tracing::info;
-use tracing::{error, instrument, warn};
+use tokio::sync::watch;
+use tracing::{debug, info, instrument, warn};
 
-use restate_bifrost::Bifrost;
-use restate_core::network::TransportConnect;
-use restate_core::{Metadata, RuntimeTaskHandle, TaskCenter, TaskKind, cancellation_token};
+use restate_core::network::{ShardSender, TransportConnect};
+use restate_core::{RuntimeTaskHandle, TaskCenter, TaskKind, cancellation_token};
 use restate_ingestion_client::IngestionClient;
-use restate_invoker_api::capacity::InvokerCapacity;
-use restate_invoker_impl::Service as InvokerService;
-use restate_partition_store::{PartitionStore, PartitionStoreManager};
-use restate_service_protocol::codec::ProtobufRawEntryCodec;
-use restate_types::SharedString;
+use restate_partition_store::{MigrationError, PartitionStoreManager};
+use restate_platform::prelude::ReString;
 use restate_types::cluster::cluster_state::PartitionProcessorStatus;
-use restate_types::config::Configuration;
-use restate_types::live::Live;
-use restate_types::live::LiveLoadExt;
 use restate_types::logs::Lsn;
 use restate_types::partitions::Partition;
-use restate_types::partitions::state::PartitionReplicaSetStates;
-use restate_types::schema::Schema;
-use restate_wal_protocol::Envelope;
+use restate_wal_protocol::v2::{Envelope, Raw};
 
 use crate::PartitionProcessorBuilder;
-use crate::invoker_integration::EntryEnricher;
-use crate::partition::invoker_storage_reader::InvokerStorageReader;
+use crate::partition::NodeContext;
 use crate::partition::{ProcessorError, TargetLeaderState};
 use crate::partition_processor_manager::processor_state::StartedProcessor;
 
 pub struct SpawnPartitionProcessorTask<T> {
-    task_name: SharedString,
+    node_ctx: NodeContext,
+    task_name: ReString,
     partition: Partition,
-    configuration: Live<Configuration>,
-    bifrost: Bifrost,
-    replica_set_states: PartitionReplicaSetStates,
     partition_store_manager: Arc<PartitionStoreManager>,
     fast_forward_lsn: Option<Lsn>,
-    invoker_capacity: InvokerCapacity,
-    ingestion_client: IngestionClient<T, Envelope>,
+    ingestion_client: IngestionClient<T, Envelope<Raw>>,
 }
 
 impl<T> SpawnPartitionProcessorTask<T>
 where
     T: TransportConnect,
 {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        task_name: SharedString,
+        node_ctx: NodeContext,
+        task_name: ReString,
         partition: Partition,
-        configuration: Live<Configuration>,
-        bifrost: Bifrost,
-        replica_set_states: PartitionReplicaSetStates,
         partition_store_manager: Arc<PartitionStoreManager>,
         fast_forward_lsn: Option<Lsn>,
-        invoker_capacity: InvokerCapacity,
-        ingestion_client: IngestionClient<T, Envelope>,
+        ingestion_client: IngestionClient<T, Envelope<Raw>>,
     ) -> Self {
         Self {
+            node_ctx,
             task_name,
             partition,
-            configuration,
-            bifrost,
-            replica_set_states,
             partition_store_manager,
             fast_forward_lsn,
-            invoker_capacity,
             ingestion_client,
         }
     }
@@ -97,52 +76,19 @@ where
         RuntimeTaskHandle<Result<(), ProcessorError>>,
     )> {
         let Self {
+            mut node_ctx,
             task_name,
             partition,
-            configuration,
-            bifrost,
-            replica_set_states,
             partition_store_manager,
             fast_forward_lsn,
-            invoker_capacity,
             ingestion_client,
         } = self;
 
-        let config = configuration.pinned();
-        let schema = Metadata::with_current(|m| m.updateable_schema());
-        let invoker: InvokerService<
-            InvokerStorageReader<PartitionStore>,
-            EntryEnricher<Schema, ProtobufRawEntryCodec>,
-            Schema,
-        > = InvokerService::from_options(
-            partition.partition_id,
-            &config.common.service_client,
-            &config.worker.invoker,
-            EntryEnricher::new(schema.clone()),
-            schema,
-            invoker_capacity.invocation_token_bucket.clone(),
-            invoker_capacity.action_token_bucket.clone(),
-        )?;
-
-        let status_reader = invoker.status_reader();
-
         let (control_tx, control_rx) = watch::channel(TargetLeaderState::Follower);
-        let (net_tx, net_rx) = mpsc::channel(128);
-        let status = PartitionProcessorStatus::new();
-        let (watch_tx, watch_rx) = watch::channel(status.clone());
+        let (net_tx, net_rx) = ShardSender::new();
+        let (watch_tx, watch_rx) = watch::channel(PartitionProcessorStatus::default());
 
-        let pp_builder = PartitionProcessorBuilder::new(
-            status,
-            control_rx,
-            net_rx,
-            watch_tx,
-            invoker.handle(),
-            invoker_capacity,
-        );
-
-        let invoker_name = Arc::from(format!("invoker-{}", partition.partition_id));
-        let invoker_config = configuration.clone().map(|c| &c.worker.invoker);
-        let key_range = partition.key_range.clone();
+        let key_range = partition.key_range;
 
         let root_task_handle = TaskCenter::current().start_runtime(
             TaskKind::PartitionProcessor,
@@ -150,86 +96,117 @@ where
             Some(partition.partition_id),
             {
                 move || async move {
-                    let open_partition_store = async {
+                    let cancellation = cancellation_token();
+                    let wait_for_delay = async {
                         if let Some(delay) = delay {
                             tokio::time::sleep(delay).await;
                         }
-
-                        match partition_store_manager
-                            .open(&partition, fast_forward_lsn)
-                            .await
-                        {
-                            Ok(partition_store) => Ok(partition_store),
-                            Err(e) => Err(ProcessorError::from(e)),
-                        }
                     };
 
-                    let partition_store = cancellation_token()
-                        .run_until_cancelled(open_partition_store)
-                        .await;
-                    let Some(partition_store) = partition_store else {
+                    if cancellation
+                        .run_until_cancelled(wait_for_delay)
+                        .await
+                        .is_none()
+                    {
                         info!(
                             partition_id = %partition.partition_id,
                             "Partition processor stopped due to cancellation signal"
                         );
                         return Ok(());
-                    };
+                    }
 
-                    let partition_store = partition_store?;
+                    // RocksDB operations continue on the storage pool if their awaiting future is
+                    // dropped. Once opening starts, drain it before honoring cancellation so a
+                    // replacement processor cannot race the abandoned open.
+                    let partition_store = partition_store_manager
+                        .open(&partition, fast_forward_lsn)
+                        .await;
 
-                    let pp = pp_builder
-                        .build(
-                            bifrost,
-                            ingestion_client,
-                            partition_store,
-                            replica_set_states,
-                        )
+                    if cancellation.is_cancelled() {
+                        info!(
+                            partition_id = %partition.partition_id,
+                            "Partition processor stopped due to cancellation signal"
+                        );
+                        return Ok(());
+                    }
+
+                    let mut partition_store = partition_store.map_err(ProcessorError::from)?;
+
+                    // verify that this partition store is not sealed
+                    if let Some(seal) = partition_store.get_seal_marker().await? {
+                        warn!("Local partition store for partition {} is sealed due to {}. The \
+                        partition store is not safe to use by this node and will need to be replaced \
+                        by a safe snapshot before continuing!",
+                        partition.partition_id,
+                        seal,
+                        );
+                        return Err(ProcessorError::from(seal));
+                    }
+
+                    // Verify local feature compatibility before decoding the FSM and finish any
+                    // physical migration before its table-specific caches are constructed. Only
+                    // this local partition copy is migrated; inactive replicas can remain on an
+                    // older physical layout until they are started.
+                    let config = node_ctx.config.live_load().clone();
+                    match partition_store
+                        .verify_and_run_migrations(cancellation.clone(), &config)
                         .await
-                        .map_err(ProcessorError::from)?;
-
-                    // Invoker needs to outlive the partition processor when shutdown signal is
-                    // received. This is why it's not spawned as a "child".
-                    let mut invoker = TaskCenter::spawn_unmanaged_child(
-                        TaskKind::SystemService,
-                        invoker_name,
-                        invoker.run(invoker_config),
-                    )
-                    .map_err(|e| ProcessorError::from(anyhow::anyhow!(e)))?
-                    .into_guard();
-
-                    let mut run_fut = std::pin::pin!(pp.run());
-
-                    tokio::select! {
-                        result = &mut run_fut => {
-                            let _ = invoker.cancel_and_wait().await;
-                            info!(
-                                partition_id = %partition.partition_id,
-                                "Partition processor stopped"
+                    {
+                        Ok(()) => {}
+                        Err(MigrationError::MigrationCancelled) => {
+                            debug!(
+                                "Shutting partition processor during data migration because it was cancelled."
                             );
-                            result
+                            return Ok(());
                         }
-                        _ = &mut invoker => {
+                        Err(MigrationError::MigrationBarrier(reason)) => {
+                            return Err(ProcessorError::MigrationBarrier { reason });
+                        }
+                        Err(MigrationError::VersionBarrier {
+                            required_min_version,
+                        }) => {
+                            return Err(ProcessorError::VersionBarrier {
+                                required_min_version,
+                                barrier_reason: String::new(),
+                                feature_changes: Vec::new(),
+                                storage_features: Vec::new(),
+                            });
+                        }
+                        Err(MigrationError::StorageFeatureVersionBarrier {
+                            required_min_version,
+                            storage_features,
+                        }) => {
+                            return Err(ProcessorError::VersionBarrier {
+                                required_min_version,
+                                barrier_reason: "enabled storage features".to_owned(),
+                                feature_changes: Vec::new(),
+                                storage_features,
+                            });
+                        }
+                        Err(MigrationError::StorageError(err)) => {
                             warn!(
-                                partition_id = %partition.partition_id,
-                                "Invoker process stopped unexpectedly"
+                                "Shutting partition processor during data migration down because of error: {err}"
                             );
-
-                            // Cancel the current task then run the PP to completion
-                            // for a clean PP shutdown
-                            let task_cancellation_token = cancellation_token();
-                            task_cancellation_token.cancel();
-                            if let Err(err) = run_fut.await {
-                                error!(
-                                    err = %err,
-                                    partition_id = %partition.partition_id,
-                                    "Partition processor exited with an error while handling \
-                                    invoker crash"
-                                );
-                            }
-
-                            Err(ProcessorError::InvokerStoppedUnexpectedly)
+                            return Err(err.into());
                         }
                     }
+
+                    let db = partition_store.into_inner();
+                    let pp_builder =
+                        PartitionProcessorBuilder::new(control_rx, net_rx, watch_tx, node_ctx);
+
+                    let run_result = async move {
+                        let pp = pp_builder
+                            .build(ingestion_client, db).await?;
+                        pp.run().await
+                    }
+                    .await;
+
+                    info!(
+                        partition_id = %partition.partition_id,
+                        "Partition processor stopped"
+                    );
+                    run_result
                 }
             },
         )?;
@@ -238,7 +215,6 @@ where
             root_task_handle.cancellation_token().clone(),
             key_range,
             control_tx,
-            status_reader,
             net_tx,
             watch_rx,
         );

@@ -12,13 +12,13 @@ use crate::table_macro::*;
 
 use datafusion::arrow::datatypes::DataType;
 
-define_sort_order!(sys_invocation_state(partition_key, id));
+define_sort_order!(sys_invocation_state(partition_key));
 
 define_table!(sys_invocation_state(
     /// Internal column that is used for partitioning the services invocations. Can be ignored.
     partition_key: DataType::UInt64,
 
-    /// [Invocation ID](/operate/invocation#invocation-identifier).
+    /// [Invocation ID](/services/invocation/managing-invocations#invocation-id).
     id: DataType::LargeUtf8,
 
     /// If true, the invocation is currently in-flight
@@ -76,4 +76,7 @@ define_table!(sys_invocation_state(
     /// available entry types in [`entries.rs`](https://github.com/restatedev/restate/blob/main/crates/types/src/journal/entries.rs).
     /// DEPRECATED: you should not use this field anymore, but last_failure_related_command_type instead.
     last_failure_related_entry_type: DataType::LargeUtf8,
+
+    /// Last known future the SDK was awaiting on, if `in_flight = true`.
+    last_awaiting_on_future_json: DataType::LargeUtf8,
 ));

@@ -20,19 +20,24 @@ restate-workspace-hack = { workspace = true }
 restate-clock = { workspace = true }
 restate-core = { workspace = true }
 restate-futures-util = { workspace = true }
+restate-memory = { workspace = true }
 restate-metadata-store = { workspace = true }
+restate-platform = { workspace = true }
 restate-rocksdb = { workspace = true, optional = true }
 restate-test-util = { workspace = true, optional = true }
 restate-types = { workspace = true }
+restate-util-bytecount = { workspace = true, features = ["serde"] }
+restate-util-time = { workspace = true }
 
 ahash = { workspace = true }
+adaptive-timeout = { workspace = true, features = ["tokio", "sync"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
 crossbeam-utils = { version = "0.8" }
 dashmap = { workspace = true }
-derive_more = { workspace = true }
+derive_more = { workspace = true, features = ["debug", "display", "is_variant", "try_from"] }
 enum-map = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
 googletest = { workspace = true, features = ["anyhow"], optional = true }
@@ -56,14 +61,13 @@ tracing = { workspace = true }
 # which benefits importing libraries that don't need rocksdb.
 restate-bifrost = {path = ".", default-features = false, features = ["local-loglet"]}
 restate-core = { workspace = true, features = ["test-util"] }
-restate-log-server = { workspace = true }
+restate-log-server = { workspace = true, features = ["test-util"] }
 restate-rocksdb = { workspace = true }
-restate-serde-util = { workspace = true }
 restate-storage-api = { workspace = true }
 restate-test-util = { workspace = true }
 restate-types = { workspace = true, features = ["test-util"] }
 restate-wal-protocol = { workspace = true }
-restate-invoker-api = { workspace = true }
+restate-worker-api = { workspace = true }
 
 bytestring = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
@@ -83,3 +87,6 @@ pprof = { version = "0.15", features = ["criterion", "flamegraph", "frame-pointe
 [[bench]]
 name = "replicated_loglet_serde"
 harness = false
+
+[lints]
+workspace = true

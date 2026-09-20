@@ -11,7 +11,7 @@
 use futures::Stream;
 use futures_util::stream;
 
-use restate_rocksdb::RocksDbPerfGuard;
+use restate_rocksdb::RocksDbReadPerfGuard;
 use restate_storage_api::Result;
 use restate_storage_api::protobuf_types::PartitionStoreProtobufValue;
 use restate_storage_api::timer_table::{
@@ -21,7 +21,7 @@ use restate_types::identifiers::{InvocationUuid, PartitionId};
 
 use crate::TableKind::Timers;
 use crate::TableScanIterationDecision::Emit;
-use crate::keys::{KeyKind, TableKey, define_table_key};
+use crate::keys::{DecodeTableKey, KeyKind, define_table_key};
 use crate::{
     PaddedPartitionId, PartitionStore, PartitionStoreTransaction, StorageAccess, TableScan,
     TableScanIterationDecision,
@@ -116,13 +116,9 @@ fn exclusive_start_key_range(
             .partition_id(partition_id.into())
             .timestamp(u64::MAX);
 
-        TableScan::KeyRangeInclusiveInSinglePartition(
-            partition_id,
-            lower_bound.into_builder(),
-            upper_bound,
-        )
+        TableScan::RangeInclusive(lower_bound.into_builder(), upper_bound)
     } else {
-        TableScan::SinglePartition(partition_id)
+        TableScan::Prefix(TimersKey::builder().partition_id(partition_id.into()))
     }
 }
 
@@ -161,7 +157,7 @@ fn next_timers_greater_than<S: StorageAccess>(
     exclusive_start: Option<&TimerKey>,
     limit: usize,
 ) -> Result<Vec<Result<(TimerKey, Timer)>>> {
-    let _x = RocksDbPerfGuard::new("get-next-timers");
+    let _x = RocksDbReadPerfGuard::new("get-next-timers");
     let scan = exclusive_start_key_range(partition_id, exclusive_start);
     let mut produced = 0;
     storage.for_each_key_value_in_place(scan, move |k, v| {
@@ -217,9 +213,9 @@ impl WriteTimerTable for PartitionStoreTransaction<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::TableKeyPrefix;
+    use crate::keys::EncodeTableKeyPrefix;
     use crate::timer_table::TimerKey;
-    use rand::Rng;
+    use rand::RngExt;
     use restate_storage_api::timer_table::TimerKeyKindDiscriminants;
     use restate_types::identifiers::InvocationUuid;
     use restate_types::invocation::InvocationTarget;
@@ -289,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lexicographical_sorting_by_timestamp() {
+    fn lexicographical_sorting_by_timestamp() {
         let kinds = [
             TimerKeyKind::CompleteJournalEntry {
                 invocation_uuid: FIXTURE_INVOCATION,
@@ -322,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lexicographical_sorting_by_invocation_uuid_complete_journal_entry_kind() {
+    fn lexicographical_sorting_by_invocation_uuid_complete_journal_entry_kind() {
         // Higher random part should be sorted correctly in bytes
         let a = TimerKey {
             kind: TimerKeyKind::CompleteJournalEntry {
@@ -342,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lexicographical_sorting_by_invocation_uuid_invoke_kind() {
+    fn lexicographical_sorting_by_invocation_uuid_invoke_kind() {
         // Higher random part should be sorted correctly in bytes
         let a = TimerKey {
             kind: TimerKeyKind::Invoke {
@@ -360,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lexicographical_sorting_by_invocation_uuid_clean_invocation_status_kind() {
+    fn lexicographical_sorting_by_invocation_uuid_clean_invocation_status_kind() {
         // Higher random part should be sorted correctly in bytes
         let a = TimerKey {
             kind: TimerKeyKind::CleanInvocationStatus {
@@ -378,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lexicographical_sorting_by_invocation_uuid_neo_invoke_kind() {
+    fn lexicographical_sorting_by_invocation_uuid_neo_invoke_kind() {
         // Higher random part should be sorted correctly in bytes
         let a = TimerKey {
             kind: TimerKeyKind::NeoInvoke {
@@ -396,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lexicographical_sorting_by_journal_index() {
+    fn lexicographical_sorting_by_journal_index() {
         let a = TimerKey {
             kind: TimerKeyKind::CompleteJournalEntry {
                 invocation_uuid: FIXTURE_INVOCATION,
@@ -415,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lexicographical_sorting_timer_kind() {
+    fn lexicographical_sorting_timer_kind() {
         let a = TimerKey {
             kind: TimerKeyKind::Invoke {
                 invocation_uuid: FIXTURE_INVOCATION,
@@ -452,7 +448,7 @@ mod tests {
         assert!(less_than(&key_a_bytes, &key_b_bytes));
 
         let (low, high) = match exclusive_start_key_range(PartitionId::from(1), Some(key_a)) {
-            TableScan::KeyRangeInclusiveInSinglePartition(p, low, high) if *p == 1 => (low, high),
+            TableScan::RangeInclusive(low, high) => (low, high),
             _ => panic!(""),
         };
         let low = low.serialize();

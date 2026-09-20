@@ -21,6 +21,10 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::stream::FusedStream;
 use pin_project::pin_project;
+use tokio::time::Sleep;
+use tracing::debug;
+use tracing::trace;
+use tracing::warn;
 
 use restate_core::Metadata;
 use restate_core::MetadataKind;
@@ -40,11 +44,7 @@ use restate_types::logs::metadata::MaybeSegment;
 use restate_types::logs::metadata::SealMetadata;
 use restate_types::logs::metadata::SegmentIndex;
 use restate_types::logs::{LogId, Lsn};
-use restate_types::retries::with_jitter;
-use tokio::time::Sleep;
-use tracing::debug;
-use tracing::trace;
-use tracing::warn;
+use restate_util_time::DurationExt;
 
 use crate::BifrostAdmin;
 use crate::Error;
@@ -55,6 +55,7 @@ use crate::bifrost::MaybeLoglet;
 use crate::error::AdminError;
 use crate::loglet::OperationError;
 use crate::loglet_wrapper::LogletReadStreamWrapper;
+use crate::read_stream_registry::{ReadStreamId, ReadStreamState, SharedReadStreamState};
 
 /// A read stream reads from the virtual log. The stream provides a unified view over
 /// the virtual log addressing space in the face of seals, reconfiguration, and trims.
@@ -62,7 +63,7 @@ use crate::loglet_wrapper::LogletReadStreamWrapper;
 // The use of [pin_project] is not strictly necessary but it's left to allow future
 // substream implementations to be !Unpin without changing the read_stream.
 #[must_use = "streams do nothing unless polled"]
-#[pin_project(project = ReadStreamProj)]
+#[pin_project(project = ReadStreamProj, PinnedDrop)]
 pub struct LogReadStream {
     log_id: LogId,
     /// Chooses which records to read/return.
@@ -84,6 +85,10 @@ pub struct LogReadStream {
     /// Current substream we are reading from
     #[pin]
     substream: Option<LogletReadStreamWrapper>,
+    /// Introspection: unique ID for this stream in the registry.
+    registry_id: ReadStreamId,
+    /// Introspection: shared state updated on each state transition.
+    shared_state: SharedReadStreamState,
     // IMPORTANT: Do not re-order this field. `inner` must be dropped last. This allows
     // `state` to reference its lifetime as 'static.
     bifrost_inner: Arc<BifrostInner>,
@@ -114,6 +119,10 @@ enum State {
         safe_known_tail: Option<Lsn>,
         #[pin]
         tail_watch: Option<BoxStream<'static, TailState>>,
+        /// Logs version at which we last confirmed `read_pointer` still falls in a live
+        /// segment. A prefix-trim always bumps the version, so we only re-scan the chain when
+        /// this lags. Reset to [`Version::INVALID`] on entry so the check runs once per substream.
+        trim_checked_version: Version,
     },
     /// Chain reconfiguration has been detected, we'll update our view of the chain.
     AwaitingReconfiguration,
@@ -136,7 +145,7 @@ impl State {
     fn awaiting_or_seal_chain() -> Self {
         Self::AwaitingOrSealChain {
             // Questionable whether making this value configurable adds value or not.
-            timeout: Box::pin(tokio::time::sleep(with_jitter(Duration::from_secs(5), 0.5))),
+            timeout: Box::pin(tokio::time::sleep(Duration::from_secs(5).add_jitter(0.5))),
         }
     }
 
@@ -150,6 +159,7 @@ impl State {
         Self::Reading {
             safe_known_tail: Some(tail_lsn),
             tail_watch: None,
+            trim_checked_version: Version::INVALID,
         }
     }
 }
@@ -167,6 +177,12 @@ impl LogReadStream {
         // Accidental reads from Lsn::INVALID are reset to Lsn::OLDEST
         let start_lsn = std::cmp::max(Lsn::OLDEST, start_lsn);
         let log_metadata = Metadata::with_current(|m| m.updateable_logs_metadata());
+
+        let introspection_state = ReadStreamState::new(log_id, start_lsn, end_lsn);
+        let (registry_id, shared_state) = bifrost_inner
+            .read_stream_registry
+            .register(introspection_state);
+
         Ok(Self {
             bifrost_inner,
             log_id,
@@ -178,6 +194,8 @@ impl LogReadStream {
             log_metadata,
             substream: None,
             state: State::New,
+            registry_id,
+            shared_state,
         })
     }
 
@@ -199,7 +217,7 @@ impl LogReadStream {
         // skips over the boundary of the gap.
         record
             .trim_gap_to_sequence_number()
-            .unwrap_or(record.sequence_number())
+            .unwrap_or_else(|| record.sequence_number())
             .next()
     }
 
@@ -216,6 +234,16 @@ impl LogReadStream {
 impl FusedStream for LogReadStream {
     fn is_terminated(&self) -> bool {
         matches!(self.state, State::Terminated)
+    }
+}
+
+#[pin_project::pinned_drop]
+impl PinnedDrop for LogReadStream {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        this.bifrost_inner
+            .read_stream_registry
+            .unregister(*this.registry_id);
     }
 }
 
@@ -237,10 +265,14 @@ impl Stream for LogReadStream {
 
         let mut this = self.as_mut().project();
         loop {
+            // Update introspection state before processing.
+            update_shared_state(&this);
+
             let state = this.state.as_mut().project();
             // We have reached the end of the stream.
             if *this.read_pointer == Lsn::MAX || *this.read_pointer > *this.end_lsn {
                 this.state.set(State::Terminated);
+                update_shared_state(&this);
                 return Poll::Ready(None);
             }
 
@@ -249,6 +281,7 @@ impl Stream for LogReadStream {
             let Some(chain) = logs.chain(this.log_id) else {
                 this.substream.set(None);
                 this.state.set(State::Terminated);
+                update_shared_state(&this);
                 return Poll::Ready(Some(Err(Error::UnknownLogId(*this.log_id))));
             };
 
@@ -281,10 +314,12 @@ impl Stream for LogReadStream {
                         Ok(MaybeLoglet::Trim { next_base_lsn }) => {
                             // deliver trim gap and advance read pointer.
                             let record = deliver_trim_gap(&mut this, next_base_lsn, bifrost_inner);
+                            update_shared_state(&this);
                             return Poll::Ready(Some(Ok(record)));
                         }
                         Err(e) => {
                             this.state.set(State::Terminated);
+                            update_shared_state(&this);
                             return Poll::Ready(Some(Err(e)));
                         }
                     };
@@ -303,6 +338,7 @@ impl Stream for LogReadStream {
                         Ok(substream) => substream,
                         Err(e) => {
                             this.state.set(State::Terminated);
+                            update_shared_state(&this);
                             return Poll::Ready(Some(Err(e.into())));
                         }
                     };
@@ -323,6 +359,7 @@ impl Stream for LogReadStream {
                     this.state.set(State::Reading {
                         safe_known_tail,
                         tail_watch,
+                        trim_checked_version: Version::INVALID,
                     });
                 }
 
@@ -330,6 +367,7 @@ impl Stream for LogReadStream {
                 StateProj::Reading {
                     safe_known_tail,
                     tail_watch,
+                    trim_checked_version,
                 } => {
                     // Continue driving the substream
                     //
@@ -338,6 +376,23 @@ impl Stream for LogReadStream {
                     let Some(substream) = this.substream.as_mut().as_pin_mut() else {
                         panic!("substream must be set at this point");
                     };
+
+                    // A prefix-trim may have dropped the segment under our read_pointer from
+                    // the chain while we were parked here; a substream on a sealed tail won't
+                    // surface that, so we consult the chain directly, as the other stalled
+                    // states do via `check_chain`.
+                    if *trim_checked_version != logs.version() {
+                        match chain.find_segment_for_lsn(*this.read_pointer) {
+                            MaybeSegment::Trim { next_base_lsn } => {
+                                let gap = deliver_trim_gap(&mut this, next_base_lsn, bifrost_inner);
+                                update_shared_state(&this);
+                                return Poll::Ready(Some(Ok(gap)));
+                            }
+                            MaybeSegment::Some(_) => {
+                                *trim_checked_version = logs.version();
+                            }
+                        }
+                    }
 
                     // If the loglet's `tail_lsn` is known, this is the tail we should always respect.
                     match substream.tail_lsn() {
@@ -400,6 +455,7 @@ impl Stream for LogReadStream {
                                         // Shutdown....
                                         this.substream.set(None);
                                         this.state.set(State::Terminated);
+                                        update_shared_state(&this);
                                         return Poll::Ready(Some(Err(ShutdownError.into())));
                                     }
                                     Poll::Ready(Some(TailState::Open(tail))) => {
@@ -453,15 +509,20 @@ impl Stream for LogReadStream {
                                 continue;
                             }
 
+                            update_shared_state(&this);
                             return Poll::Ready(Some(Ok(record)));
                         }
                         // The assumption here is that underlying stream won't move its read
                         // pointer on error.
-                        Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e.into()))),
+                        Poll::Ready(Some(Err(e))) => {
+                            update_shared_state(&this);
+                            return Poll::Ready(Some(Err(e.into())));
+                        }
                         Poll::Ready(None) => {
                             // We should, almost never, reach this.
                             this.substream.set(None);
                             this.state.set(State::Terminated);
+                            update_shared_state(&this);
                             return Poll::Ready(None);
                         }
                     }
@@ -496,11 +557,9 @@ impl Stream for LogReadStream {
                         }
                         Decision::Trim { next_base_lsn } => {
                             // Deliver the trim gap
-                            return Poll::Ready(Some(Ok(deliver_trim_gap(
-                                &mut this,
-                                next_base_lsn,
-                                bifrost_inner,
-                            ))));
+                            let gap = deliver_trim_gap(&mut this, next_base_lsn, bifrost_inner);
+                            update_shared_state(&this);
+                            return Poll::Ready(Some(Ok(gap)));
                         }
                         Decision::NoChange => {
                             // Reconfiguration still ongoing, keep waiting.
@@ -545,11 +604,9 @@ impl Stream for LogReadStream {
                         }
                         Decision::Trim { next_base_lsn } => {
                             // Deliver the trim gap
-                            return Poll::Ready(Some(Ok(deliver_trim_gap(
-                                &mut this,
-                                next_base_lsn,
-                                bifrost_inner,
-                            ))));
+                            let gap = deliver_trim_gap(&mut this, next_base_lsn, bifrost_inner);
+                            update_shared_state(&this);
+                            return Poll::Ready(Some(Ok(gap)));
                         }
 
                         Decision::NoChange => {}
@@ -596,13 +653,13 @@ impl Stream for LogReadStream {
     }
 }
 
-// NOTE: This function assumes that chain sealing is supported/enabled.
 async fn seal_chain(bifrost: &BifrostInner, log_id: LogId, segment_index: SegmentIndex) {
     match BifrostAdmin::new(bifrost)
         .seal(
             log_id,
             segment_index,
             SealMetadata::new("read-stream", my_node_id()),
+            None,
         )
         .await
     {
@@ -672,6 +729,45 @@ fn deliver_trim_gap(
     record
 }
 
+fn state_name(state: &State) -> &'static str {
+    match state {
+        State::New => "New",
+        State::FindingLoglet { .. } => "FindingLoglet",
+        State::CreatingSubstream { .. } => "CreatingSubstream",
+        State::Reading { .. } => "Reading",
+        State::AwaitingReconfiguration => "AwaitingReconfiguration",
+        State::AwaitingOrSealChain { .. } => "AwaitingOrSealChain",
+        State::SealingChain { .. } => "SealingChain",
+        State::Terminated => "Terminated",
+    }
+}
+
+fn update_shared_state(this: &ReadStreamProj) {
+    let current_loglet = this
+        .substream
+        .as_ref()
+        .as_pin_ref()
+        .map(|s| (s.loglet().loglet_id(), s.loglet().segment_index()));
+
+    let safe_tail = match &*this.state {
+        State::Reading {
+            safe_known_tail, ..
+        } => *safe_known_tail,
+        _ => None,
+    };
+    let mut shared = this.shared_state.lock();
+    shared.read_pointer = *this.read_pointer;
+    shared.state = state_name(&this.state);
+    shared.safe_known_tail = safe_tail;
+    if let Some((loglet_id, segment)) = current_loglet {
+        shared.current_segment = Some(segment);
+        shared.loglet_id = loglet_id;
+    } else {
+        shared.current_segment = None;
+        shared.loglet_id = None;
+    }
+}
+
 #[cfg(all(test, feature = "local-loglet"))]
 mod tests {
     use super::*;
@@ -697,7 +793,7 @@ mod tests {
 
     #[restate_core::test(flavor = "multi_thread", worker_threads = 2)]
     #[traced_test]
-    async fn test_readstream_one_loglet() -> anyhow::Result<()> {
+    async fn readstream_one_loglet() -> anyhow::Result<()> {
         const LOG_ID: LogId = LogId::new(0);
 
         let env = TestCoreEnvBuilder::with_incoming_only_connector()
@@ -779,7 +875,7 @@ mod tests {
 
     #[restate_core::test(flavor = "multi_thread", worker_threads = 2)]
     #[traced_test]
-    async fn test_read_stream_with_trim() -> anyhow::Result<()> {
+    async fn read_stream_with_trim() -> anyhow::Result<()> {
         const LOG_ID: LogId = LogId::new(0);
 
         let node_env = TestCoreEnvBuilder::with_incoming_only_connector()
@@ -876,7 +972,7 @@ mod tests {
 
     // Note: This test doesn't validate read stream behaviour with zombie records at seal boundary.
     #[restate_core::test(start_paused = true)]
-    async fn test_readstream_simple_multi_loglet() -> anyhow::Result<()> {
+    async fn readstream_simple_multi_loglet() -> anyhow::Result<()> {
         const LOG_ID: LogId = LogId::new(0);
 
         let node_env = TestCoreEnvBuilder::with_incoming_only_connector()
@@ -1037,7 +1133,7 @@ mod tests {
     }
 
     #[restate_core::test(start_paused = true)]
-    async fn test_readstream_sealed_multi_loglet() -> anyhow::Result<()> {
+    async fn readstream_sealed_multi_loglet() -> anyhow::Result<()> {
         const LOG_ID: LogId = LogId::new(0);
 
         let node_env = TestCoreEnvBuilder::with_incoming_only_connector()
@@ -1157,7 +1253,7 @@ mod tests {
     }
 
     #[restate_core::test(start_paused = true)]
-    async fn test_readstream_chain_sealing() -> anyhow::Result<()> {
+    async fn readstream_chain_sealing() -> anyhow::Result<()> {
         const LOG_ID: LogId = LogId::new(0);
 
         let node_env = TestCoreEnvBuilder::with_incoming_only_connector()
@@ -1288,7 +1384,7 @@ mod tests {
     }
 
     #[restate_core::test(start_paused = true)]
-    async fn test_readstream_prefix_trimmed() -> anyhow::Result<()> {
+    async fn readstream_prefix_trimmed() -> anyhow::Result<()> {
         const LOG_ID: LogId = LogId::new(0);
 
         let node_env = TestCoreEnvBuilder::with_incoming_only_connector()
@@ -1358,6 +1454,80 @@ mod tests {
                 eq(format!("record-{i}"))
             );
         }
+
+        Ok(())
+    }
+
+    #[restate_core::test(start_paused = true)]
+    async fn readstream_reading_state_observes_chain_trim() -> anyhow::Result<()> {
+        const LOG_ID: LogId = LogId::new(0);
+
+        let node_env = TestCoreEnvBuilder::with_incoming_only_connector()
+            .set_provider_kind(ProviderKind::Local)
+            .build()
+            .await;
+        let config = Constant::new(LocalLogletOptions::default()).boxed();
+        RocksDbManager::init();
+        let svc = BifrostService::new(node_env.metadata_writer.clone())
+            .enable_local_loglet(config)
+            .enable_in_memory_loglet();
+        let bifrost = svc.handle();
+        svc.start().await.expect("loglet must start");
+
+        let mut appender = bifrost.create_appender(LOG_ID, ErrorRecoveryStrategy::Wait)?;
+        for i in 1..=10 {
+            let lsn = appender.append(format!("record-{i}")).await?;
+            assert_eq!(Lsn::from(i), lsn);
+        }
+
+        let new_segment_params = new_single_node_loglet_params(ProviderKind::InMemory);
+        bifrost
+            .admin()
+            .seal_and_extend_chain(
+                LOG_ID,
+                None,
+                Version::MIN,
+                ProviderKind::InMemory,
+                new_segment_params,
+            )
+            .await?;
+
+        let mut reader = bifrost.create_reader(LOG_ID, KeyFilter::Any, Lsn::OLDEST, Lsn::MAX)?;
+        for i in 1..=5 {
+            let record = reader.next().await.expect("to stay alive")?;
+            assert_that!(record.sequence_number(), eq(Lsn::new(i)));
+        }
+        assert_eq!(Lsn::from(6), reader.read_pointer());
+
+        // Trim only the chain (not the loglet) so records 6..=10 remain physically
+        // present in the substream. This isolates the Reading-state bug: the substream
+        // still has a known sealed tail > read_pointer, so it never re-checks the chain
+        // for a trim before polling for the next record.
+        let metadata = Metadata::current();
+        let old_version = metadata.logs_version();
+        let mut builder = metadata
+            .logs_ref()
+            .clone()
+            .try_into_builder()
+            .expect("can create builder");
+        let mut chain_builder = builder.chain(LOG_ID).unwrap();
+        chain_builder.trim_prefix(Lsn::new(11));
+        let new_metadata = builder.build();
+        let new_version = new_metadata.version();
+        assert_eq!(new_version, old_version.next());
+        node_env
+            .metadata_writer
+            .global_metadata()
+            .put(
+                new_metadata.into(),
+                Precondition::MatchesVersion(old_version),
+            )
+            .await?;
+
+        let record = reader.next().await.expect("reader must not hang")?;
+        assert_that!(record.sequence_number(), eq(Lsn::new(6)));
+        assert_that!(record.trim_gap_to_sequence_number(), eq(Some(Lsn::new(10))));
+        assert_eq!(Lsn::from(11), reader.read_pointer());
 
         Ok(())
     }
