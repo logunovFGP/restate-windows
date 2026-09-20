@@ -1,0 +1,108 @@
+name: Windows build
+
+# Windows support is fork-only: upstream ships apple-darwin and linux-musl binaries and
+# declined PR #4203. This workflow is deliberately SEPARATE from ci.yml and release.yml so
+# it can never affect the Unix build. Do not fold it into those.
+#
+# Kafka is excluded on purpose: rdkafka -> sasl2-sys -> krb5-src needs Unix build tools, so
+# `kafka-oidc` (a default feature of restate-server) must be off. `-p restate-server` is
+# mandatory because `crates/*` is in workspace default-members, so a bare `cargo build`
+# would compile restate-ingress-kafka regardless of features.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - windows-support
+
+jobs:
+  # Guards the "must not break the Unix build" constraint. ci.yml is off-limits, and the
+  # Windows job below cannot check Unix, so the assertion lives here. Runs on ubuntu and
+  # needs no MSVC: `cargo tree --target` filters the resolved graph by target cfg, so both
+  # directions are verifiable from one Linux runner in seconds.
+  dep-guard:
+    name: Dependency guard (jemalloc gating)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache: false
+
+      - name: jemalloc MUST still reach rocksdb on Unix
+        # Root Cargo.toml deliberately omits the `jemalloc` feature; crates/rocksdb re-adds
+        # it under cfg(not(target_env = "msvc")). If that gate ever stops working, Unix
+        # silently loses jemalloc — this is the check that catches it.
+        run: cargo tree -p restate-rocksdb -i tikv-jemalloc-sys
+
+      - name: jemalloc MUST NOT reach rocksdb on windows-msvc
+        # The inverse assertion. jemalloc has no MSVC support; if someone re-adds it to the
+        # workspace dependency, cargo unions the feature back in and Windows breaks again.
+        run: |
+          if cargo tree --target x86_64-pc-windows-msvc -p restate-rocksdb -i tikv-jemalloc-sys >/dev/null 2>&1; then
+            echo "::error file=Cargo.toml::tikv-jemalloc-sys is reachable on x86_64-pc-windows-msvc — the cfg(not(target_env = \"msvc\")) gate has regressed. Check the rocksdb features in the workspace [workspace.dependencies]."
+            exit 1
+          fi
+          echo "OK: jemalloc is absent from the windows-msvc graph"
+
+  build-windows:
+    name: Build restate-server (windows-latest)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    env:
+      RUST_BACKTRACE: full
+      # Release on pushes to the maintained branch and on manual runs (this is the binary
+      # bundled with cline-2); debug on PRs for faster regression signal.
+      CARGO_PROFILE: ${{ (github.event_name == 'pull_request') && 'debug' || 'release' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Reads rust-toolchain.toml (1.92.0 on this branch).
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache: false
+
+      - name: Setup Rust caching
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Install protoc
+        # NOT ./.github/actions/install-protoc — that composite action exits 1 on Windows
+        # ("$RUNNER_OS not supported"). Leaving it untouched keeps Linux/macOS exactly as is.
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "21.12"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build restate-server
+        run: |
+          $flags = @('-p','restate-server','--no-default-features','-F','no-trace-logging')
+          if ($env:CARGO_PROFILE -eq 'release') { $flags += '--release' }
+          cargo build @flags
+
+      - name: Verify the binary runs
+        run: |
+          $exe = "target/$env:CARGO_PROFILE/restate-server.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          & $exe --version
+
+      - name: Upload restate-server.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: restate-server-windows-x86_64-${{ env.CARGO_PROFILE }}
+          path: target/${{ env.CARGO_PROFILE }}/restate-server.exe
+          if-no-files-found: error
