@@ -14,7 +14,9 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      # NOT `main`: that branch is a pristine mirror of upstream restatedev/restate,
+      # which carries no Windows port (PR #4203 was rejected). Building it here could
+      # only ever be red, on a branch this fork does not author.
       - windows-support
 
 jobs:

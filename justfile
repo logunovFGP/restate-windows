@@ -87,12 +87,14 @@ _os_target := if _os == "macos" {
         "apple-darwin"
     } else if _os == "linux" {
         "unknown-linux"
+    } else if _os == "windows" {
+        "pc-windows"
     } else {
         error("unsupported os=" + _os)
     }
 
 _default_target := `rustc -vV | sed -n 's|host: ||p'`
-target := _arch + "-" + _os_target + if _os == "linux" { "-" + libc } else { "" }
+target := _arch + "-" + _os_target + if _os == "linux" { "-" + libc } else if _os == "windows" { "-msvc" } else { "" }
 _resolved_target := if target != _default_target { target } else { "" }
 _target-option := if _resolved_target != "" { "--target " + _resolved_target } else { "" }
 
@@ -166,6 +168,40 @@ doctest:
 
 # Runs lints and tests
 verify: lint test doctest
+
+# Windows gate. Run this from Git Bash, not PowerShell: just needs a POSIX shell on
+# PATH for its backticks, as the rest of this justfile already assumes (sed, rm -rf,
+# bash shebangs).
+# `just verify` cannot be used here: `lint` and `test` span the whole
+# workspace, which pulls in restate-ingress-kafka (rdkafka -> krb5-src) and does not
+# build on Windows. This is the scoped equivalent over the restate-server graph.
+windows-verify: windows-dep-guard
+    cargo fmt --all -- --check
+    cargo clippy -p restate-server --no-default-features -F no-trace-logging --all-targets -- -D warnings
+    cargo nextest run -p restate-server --no-default-features -F no-trace-logging
+    cargo hakari generate --diff
+    cargo hakari manage-deps --dry-run
+
+# Asserts the jemalloc gating holds in both directions. Mirrors the dep-guard job in
+# .github/workflows/windows.yml so a regression is caught before push, not after.
+# `cargo tree -i` exits 0 even when nothing matches, so both checks test output.
+windows-dep-guard:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    unix_out=$(cargo tree --target x86_64-unknown-linux-gnu -p restate-rocksdb -i tikv-jemalloc-sys 2>/dev/null || true)
+    win_out=$(cargo tree --target x86_64-pc-windows-msvc -p restate-rocksdb -i tikv-jemalloc-sys 2>/dev/null || true)
+    rc=0
+    if echo "$unix_out" | grep -q '^tikv-jemalloc-sys'; then
+        echo "OK: jemalloc reaches rocksdb on x86_64-unknown-linux-gnu"
+    else
+        echo "FAIL: jemalloc no longer reaches rocksdb on Unix"; rc=1
+    fi
+    if echo "$win_out" | grep -q '^tikv-jemalloc-sys'; then
+        echo "FAIL: jemalloc is reachable on x86_64-pc-windows-msvc"; rc=1
+    else
+        echo "OK: jemalloc is absent from the x86_64-pc-windows-msvc graph"
+    fi
+    exit $rc
 
 docker:
     # podman builds do not work without --platform set, even though it claims to default to host arch

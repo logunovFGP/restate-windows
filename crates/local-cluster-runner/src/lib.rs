@@ -52,10 +52,14 @@ pub fn shutdown() -> impl Future<Output = &'static str> {
 
 #[cfg(windows)]
 pub fn shutdown() -> impl Future<Output = &'static str> {
+    // Registered eagerly, like the Unix arm above: main.rs calls this before
+    // `cluster.start()` specifically to start capturing signals, so a Ctrl+C arriving
+    // during startup must not be missed. `tokio::signal::ctrl_c()` would only register
+    // on first poll.
+    let mut ctrl_c = tokio::signal::windows::ctrl_c().expect("failed to register ctrl-c handler");
+
     async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to listen for ctrl-c");
+        ctrl_c.recv().await;
         info!("Received CTRL_C, starting cluster shutdown.");
         "CTRL_C"
     }
