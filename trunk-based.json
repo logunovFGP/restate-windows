@@ -1,0 +1,27 @@
+{
+  "skill_version": 3,
+  "trunk": "windows-support",
+  "release_strategy": "trunk",
+  "leaf_prefix": "leaf",
+  "leaf_max_hours": 24,
+  "max_active_leaves": 3,
+  "verify_command": "just verify",
+  "allow_direct_trunk_commits": false,
+  "merge_style": "merge",
+  "review": "self-on-green",
+  "feature_flags": {
+    "mechanism": "crates/types/src/config/common.rs",
+    "how": "add an `experimental_<name>: bool` field to CommonOptions, default it to false in the Default impl, and gate the new path on it. Existing examples: experimental_enable_vqueues, experimental_kafka_batch_ingestion, experimental_shuffler_batch_ingestion.",
+    "delete_when": "the new path is permanent -- drop the field and the branch together"
+  },
+  "foreign_branches": {
+    "main": "pristine mirror of upstream restatedev/restate. Only ever fast-forwarded from `upstream`. Never commit to it, never open a leaf from it, never push it to origin as if it were ours."
+  },
+  "notes": {
+    "fork": "origin = git@github.com:logunovFGP/restate-windows (SSH, personal key). upstream = https://github.com/restatedev/restate.git (read-only; fetch main from here).",
+    "ci": "ci.yml does NOT run on push to windows-support -- it triggers on pull_request, workflow_dispatch, and push to main/release-*. A push to trunk therefore triggers nothing on this fork; the local verify_command is the only gate. Open a PR to get CI.",
+    "verify_cost": "`just verify` = check-fmt + clippy + check-deny + nextest + doctest over the whole workspace. The pre-push hook re-runs it on every push to trunk. If that is too slow to live with, narrow this field rather than reaching for --no-verify.",
+    "line_endings": "governed by .gitattributes + .editorconfig; see the `chore: declare line endings` commit. Never mix a renormalize with a logic change.",
+    "verify_prerequisites": "NOT SATISFIED as of setup. Rust is installed (rustup shims in ~/.cargo/bin) but ~/.cargo/bin is on no PATH -- neither the Windows PATH nor git-bash's -- and just, cargo-nextest and cargo-deny are not installed at all. Until that is fixed the pre-push hook fails on every push to trunk with 'just: command not found'. Fix it, do not reach for --no-verify: put ~/.cargo/bin on PATH, then 'cargo install just cargo-nextest cargo-deny cargo-hakari'."
+  }
+}
