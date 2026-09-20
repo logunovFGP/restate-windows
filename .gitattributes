@@ -1,0 +1,49 @@
+# Line endings and per-path behaviour for THIS REPOSITORY.
+# A committed contract -- not core.autocrlf, which is per-machine and unenforceable.
+# Verify with:  git ls-files --eol
+# After editing this file:  git add --renormalize . && git status && commit ALONE.
+#
+# ONE LINE PER EXTENSION. `*.{cmd,bat}` matches NOTHING here -- brace expansion is
+# not supported in .gitattributes, though it IS required in .editorconfig.
+# Keep the two files in sync.
+
+# ---- baseline: LF in the index AND in the working tree, on every platform.
+# `eol=lf` is deliberate and is NOT redundant with text=auto. Without it the
+# working-tree ending falls to each machine's core.eol, which defaults to
+# `native` -- CRLF on Windows -- so a checkout here would disagree with the
+# `end_of_line = lf` this repo's .editorconfig promises, and the editor and Git
+# would quietly fight over every file. Declaring it here makes the contract
+# committed and reviewable instead of per-machine, and gives a Windows checkout
+# bytes identical to Linux, WSL and the container images. Windows-only paths
+# opt back out in the eol=crlf block below.
+*                   text=auto eol=lf
+
+# ---- run by a POSIX interpreter: LF on EVERY platform, incl. Windows checkouts.
+# These are COPY'd into containers; a CRLF shebang is `bad interpreter: /bin/sh^M`.
+*.sh                text eol=lf
+*.bash              text eol=lf
+Dockerfile          text eol=lf
+Dockerfile.*        text eol=lf
+*.dockerfile        text eol=lf
+entrypoint*         text eol=lf
+justfile            text eol=lf
+tools/scripts/check-license-headers text eol=lf
+
+# ---- Windows-only: CRLF in the working tree on EVERY platform, incl. Linux CI.
+# cmd.exe genuinely mis-executes LF-only batch files; PowerShell signatures cover
+# exact bytes. No such file is tracked yet -- these are for the Windows port.
+*.bat               text eol=crlf
+*.cmd               text eol=crlf
+*.ps1               text eol=crlf
+*.psm1              text eol=crlf
+*.psd1              text eol=crlf
+*.sln               text eol=crlf
+
+# ---- diff quality: hunk headers that name the enclosing item.
+# Only Git's built-in driver names work; an unknown one is silently ignored.
+*.rs                diff=rust
+*.md                diff=markdown
+*.sh                diff=bash
+
+# ---- generated: keep the lockfiles out of review and out of language stats
+*.lock              -diff linguist-generated=true
