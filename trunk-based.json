@@ -5,7 +5,7 @@
   "leaf_prefix": "leaf",
   "leaf_max_hours": 24,
   "max_active_leaves": 3,
-  "verify_command": "just verify",
+  "verify_command": "just verify-platform",
   "allow_direct_trunk_commits": false,
   "merge_style": "merge",
   "review": "self-on-green",
@@ -20,8 +20,8 @@
   "notes": {
     "fork": "origin = git@github.com:logunovFGP/restate-windows (SSH, personal key). upstream = https://github.com/restatedev/restate.git (read-only; fetch main from here).",
     "ci": "ci.yml does NOT run on push to windows-support -- it triggers on pull_request, workflow_dispatch, and push to main/release-*. A push to trunk therefore triggers nothing on this fork; the local verify_command is the only gate. Open a PR to get CI.",
-    "verify_cost": "`just verify` = check-fmt + clippy + check-deny + nextest + doctest over the whole workspace. The pre-push hook re-runs it on every push to trunk. If that is too slow to live with, narrow this field rather than reaching for --no-verify.",
+    "verify_cost": "`just verify` = check-fmt + clippy + check-deny + nextest + doctest over the whole workspace. That cannot run on Windows: it pulls in restate-ingress-kafka (rdkafka -> krb5-src). verify_command therefore points at `just verify-platform`, which dispatches to `just windows-verify` (fmt + scoped clippy + scoped nextest + both hakari gates + the jemalloc dependency guard) on Windows and to `just verify` elsewhere. Narrow this field further if needed; never reach for --no-verify.",
     "line_endings": "governed by .gitattributes + .editorconfig; see the `chore: declare line endings` commit. Never mix a renormalize with a logic change.",
-    "verify_prerequisites": "NOT SATISFIED as of setup. Rust is installed (rustup shims in ~/.cargo/bin) but ~/.cargo/bin is on no PATH -- neither the Windows PATH nor git-bash's -- and just, cargo-nextest and cargo-deny are not installed at all. Until that is fixed the pre-push hook fails on every push to trunk with 'just: command not found'. Fix it, do not reach for --no-verify: put ~/.cargo/bin on PATH, then 'cargo install just cargo-nextest cargo-deny cargo-hakari'."
+    "verify_prerequisites": "SATISFIED on this workstation as of 2026-09-20: rustup 1.92.0 + MSVC Build Tools 2022, protoc (Google.Protobuf) and LLVM/libclang installed, and just, cargo-nextest, cargo-deny and cargo-hakari all present. Build scripts need PROTOC and LIBCLANG_PATH exported when cargo is invoked outside a shell that has them on PATH."
   }
 }

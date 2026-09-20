@@ -169,6 +169,12 @@ doctest:
 # Runs lints and tests
 verify: lint test doctest
 
+# `verify` cannot run on Windows: `lint` and `test` span the whole workspace, which pulls
+# in restate-ingress-kafka (rdkafka -> krb5-src) and does not build there.
+# Runs the verify appropriate to this platform; used by the pre-push hook
+verify-platform:
+    just {{ if os() == "windows" { "windows-verify" } else { "verify" } }}
+
 # Windows gate. Run this from Git Bash, not PowerShell: just needs a POSIX shell on
 # PATH for its backticks, as the rest of this justfile already assumes (sed, rm -rf,
 # bash shebangs).
