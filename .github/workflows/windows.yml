@@ -67,8 +67,12 @@ jobs:
           exit $rc
 
   build-windows:
-    name: Build restate-server (windows-latest)
-    runs-on: windows-latest
+    # Pinned, not `windows-latest`: that image now ships Visual Studio 18 (MSVC 14.51),
+    # which the `cmake` 0.1.54 crate cannot map to a generator, so aws-lc-sys dies with
+    # "couldn't determine visual studio generator". windows-2022 carries VS 2022, which
+    # matches the toolchain this port was verified against locally.
+    name: Build restate-server (windows-2022)
+    runs-on: windows-2022
     permissions:
       contents: read
     timeout-minutes: 90
