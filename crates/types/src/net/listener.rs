@@ -583,7 +583,10 @@ impl<P: ListenerPort> Listeners<P> {
                 .as_mut()
                 .expect("No TCP listener configured");
             let (tcp_stream, tcp_addr) = tcp.accept().await?;
-            Ok((AcceptedStream::Tcp(tcp_stream), SocketAddress::Socket(tcp_addr)))
+            Ok((
+                AcceptedStream::Tcp(tcp_stream),
+                SocketAddress::Socket(tcp_addr),
+            ))
         }
     }
 }

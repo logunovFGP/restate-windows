@@ -28,7 +28,7 @@ use super::{CommonOptions, KafkaClusterOptions, ListenerOptions};
 #[builder(default)]
 pub struct IngressOptions {
     #[serde(flatten)]
-    ingress_listener_options: ListenerOptions<HttpIngressPort>,
+    pub(super) ingress_listener_options: ListenerOptions<HttpIngressPort>,
 
     /// # Concurrency limit
     ///

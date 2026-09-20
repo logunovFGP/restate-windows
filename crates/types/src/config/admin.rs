@@ -32,7 +32,7 @@ use crate::net::listener::AddressBook;
 pub struct AdminOptions {
     /// Address to bind for the Admin APIs.
     #[serde(flatten)]
-    admin_listener_options: ListenerOptions<AdminPort>,
+    pub(super) admin_listener_options: ListenerOptions<AdminPort>,
 
     /// # Advertised Admin endpoint
     ///

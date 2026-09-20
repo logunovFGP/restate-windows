@@ -1,0 +1,125 @@
+name: Windows build
+
+# Windows support is fork-only: upstream ships apple-darwin and linux-musl binaries and
+# declined PR #4203. This workflow is deliberately SEPARATE from ci.yml and release.yml so
+# it can never affect the Unix build. Do not fold it into those.
+#
+# Kafka is excluded on purpose: rdkafka -> sasl2-sys -> krb5-src needs Unix build tools, so
+# `kafka-oidc` (a default feature of restate-server) must be off. `-p restate-server` is
+# mandatory because `crates/*` is in workspace default-members, so a bare `cargo build`
+# would compile restate-ingress-kafka regardless of features.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      # NOT `main`: that branch is a pristine mirror of upstream restatedev/restate,
+      # which carries no Windows port (PR #4203 was rejected). Building it here could
+      # only ever be red, on a branch this fork does not author.
+      - windows-support
+
+jobs:
+  # Guards the "must not break the Unix build" constraint. ci.yml is off-limits, and the
+  # Windows job below cannot check Unix, so the assertion lives here. Runs on ubuntu and
+  # needs no MSVC: `cargo tree --target` filters the resolved graph by target cfg, so both
+  # directions are verifiable from one Linux runner in seconds.
+  dep-guard:
+    name: Dependency guard (jemalloc gating)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache: false
+
+      - name: Assert jemalloc gating (both directions)
+        # `cargo tree -i` exits 0 even when nothing matches -- it only warns "nothing to
+        # print" on stderr. So both assertions test OUTPUT, never the exit code. Verified
+        # locally: linux-gnu yields the tree, windows-msvc yields zero bytes on stdout.
+        run: |
+          set -uo pipefail
+
+          unix_out=$(cargo tree --target x86_64-unknown-linux-gnu -p restate-rocksdb -i tikv-jemalloc-sys 2>/dev/null || true)
+          win_out=$(cargo tree --target x86_64-pc-windows-msvc -p restate-rocksdb -i tikv-jemalloc-sys 2>/dev/null || true)
+          rc=0
+
+          if echo "$unix_out" | grep -q '^tikv-jemalloc-sys'; then
+            echo "OK: jemalloc reaches rocksdb on x86_64-unknown-linux-gnu"
+          else
+            echo "::error file=crates/rocksdb/Cargo.toml::jemalloc no longer reaches rocksdb on Unix. The cfg(not(target_env = \"msvc\")) block in crates/rocksdb/Cargo.toml is what re-enables it -- Unix builds have silently lost jemalloc."
+            rc=1
+          fi
+
+          if echo "$win_out" | grep -q '^tikv-jemalloc-sys'; then
+            echo "::error file=Cargo.toml::tikv-jemalloc-sys is reachable on x86_64-pc-windows-msvc. jemalloc has no MSVC support, and cargo unions features -- re-adding \"jemalloc\" to the workspace rocksdb dependency silently re-breaks the Windows build."
+            rc=1
+          else
+            echo "OK: jemalloc is absent from the x86_64-pc-windows-msvc graph"
+          fi
+
+          exit $rc
+
+  build-windows:
+    # Pinned, not `windows-latest`: that image now ships Visual Studio 18 (MSVC 14.51),
+    # which the `cmake` 0.1.54 crate cannot map to a generator, so aws-lc-sys dies with
+    # "couldn't determine visual studio generator". windows-2022 carries VS 2022, which
+    # matches the toolchain this port was verified against locally.
+    name: Build restate-server (windows-2022)
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    env:
+      RUST_BACKTRACE: full
+      # Release on pushes to the maintained branch and on manual runs (this is the binary
+      # bundled with cline-2); debug on PRs for faster regression signal.
+      CARGO_PROFILE: ${{ (github.event_name == 'pull_request') && 'debug' || 'release' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Reads rust-toolchain.toml (1.92.0 on this branch).
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache: false
+
+      - name: Setup Rust caching
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Install protoc
+        # NOT ./.github/actions/install-protoc — that composite action exits 1 on Windows
+        # ("$RUNNER_OS not supported"). Leaving it untouched keeps Linux/macOS exactly as is.
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "21.12"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build restate-server
+        run: |
+          $flags = @('-p','restate-server','--no-default-features','-F','no-trace-logging')
+          if ($env:CARGO_PROFILE -eq 'release') { $flags += '--release' }
+          cargo build @flags
+
+      - name: Verify the binary runs
+        run: |
+          $exe = "target/$env:CARGO_PROFILE/restate-server.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          & $exe --version
+
+      - name: Upload restate-server.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: restate-server-windows-x86_64-${{ env.CARGO_PROFILE }}
+          path: target/${{ env.CARGO_PROFILE }}/restate-server.exe
+          if-no-files-found: error

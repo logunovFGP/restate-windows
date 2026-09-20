@@ -15,11 +15,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+#[cfg(unix)]
+use http::Uri;
 use hyper::body::{Body, Incoming};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::graceful::GracefulShutdown;
-#[cfg(unix)]
-use http::Uri;
 use tokio::io;
 #[cfg(unix)]
 use tokio::net::UnixStream;

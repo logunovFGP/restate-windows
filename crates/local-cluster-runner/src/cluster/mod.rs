@@ -110,16 +110,13 @@ impl Cluster {
 
         // todo: Add support for cluster address book to acquire tcp listeners for all servers
         // prior to starting the nodes and keep a global registry of those file descriptors.
+        // Partially done: on platforms without unix domain sockets each NodeSpec pins its
+        // ports at construction, and `fabric_advertised_address` reads them back here.
 
         let metadata_server_addresses: Vec<_> = nodes
             .iter()
-            .filter_map(|node| {
-                node.has_role(Role::MetadataServer).then_some(
-                    AdvertisedAddress::with_node_base_dir(
-                        &base_dir.as_path().join(node.node_name()),
-                    ),
-                )
-            })
+            .filter(|node| node.has_role(Role::MetadataServer))
+            .map(|node| node.fabric_advertised_address(&base_dir.as_path().join(node.node_name())))
             .collect();
 
         for (i, mut node) in nodes.into_iter().enumerate() {
@@ -156,11 +153,10 @@ impl StartedCluster {
     pub fn collect_metadata_server_addresses(&self) -> Vec<AdvertisedAddress<FabricPort>> {
         self.nodes
             .iter()
-            .filter_map(|node| {
-                node.has_role(Role::MetadataServer).then_some(
-                    AdvertisedAddress::with_node_base_dir(&self.base_dir().join(node.node_name())),
-                )
-            })
+            // the started node already carries the address it actually advertises, which is
+            // a pinned TCP socket where unix domain sockets are unavailable
+            .filter(|node| node.has_role(Role::MetadataServer))
+            .map(|node| node.advertised_address().clone())
             .collect()
     }
 

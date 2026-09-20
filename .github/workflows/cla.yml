@@ -15,6 +15,12 @@ permissions:
 
 jobs:
   CLAAssistant:
+    # Only meaningful in the upstream repo. This action stores signatures in
+    # restatedev/cla-signatures via secrets.CLA_SIGNATURES_READ_WRITE, which no fork has,
+    # so on a fork it fails within seconds and can never pass. Guarding on the repository
+    # keeps upstream behaviour byte-identical -- a PR opened against restatedev/restate
+    # still runs the CLA gate, because there this condition is true.
+    if: github.repository == 'restatedev/restate'
     runs-on: ubuntu-latest
     steps:
       - name: "CLA Assistant"

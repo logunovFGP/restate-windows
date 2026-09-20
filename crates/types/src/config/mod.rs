@@ -52,6 +52,7 @@ pub use rocksdb::*;
 pub use worker::*;
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
@@ -64,6 +65,7 @@ use crate::PlainNodeId;
 use crate::errors::GenericError;
 use crate::live::Live;
 use crate::live::LiveLoadExt;
+use crate::net::address::{AdminPort, AdvertisedAddress, FabricPort, HttpIngressPort};
 use crate::nodes_config::Role;
 
 /// Overrides production profile
@@ -187,6 +189,13 @@ pub struct Configuration {
 
 impl Configuration {
     /// A default configuration that exclusively uses unix sockets.
+    ///
+    /// Test-only constructor. On platforms without unix domain sockets it falls back to
+    /// random TCP ports (see the `cfg(not(unix))` twin below): `ListenMode::Unix` binds
+    /// nothing there, and the fabric connector panics outright on a `PeerNetAddress::Uds`
+    /// (crates/core/src/network/net_util.rs). Tests that assert UDS behaviour specifically
+    /// are `#![cfg(unix)]`; the rest only need some working transport.
+    #[cfg(unix)]
     pub fn new_unix_sockets() -> Self {
         let mut config = Configuration::default();
         config.common.fabric_listener_options.listen_mode = Some(ListenMode::Unix);
@@ -199,6 +208,61 @@ impl Configuration {
         config.admin.set_derived_values(&config.common);
         config.ingress.set_derived_values(&config.common);
         config
+    }
+
+    /// Unix-socket configuration is unavailable on this platform; see the `cfg(unix)`
+    /// twin above. Random TCP ports give these tests a transport that actually works.
+    #[cfg(not(unix))]
+    pub fn new_unix_sockets() -> Self {
+        Self::new_random_ports()
+    }
+
+    /// The advertised addresses pinned by [`Self::pin_listeners_to_tcp`], if any.
+    ///
+    /// Each is `None` when nothing was pinned, in which case the caller falls back to
+    /// whatever it would normally infer.
+    #[allow(clippy::type_complexity)]
+    pub fn pinned_advertised_addresses(
+        &self,
+    ) -> (
+        Option<AdvertisedAddress<FabricPort>>,
+        Option<AdvertisedAddress<AdminPort>>,
+        Option<AdvertisedAddress<HttpIngressPort>>,
+    ) {
+        (
+            self.common
+                .fabric_listener_options
+                .configured_advertised_address()
+                .cloned(),
+            self.admin
+                .admin_listener_options
+                .configured_advertised_address()
+                .cloned(),
+            self.ingress
+                .ingress_listener_options
+                .configured_advertised_address()
+                .cloned(),
+        )
+    }
+
+    /// Pins every listener this node uses to explicit TCP sockets.
+    ///
+    /// Counterpart to [`ListenerOptions::pin_to_tcp`], for the local cluster runner on
+    /// platforms without unix domain sockets. `admin` and `ingress` are `None` when this
+    /// node does not carry that role.
+    pub fn pin_listeners_to_tcp(
+        &mut self,
+        fabric: SocketAddr,
+        admin: Option<SocketAddr>,
+        ingress: Option<SocketAddr>,
+    ) {
+        self.common.fabric_listener_options.pin_to_tcp(fabric);
+        if let Some(addr) = admin {
+            self.admin.admin_listener_options.pin_to_tcp(addr);
+        }
+        if let Some(addr) = ingress {
+            self.ingress.ingress_listener_options.pin_to_tcp(addr);
+        }
     }
 
     pub fn new_random_ports() -> Self {
