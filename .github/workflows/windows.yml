@@ -37,21 +37,32 @@ jobs:
           rustflags: ""
           cache: false
 
-      - name: jemalloc MUST still reach rocksdb on Unix
-        # Root Cargo.toml deliberately omits the `jemalloc` feature; crates/rocksdb re-adds
-        # it under cfg(not(target_env = "msvc")). If that gate ever stops working, Unix
-        # silently loses jemalloc — this is the check that catches it.
-        run: cargo tree -p restate-rocksdb -i tikv-jemalloc-sys
-
-      - name: jemalloc MUST NOT reach rocksdb on windows-msvc
-        # The inverse assertion. jemalloc has no MSVC support; if someone re-adds it to the
-        # workspace dependency, cargo unions the feature back in and Windows breaks again.
+      - name: Assert jemalloc gating (both directions)
+        # `cargo tree -i` exits 0 even when nothing matches -- it only warns "nothing to
+        # print" on stderr. So both assertions test OUTPUT, never the exit code. Verified
+        # locally: linux-gnu yields the tree, windows-msvc yields zero bytes on stdout.
         run: |
-          if cargo tree --target x86_64-pc-windows-msvc -p restate-rocksdb -i tikv-jemalloc-sys >/dev/null 2>&1; then
-            echo "::error file=Cargo.toml::tikv-jemalloc-sys is reachable on x86_64-pc-windows-msvc — the cfg(not(target_env = \"msvc\")) gate has regressed. Check the rocksdb features in the workspace [workspace.dependencies]."
-            exit 1
+          set -uo pipefail
+
+          unix_out=$(cargo tree --target x86_64-unknown-linux-gnu -p restate-rocksdb -i tikv-jemalloc-sys 2>/dev/null || true)
+          win_out=$(cargo tree --target x86_64-pc-windows-msvc -p restate-rocksdb -i tikv-jemalloc-sys 2>/dev/null || true)
+          rc=0
+
+          if echo "$unix_out" | grep -q '^tikv-jemalloc-sys'; then
+            echo "OK: jemalloc reaches rocksdb on x86_64-unknown-linux-gnu"
+          else
+            echo "::error file=crates/rocksdb/Cargo.toml::jemalloc no longer reaches rocksdb on Unix. The cfg(not(target_env = \"msvc\")) block in crates/rocksdb/Cargo.toml is what re-enables it -- Unix builds have silently lost jemalloc."
+            rc=1
           fi
-          echo "OK: jemalloc is absent from the windows-msvc graph"
+
+          if echo "$win_out" | grep -q '^tikv-jemalloc-sys'; then
+            echo "::error file=Cargo.toml::tikv-jemalloc-sys is reachable on x86_64-pc-windows-msvc. jemalloc has no MSVC support, and cargo unions features -- re-adding \"jemalloc\" to the workspace rocksdb dependency silently re-breaks the Windows build."
+            rc=1
+          else
+            echo "OK: jemalloc is absent from the x86_64-pc-windows-msvc graph"
+          fi
+
+          exit $rc
 
   build-windows:
     name: Build restate-server (windows-latest)
