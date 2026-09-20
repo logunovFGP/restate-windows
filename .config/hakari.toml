@@ -26,4 +26,9 @@ third-party = [
     # excluded for Windows compatibility - rdkafka requires OpenSSL which doesn't build easily on Windows
     { name = "rdkafka" },
     { name = "rdkafka-sys" },
+    # excluded for Windows compatibility - pprof is Unix-only (benchmarks/bifrost gate it
+    # behind [target.'cfg(unix)'], but every platform in `platforms` above is Unix, so
+    # hakari would otherwise hoist it into the unconditional [dependencies] section and
+    # drag it onto Windows. Excluding it keeps workspace-hack genuinely generated.
+    { name = "pprof" },
 ]
