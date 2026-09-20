@@ -65,6 +65,7 @@ use crate::PlainNodeId;
 use crate::errors::GenericError;
 use crate::live::Live;
 use crate::live::LiveLoadExt;
+use crate::net::address::{AdminPort, AdvertisedAddress, FabricPort, HttpIngressPort};
 use crate::nodes_config::Role;
 
 /// Overrides production profile
@@ -214,6 +215,34 @@ impl Configuration {
     #[cfg(not(unix))]
     pub fn new_unix_sockets() -> Self {
         Self::new_random_ports()
+    }
+
+    /// The advertised addresses pinned by [`Self::pin_listeners_to_tcp`], if any.
+    ///
+    /// Each is `None` when nothing was pinned, in which case the caller falls back to
+    /// whatever it would normally infer.
+    #[allow(clippy::type_complexity)]
+    pub fn pinned_advertised_addresses(
+        &self,
+    ) -> (
+        Option<AdvertisedAddress<FabricPort>>,
+        Option<AdvertisedAddress<AdminPort>>,
+        Option<AdvertisedAddress<HttpIngressPort>>,
+    ) {
+        (
+            self.common
+                .fabric_listener_options
+                .configured_advertised_address()
+                .cloned(),
+            self.admin
+                .admin_listener_options
+                .configured_advertised_address()
+                .cloned(),
+            self.ingress
+                .ingress_listener_options
+                .configured_advertised_address()
+                .cloned(),
+        )
     }
 
     /// Pins every listener this node uses to explicit TCP sockets.

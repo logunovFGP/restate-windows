@@ -122,24 +122,22 @@ pub enum NodeStartError {
     SpawnError(io::Error),
 }
 
-/// How the test harness addresses a node.
-///
-/// On Unix a node is reachable at a socket path under its base dir. Elsewhere there are no
-/// unix domain sockets, so the harness allocates a TCP port up front, pins it into the
-/// node's config, and addresses the node there instead.
-fn advertised_address_for<P: ListenerPort>(
-    node_base_dir: &Path,
-    pinned_tcp: Option<SocketAddr>,
-) -> AdvertisedAddress<P> {
-    match pinned_tcp {
-        None => AdvertisedAddress::with_node_base_dir(node_base_dir),
-        Some(addr) => format!("http://{addr}")
-            .parse()
-            .expect("a socket address forms a valid http uri"),
-    }
+/// Reserves a free TCP port for a test node, on platforms without unix domain sockets.
+#[cfg(not(unix))]
+fn alloc_test_port() -> SocketAddr {
+    crate::random_socket_address().expect("a free TCP port for the test node")
 }
 
 impl NodeSpec {
+    /// The address the harness uses to reach this node's fabric port.
+    ///
+    /// A TCP socket pinned at construction where unix domain sockets are unavailable,
+    /// otherwise the socket path under this node's base dir.
+    pub fn fabric_advertised_address(&self, node_base_dir: &Path) -> AdvertisedAddress<FabricPort> {
+        let (fabric, _, _) = self.base_config.pinned_advertised_addresses();
+        fabric.unwrap_or_else(|| AdvertisedAddress::with_node_base_dir(node_base_dir))
+    }
+
     pub fn node_name(&self) -> &str {
         self.base_config.node_name()
     }
@@ -163,6 +161,21 @@ impl NodeSpec {
         binary_source: BinarySource,
         roles: EnumSet<Role>,
     ) -> Self {
+        // Unix domain sockets are unavailable here, so the harness cannot address a node by
+        // socket path. Pin concrete TCP ports at construction -- not at start() -- because
+        // Cluster wires metadata-server addresses for every node before any of them starts.
+        // This is the miniature form of the address book the todo in cluster/mod.rs asks for.
+        #[cfg(not(unix))]
+        let base_config = {
+            let mut base_config = base_config;
+            base_config.pin_listeners_to_tcp(
+                alloc_test_port(),
+                roles.contains(Role::Admin).then(alloc_test_port),
+                roles.contains(Role::HttpIngress).then(alloc_test_port),
+            );
+            base_config
+        };
+
         Self::builder()
             .binary_source(binary_source)
             .base_config(base_config)
@@ -236,36 +249,7 @@ impl NodeSpec {
 
     /// Start this node with the current config. A subprocess will be created, and a tokio task
     /// spawned to process output logs and watch for exit.
-    // `mut` is only exercised off Unix, where the config is rewritten to pin TCP ports.
-    #[cfg_attr(unix, allow(unused_mut))]
-    pub async fn start(mut self) -> Result<StartedNode, NodeStartError> {
-        // Unix domain sockets are unavailable on this platform, so the harness cannot
-        // address a node by socket path. Allocate concrete ports and pin them into the
-        // config *before* it is dumped, so the node binds and advertises exactly these.
-        #[cfg(not(unix))]
-        let (fabric_tcp, admin_tcp, ingress_tcp) = {
-            let mut alloc = || crate::random_socket_address().map_err(NodeStartError::AllocatePort);
-            let fabric = alloc()?;
-            let admin = self
-                .base_config
-                .has_role(Role::Admin)
-                .then(&mut alloc)
-                .transpose()?;
-            let ingress = self
-                .base_config
-                .has_role(Role::HttpIngress)
-                .then(&mut alloc)
-                .transpose()?;
-            self.base_config.pin_listeners_to_tcp(fabric, admin, ingress);
-            (Some(fabric), admin, ingress)
-        };
-        #[cfg(unix)]
-        let (fabric_tcp, admin_tcp, ingress_tcp): (
-            Option<SocketAddr>,
-            Option<SocketAddr>,
-            Option<SocketAddr>,
-        ) = (None, None, None);
-
+    pub async fn start(self) -> Result<StartedNode, NodeStartError> {
         let Self {
             base_config,
             binary_source,
@@ -284,13 +268,16 @@ impl NodeSpec {
         .map_err(NodeStartError::Absolute)?;
 
         // set advertised addresses to make it easier to address this node from the test harness.
-        let fabric_advertised_address = advertised_address_for(&node_base_dir, fabric_tcp);
-        let ingress_advertised_address = base_config
-            .has_role(Role::HttpIngress)
-            .then(|| advertised_address_for(&node_base_dir, ingress_tcp));
-        let admin_advertised_address = base_config
-            .has_role(Role::Admin)
-            .then(|| advertised_address_for(&node_base_dir, admin_tcp));
+        let (pinned_fabric, pinned_admin, pinned_ingress) =
+            base_config.pinned_advertised_addresses();
+        let fabric_advertised_address =
+            pinned_fabric.unwrap_or_else(|| AdvertisedAddress::with_node_base_dir(&node_base_dir));
+        let ingress_advertised_address = base_config.has_role(Role::HttpIngress).then(|| {
+            pinned_ingress.unwrap_or_else(|| AdvertisedAddress::with_node_base_dir(&node_base_dir))
+        });
+        let admin_advertised_address = base_config.has_role(Role::Admin).then(|| {
+            pinned_admin.unwrap_or_else(|| AdvertisedAddress::with_node_base_dir(&node_base_dir))
+        });
 
         if !node_base_dir.exists() {
             std::fs::create_dir_all(&node_base_dir).map_err(NodeStartError::CreateDirectory)?;

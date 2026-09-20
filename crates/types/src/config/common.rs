@@ -163,6 +163,14 @@ impl<P: ListenerPort + 'static> ListenerOptions<P> {
         })
     }
 
+    /// The advertised address explicitly configured for this listener, if any.
+    ///
+    /// Unlike [`Self::advertised_address`] this never guesses, so a caller can tell a
+    /// pinned address apart from one that would be inferred at bind time.
+    pub fn configured_advertised_address(&self) -> Option<&AdvertisedAddress<P>> {
+        self.advertised_address.as_ref()
+    }
+
     /// Pins this listener to an explicit TCP socket, for both binding and advertising.
     ///
     /// The local cluster runner needs this on platforms without unix domain sockets. On
