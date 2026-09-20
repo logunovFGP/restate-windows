@@ -13,9 +13,10 @@ use std::{
     fmt::Display,
     future::Future,
     io::{self, ErrorKind},
+    net::SocketAddr,
     num::NonZeroU16,
     ops::{Deref, DerefMut},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     process::{ExitStatus, Stdio},
     sync::Arc,
@@ -103,6 +104,8 @@ pub struct NodeSpec {
 pub enum NodeStartError {
     #[error("Failed to absolutize node base path: {0}")]
     Absolute(io::Error),
+    #[error("Failed to allocate a TCP port for this node: {0}")]
+    AllocatePort(io::Error),
     #[error(transparent)]
     BinarySourceError(#[from] BinarySourceError),
     #[error("Failed to create node base directory: {0}")]
@@ -117,6 +120,23 @@ pub enum NodeStartError {
     DumpConfig(GenericError),
     #[error("Failed to spawn restate-server: {0}")]
     SpawnError(io::Error),
+}
+
+/// How the test harness addresses a node.
+///
+/// On Unix a node is reachable at a socket path under its base dir. Elsewhere there are no
+/// unix domain sockets, so the harness allocates a TCP port up front, pins it into the
+/// node's config, and addresses the node there instead.
+fn advertised_address_for<P: ListenerPort>(
+    node_base_dir: &Path,
+    pinned_tcp: Option<SocketAddr>,
+) -> AdvertisedAddress<P> {
+    match pinned_tcp {
+        None => AdvertisedAddress::with_node_base_dir(node_base_dir),
+        Some(addr) => format!("http://{addr}")
+            .parse()
+            .expect("a socket address forms a valid http uri"),
+    }
 }
 
 impl NodeSpec {
@@ -216,7 +236,36 @@ impl NodeSpec {
 
     /// Start this node with the current config. A subprocess will be created, and a tokio task
     /// spawned to process output logs and watch for exit.
-    pub async fn start(self) -> Result<StartedNode, NodeStartError> {
+    // `mut` is only exercised off Unix, where the config is rewritten to pin TCP ports.
+    #[cfg_attr(unix, allow(unused_mut))]
+    pub async fn start(mut self) -> Result<StartedNode, NodeStartError> {
+        // Unix domain sockets are unavailable on this platform, so the harness cannot
+        // address a node by socket path. Allocate concrete ports and pin them into the
+        // config *before* it is dumped, so the node binds and advertises exactly these.
+        #[cfg(not(unix))]
+        let (fabric_tcp, admin_tcp, ingress_tcp) = {
+            let mut alloc = || crate::random_socket_address().map_err(NodeStartError::AllocatePort);
+            let fabric = alloc()?;
+            let admin = self
+                .base_config
+                .has_role(Role::Admin)
+                .then(&mut alloc)
+                .transpose()?;
+            let ingress = self
+                .base_config
+                .has_role(Role::HttpIngress)
+                .then(&mut alloc)
+                .transpose()?;
+            self.base_config.pin_listeners_to_tcp(fabric, admin, ingress);
+            (Some(fabric), admin, ingress)
+        };
+        #[cfg(unix)]
+        let (fabric_tcp, admin_tcp, ingress_tcp): (
+            Option<SocketAddr>,
+            Option<SocketAddr>,
+            Option<SocketAddr>,
+        ) = (None, None, None);
+
         let Self {
             base_config,
             binary_source,
@@ -235,14 +284,13 @@ impl NodeSpec {
         .map_err(NodeStartError::Absolute)?;
 
         // set advertised addresses to make it easier to address this node from the test harness.
-        // todo: add tcp support
-        let fabric_advertised_address = AdvertisedAddress::with_node_base_dir(&node_base_dir);
+        let fabric_advertised_address = advertised_address_for(&node_base_dir, fabric_tcp);
         let ingress_advertised_address = base_config
             .has_role(Role::HttpIngress)
-            .then_some(AdvertisedAddress::with_node_base_dir(&node_base_dir));
+            .then(|| advertised_address_for(&node_base_dir, ingress_tcp));
         let admin_advertised_address = base_config
             .has_role(Role::Admin)
-            .then_some(AdvertisedAddress::with_node_base_dir(&node_base_dir));
+            .then(|| advertised_address_for(&node_base_dir, admin_tcp));
 
         if !node_base_dir.exists() {
             std::fs::create_dir_all(&node_base_dir).map_err(NodeStartError::CreateDirectory)?;

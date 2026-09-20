@@ -8,7 +8,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -161,6 +161,27 @@ impl<P: ListenerPort + 'static> ListenerOptions<P> {
                 self.use_random_ports.unwrap_or(false),
             )
         })
+    }
+
+    /// Pins this listener to an explicit TCP socket, for both binding and advertising.
+    ///
+    /// The local cluster runner needs this on platforms without unix domain sockets. On
+    /// Unix it addresses each node by socket path under the node's base dir, which has no
+    /// equivalent elsewhere, so instead it allocates a port up front and the node must
+    /// bind and advertise exactly that one.
+    pub fn pin_to_tcp(&mut self, addr: SocketAddr) {
+        self.listen_mode = Some(ListenMode::Tcp);
+        self.use_random_ports = Some(false);
+        self.bind_address = Some(BindAddress::from_parts(
+            Some(addr.ip()),
+            Some(addr.port()),
+            false,
+        ));
+        self.advertised_address = Some(
+            format!("http://{addr}")
+                .parse()
+                .expect("a socket address forms a valid http uri"),
+        );
     }
 
     pub fn advertised_address(&self, address_book: &AddressBook) -> AdvertisedAddress<P> {
