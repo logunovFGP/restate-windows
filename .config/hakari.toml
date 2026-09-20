@@ -23,9 +23,11 @@ workspace-members = ["service-protocol-wireshark-dissector"]
 third-party = [
     # excluded to avoid pulling in feature="test-util" by default for non-test builds
     { name = "tokio" },
-    # excluded for Windows compatibility - rdkafka requires OpenSSL which doesn't build easily on Windows
-    { name = "rdkafka" },
-    { name = "rdkafka-sys" },
+    # excluded for Windows compatibility - rdkafka requires OpenSSL which doesn't build easily on Windows.
+    # These come from a git fork, not crates.io; an entry without `git` defaults to
+    # source = crates.io, matches nothing, and makes hakari abort with "unknown elements".
+    { name = "rdkafka", git = "https://github.com/restatedev/rust-rdkafka.git", rev = "e92cad90eff797a0dc29fa524cabb89b602ae234" },
+    { name = "rdkafka-sys", git = "https://github.com/restatedev/rust-rdkafka.git", rev = "e92cad90eff797a0dc29fa524cabb89b602ae234" },
     # excluded for Windows compatibility - pprof is Unix-only (benchmarks/bifrost gate it
     # behind [target.'cfg(unix)'], but every platform in `platforms` above is Unix, so
     # hakari would otherwise hoist it into the unconditional [dependencies] section and
