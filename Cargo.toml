@@ -209,9 +209,11 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
 ] }
 rlimit = { version = "0.10.2" }
+# NOTE: `jemalloc` is deliberately NOT enabled here. It is added per-target in
+# crates/rocksdb/Cargo.toml under cfg(not(target_env = "msvc")). Cargo features are
+# unioned, so re-adding it here would silently re-break the Windows/MSVC build.
 rocksdb = { version = "0.45.0", package = "rust-rocksdb", features = [
     "multi-threaded-cf",
-    "jemalloc",
 ], git = "https://github.com/restatedev/rust-rocksdb", rev = "baaa733a94e2b590e20761a4de371cb367eeda51" }
 rstest = "0.26.1"
 rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
