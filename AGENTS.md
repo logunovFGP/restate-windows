@@ -89,9 +89,11 @@ This repo uses trunk-based development. Read `TRUNK-BASED-PATTERNS.md` before an
 code change. Config: `trunk-based.json`. Worktrees and long-lived branches are
 blocked by a PreToolUse guard and by `.git/hooks/pre-push`.
 
-Trunk is `windows-support`, not `main`. `main` is a pristine mirror of upstream
-`restatedev/restate` and is declared foreign: never commit to it, never fork a
-leaf from it, only ever fast-forward it from the `upstream` remote.
+Trunk is `windows-support`. `main` carries the same work, fast-forwarded from
+`windows-support` -- it is no longer a mirror of upstream. Upstream
+`restatedev/restate` is tracked through the `upstream` remote and merged in on a
+leaf, never by resetting `main` to it. Still fork every leaf from
+`windows-support`.
 
 Note that `CLAUDE.md` is a symlink to this file, so this section is what a Claude
 Code session reads.

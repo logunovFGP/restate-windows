@@ -14,14 +14,12 @@
     "how": "add an `experimental_<name>: bool` field to CommonOptions, default it to false in the Default impl, and gate the new path on it. Existing examples: experimental_enable_vqueues, experimental_kafka_batch_ingestion, experimental_shuffler_batch_ingestion.",
     "delete_when": "the new path is permanent -- drop the field and the branch together"
   },
-  "foreign_branches": {
-    "main": "pristine mirror of upstream restatedev/restate. Only ever fast-forwarded from `upstream`. Never commit to it, never open a leaf from it, never push it to origin as if it were ours."
-  },
   "notes": {
     "fork": "origin = git@github.com:logunovFGP/restate-windows (SSH, personal key). upstream = https://github.com/restatedev/restate.git (read-only; fetch main from here).",
     "ci": "ci.yml does NOT run on push to windows-support -- it triggers on pull_request, workflow_dispatch, and push to main/release-*. A push to trunk therefore triggers nothing on this fork; the local verify_command is the only gate. Open a PR to get CI.",
     "verify_cost": "`just verify` = check-fmt + clippy + check-deny + nextest + doctest over the whole workspace. That cannot run on Windows: it pulls in restate-ingress-kafka (rdkafka -> krb5-src). verify_command therefore points at `just verify-platform`, which dispatches to `just windows-verify` (fmt + scoped clippy + scoped nextest + both hakari gates + the jemalloc dependency guard) on Windows and to `just verify` elsewhere. Narrow this field further if needed; never reach for --no-verify.",
     "line_endings": "governed by .gitattributes + .editorconfig; see the `chore: declare line endings` commit. Never mix a renormalize with a logic change.",
-    "verify_prerequisites": "SATISFIED on this workstation as of 2026-09-20: rustup 1.92.0 + MSVC Build Tools 2022, protoc (Google.Protobuf) and LLVM/libclang installed, and just, cargo-nextest, cargo-deny and cargo-hakari all present. Build scripts need PROTOC and LIBCLANG_PATH exported when cargo is invoked outside a shell that has them on PATH."
+    "verify_prerequisites": "SATISFIED on this workstation as of 2026-09-20: rustup 1.92.0 + MSVC Build Tools 2022, protoc (Google.Protobuf) and LLVM/libclang installed, and just, cargo-nextest, cargo-deny and cargo-hakari all present. Build scripts need PROTOC and LIBCLANG_PATH exported when cargo is invoked outside a shell that has them on PATH.",
+    "branches": "main is NOT an upstream mirror any more. logunovFGP/restate-windows is the authoritative repo for this work; main is fast-forwarded from windows-support so it carries the Windows port. restatedev/restate is tracked separately via the `upstream` remote and merged in on a leaf, never by resetting main to it."
   }
 }
