@@ -14,7 +14,7 @@ use bytestring::ByteString;
 use futures::Stream;
 use futures_util::stream;
 
-use restate_rocksdb::{Priority, RocksDbPerfGuard};
+use restate_rocksdb::{Priority, RocksDbReadPerfGuard};
 use restate_storage_api::inbox_table::{
     InboxEntry, ReadInboxTable, ScanInboxTable, SequenceNumberInboxEntry, WriteInboxTable,
 };
@@ -22,9 +22,10 @@ use restate_storage_api::protobuf_types::PartitionStoreProtobufValue;
 use restate_storage_api::{Result, StorageError};
 use restate_types::identifiers::{PartitionKey, ServiceId, WithPartitionKey};
 use restate_types::message::MessageIndex;
+use restate_types::sharding::KeyRange;
 
 use crate::TableKind::Inbox;
-use crate::keys::{KeyKind, TableKey, define_table_key};
+use crate::keys::{DecodeTableKey, KeyKind, define_table_key};
 use crate::{
     PartitionStore, PartitionStoreTransaction, StorageAccess, TableScan,
     TableScanIterationDecision, break_on_err,
@@ -41,6 +42,12 @@ define_table_key!(
     )
 );
 
+fn any_inbox_entry_in_range<S: StorageAccess>(storage: &mut S, range: KeyRange) -> Result<bool> {
+    storage.get_first_blocking(TableScan::ScanPartitionKeyRange::<InboxKey>(range), |kv| {
+        Ok(kv.is_some())
+    })
+}
+
 fn peek_inbox<S: StorageAccess>(
     storage: &mut S,
     service_id: &ServiceId,
@@ -50,16 +57,13 @@ fn peek_inbox<S: StorageAccess>(
         .service_name(service_id.service_name.clone())
         .service_key(service_id.key.clone());
 
-    storage.get_first_blocking(
-        TableScan::SinglePartitionKeyPrefix(service_id.partition_key(), key),
-        |kv| match kv {
-            Some((k, v)) => {
-                let entry = decode_inbox_key_value(k, v)?;
-                Ok(Some(entry))
-            }
-            None => Ok(None),
-        },
-    )
+    storage.get_first_blocking(TableScan::Prefix(key), |kv| match kv {
+        Some((k, v)) => {
+            let entry = decode_inbox_key_value(k, v)?;
+            Ok(Some(entry))
+        }
+        None => Ok(None),
+    })
 }
 
 fn inbox<S: StorageAccess>(
@@ -72,7 +76,7 @@ fn inbox<S: StorageAccess>(
         .service_key(service_id.key.clone());
 
     Ok(stream::iter(storage.for_each_key_value_in_place(
-        TableScan::SinglePartitionKeyPrefix(service_id.partition_key(), key),
+        TableScan::Prefix(key),
         |k, v| {
             let inbox_entry = decode_inbox_key_value(k, v);
             TableScanIterationDecision::Emit(inbox_entry)
@@ -96,6 +100,10 @@ impl ReadInboxTable for PartitionStore {
         self.assert_partition_key(service_id)?;
         inbox(self, service_id)
     }
+
+    async fn any_inbox_entry_in_range(&mut self, range: KeyRange) -> Result<bool> {
+        any_inbox_entry_in_range(self, range)
+    }
 }
 
 impl ScanInboxTable for PartitionStore {
@@ -103,13 +111,13 @@ impl ScanInboxTable for PartitionStore {
         F: FnMut(SequenceNumberInboxEntry) -> ControlFlow<()> + Send + Sync + 'static,
     >(
         &self,
-        range: std::ops::RangeInclusive<PartitionKey>,
+        range: KeyRange,
         mut f: F,
     ) -> Result<impl Future<Output = Result<()>> + Send> {
         self.iterator_for_each(
             "df-inbox",
             Priority::Low,
-            TableScan::FullScanPartitionKeyRange::<InboxKey>(range),
+            TableScan::ScanPartitionKeyRange::<InboxKey>(range),
             move |(mut key, mut value)| {
                 let key = break_on_err(InboxKey::deserialize_from(&mut key))?;
                 let inbox_entry = break_on_err(InboxEntry::decode(&mut value))?;
@@ -140,6 +148,10 @@ impl ReadInboxTable for PartitionStoreTransaction<'_> {
     ) -> Result<impl Stream<Item = Result<SequenceNumberInboxEntry>> + Send> {
         self.assert_partition_key(service_id)?;
         inbox(self, service_id)
+    }
+
+    async fn any_inbox_entry_in_range(&mut self, range: KeyRange) -> Result<bool> {
+        any_inbox_entry_in_range(self, range)
     }
 }
 
@@ -172,7 +184,7 @@ impl WriteInboxTable for PartitionStoreTransaction<'_> {
         service_id: &ServiceId,
     ) -> Result<Option<SequenceNumberInboxEntry>> {
         self.assert_partition_key(service_id)?;
-        let _x = RocksDbPerfGuard::new("pop-inbox");
+        let _x = RocksDbReadPerfGuard::new("pop-inbox");
         let result = peek_inbox(self, service_id);
 
         if let Ok(Some(ref inbox_entry)) = result {
@@ -211,7 +223,7 @@ fn decode_inbox_key_value(mut k: &[u8], mut v: &[u8]) -> Result<SequenceNumberIn
 #[cfg(test)]
 mod tests {
     use crate::inbox_table::InboxKey;
-    use crate::keys::TableKeyPrefix;
+    use crate::keys::EncodeTableKeyPrefix;
     use bytes::Bytes;
     use restate_types::identifiers::{ServiceId, WithPartitionKey};
 

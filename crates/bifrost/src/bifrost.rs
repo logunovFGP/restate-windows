@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use enum_map::EnumMap;
+use parking_lot::Mutex;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::{info, instrument, warn};
@@ -24,6 +25,7 @@ use restate_types::live::LiveLoadExt;
 use restate_core::MetadataWriter;
 use restate_core::my_node_id;
 use restate_core::{Metadata, ShutdownError};
+use restate_memory::NonZeroByteCount;
 use restate_types::config::Configuration;
 use restate_types::logs::metadata::SealMetadata;
 use restate_types::logs::metadata::{LogletParams, Logs, SegmentIndex};
@@ -205,16 +207,17 @@ impl Bifrost {
         ))
     }
 
+    /// See [`BackgroundAppender::new`] for the semantics of `memory_limit`.
     pub fn create_background_appender<T: StorageEncode>(
         &self,
         log_id: LogId,
         error_recovery_strategy: ErrorRecoveryStrategy,
-        queue_capacity: usize,
+        memory_limit: Option<NonZeroByteCount>,
         max_batch_size: usize,
     ) -> Result<BackgroundAppender<T>> {
         Ok(BackgroundAppender::new(
             self.create_appender(log_id, error_recovery_strategy)?,
-            queue_capacity,
+            memory_limit,
             max_batch_size,
         ))
     }
@@ -275,6 +278,11 @@ impl Bifrost {
         )?;
         reader.try_collect().await
     }
+
+    /// Returns a reference to the active read stream registry for introspection.
+    pub fn read_stream_registry(&self) -> &crate::read_stream_registry::ActiveReadStreamRegistry {
+        &self.inner.read_stream_registry
+    }
 }
 
 // compile-time check
@@ -287,6 +295,7 @@ pub struct BifrostInner {
     // Initialized after BifrostService::start completes.
     pub(crate) providers: OnceLock<EnumMap<ProviderKind, Option<Arc<dyn LogletProvider>>>>,
     shutting_down: AtomicBool,
+    pub(crate) read_stream_registry: crate::read_stream_registry::ActiveReadStreamRegistry,
 }
 
 impl BifrostInner {
@@ -295,6 +304,7 @@ impl BifrostInner {
             watchdog,
             providers: Default::default(),
             shutting_down: AtomicBool::new(false),
+            read_stream_registry: Default::default(),
         }
     }
 
@@ -388,11 +398,12 @@ impl BifrostInner {
                                 log_id,
                                 loglet.segment_index(),
                                 SealMetadata::new("find-tail", my_node_id()),
+                                None,
                             )
                             .await
                         {
                             Ok(lsn) => {
-                                info!(%log_id, "Chain is sealed at lsn={lsn}, will attempt finding the tail again");
+                                debug!(%log_id, "Chain is sealed at lsn={lsn}, will attempt finding the tail again");
                                 continue;
                             }
                             Err(err) => {
@@ -498,12 +509,14 @@ impl BifrostInner {
         }
     }
 
-    /// Acquire a token to tell bifrost that this node is the intended primary writer for this log.
+    /// Enables acquiring and forgetting a recovery preference token for a given log.
+    ///
+    /// An acquired preference token tells bifrost that this node is the intended primary writer for this log.
     ///
     /// The preference can be kept for as long as the token is not dropped. Multiple tokens can be
     /// taken for the same log. Preference is only lost after the last token is dropped.
-    pub fn acquire_preference_token(&self, log_id: LogId) -> PreferenceToken {
-        PreferenceToken::new(self.watchdog.clone(), log_id)
+    pub fn control_preference(&self, log_id: LogId) -> PreferenceControl {
+        PreferenceControl::new(self.watchdog.clone(), log_id)
     }
 
     /// Adds a new log if it doesn't exist.
@@ -718,6 +731,39 @@ impl Drop for PreferenceToken {
     }
 }
 
+/// Shared/cloneable handle to acquire/release preference token for a given log.
+#[derive(Clone)]
+pub struct PreferenceControl(Arc<Inner>);
+
+struct Inner {
+    log_id: LogId,
+    watchdog: WatchdogSender,
+    current_preference: Mutex<Option<PreferenceToken>>,
+}
+
+impl PreferenceControl {
+    fn new(watchdog: WatchdogSender, log_id: LogId) -> Self {
+        Self(Arc::new(Inner {
+            log_id,
+            watchdog,
+            current_preference: Mutex::new(None),
+        }))
+    }
+
+    /// Marks this node as a preferred writer for the underlying log
+    pub fn mark_as_preferred(&self) {
+        let mut guard = self.0.current_preference.lock();
+        if guard.is_none() {
+            *guard = Some(PreferenceToken::new(self.0.watchdog.clone(), self.0.log_id));
+        }
+    }
+
+    /// Removes the preference about this node being the preferred writer for the log
+    pub fn forget_preference(&self) {
+        self.0.current_preference.lock().take();
+    }
+}
+
 #[cfg(all(test, feature = "local-loglet"))]
 mod tests {
     use super::*;
@@ -746,13 +792,13 @@ mod tests {
     use crate::providers::memory_loglet::{self};
 
     // Helper to create a small byte count for testing
-    fn small_byte_limit(bytes: usize) -> restate_serde_util::NonZeroByteCount {
-        restate_serde_util::NonZeroByteCount::new(NonZeroUsize::new(bytes).unwrap())
+    fn small_byte_limit(bytes: usize) -> restate_util_bytecount::NonZeroByteCount {
+        restate_util_bytecount::NonZeroByteCount::new(NonZeroUsize::new(bytes).unwrap())
     }
 
     #[restate_core::test]
     #[traced_test]
-    async fn test_append_smoke() -> googletest::Result<()> {
+    async fn append_smoke() -> googletest::Result<()> {
         let num_partitions = 5;
         let env = TestCoreEnvBuilder::with_incoming_only_connector()
             .set_partition_table(PartitionTable::with_equally_sized_partitions(
@@ -828,7 +874,7 @@ mod tests {
     }
 
     #[restate_core::test(start_paused = true)]
-    async fn test_lazy_initialization() -> googletest::Result<()> {
+    async fn lazy_initialization() -> googletest::Result<()> {
         let env = TestCoreEnv::create_with_single_node(1, 1).await;
         let delay = Duration::from_secs(5);
         // This memory provider adds a delay to its loglet initialization, we want
@@ -929,7 +975,7 @@ mod tests {
     }
 
     #[restate_core::test(start_paused = true)]
-    async fn test_read_across_segments() -> googletest::Result<()> {
+    async fn read_across_segments() -> googletest::Result<()> {
         const LOG_ID: LogId = LogId::new(0);
 
         let node_env = TestCoreEnvBuilder::with_incoming_only_connector()
@@ -1149,7 +1195,7 @@ mod tests {
 
     #[restate_core::test(start_paused = true)]
     #[traced_test]
-    async fn test_appends_correctly_handle_reconfiguration() -> googletest::Result<()> {
+    async fn appends_correctly_handle_reconfiguration() -> googletest::Result<()> {
         const LOG_ID: LogId = LogId::new(0);
         let node_env = TestCoreEnvBuilder::with_incoming_only_connector()
             .set_partition_table(PartitionTable::with_equally_sized_partitions(
@@ -1208,7 +1254,7 @@ mod tests {
         // seal and don't extend the chain.
         let _ = bifrost
             .admin()
-            .seal(LOG_ID, SegmentIndex::from(0), SealMetadata::default())
+            .seal(LOG_ID, SegmentIndex::from(0), SealMetadata::default(), None)
             .await?;
 
         // appends should stall!
@@ -1261,7 +1307,7 @@ mod tests {
     }
 
     #[restate_core::test]
-    async fn test_append_record_too_large() -> googletest::Result<()> {
+    async fn append_record_too_large() -> googletest::Result<()> {
         // Set up a configuration with a small record size limit.
         let mut config = restate_types::config::Configuration::default();
         config.networking.message_size_limit = small_byte_limit(5); // 5 bytes limit
@@ -1302,7 +1348,7 @@ mod tests {
     }
 
     #[restate_core::test]
-    async fn test_background_appender_record_too_large() -> googletest::Result<()> {
+    async fn background_appender_record_too_large() -> googletest::Result<()> {
         // Set up configuration with a small record size limit (100 bytes).
         // Note: The estimated_encode_size for any typed record is ~2KB constant,
         // so even "small" strings will exceed the 100 byte limit.
@@ -1316,7 +1362,7 @@ mod tests {
         let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
 
         let background_appender: crate::BackgroundAppender<String> = bifrost
-            .create_background_appender(LogId::new(0), ErrorRecoveryStrategy::Wait, 10, 10)?;
+            .create_background_appender(LogId::new(0), ErrorRecoveryStrategy::Wait, None, 10)?;
 
         let mut handle = background_appender.start("test-appender")?;
         let sender = handle.sender();
@@ -1324,8 +1370,8 @@ mod tests {
         // A string with 100 bytes
         let payload = String::from_utf8(vec![b't'; 100]).unwrap();
 
-        // try_enqueue should fail with RecordTooLarge
-        let result = sender.try_enqueue(payload.clone());
+        // enqueue should fail with RecordTooLarge
+        let result = sender.enqueue(payload.clone());
         assert_that!(
             result,
             pat!(Err(pat!(EnqueueError::RecordTooLarge {
@@ -1335,7 +1381,7 @@ mod tests {
         );
 
         // enqueue (async) should also fail with RecordTooLarge
-        let result = sender.enqueue(payload.clone()).await;
+        let result = sender.enqueue(payload.clone());
         assert_that!(
             result,
             pat!(Err(pat!(EnqueueError::RecordTooLarge {
@@ -1344,8 +1390,8 @@ mod tests {
             })))
         );
 
-        // try_enqueue_with_notification should also fail
-        let result = sender.try_enqueue_with_notification(payload.clone());
+        // enqueue_with_notification should also fail
+        let result = sender.enqueue_with_notification(payload.clone());
         assert!(matches!(
             result,
             Err(EnqueueError::RecordTooLarge {
@@ -1361,7 +1407,7 @@ mod tests {
     }
 
     #[restate_core::test]
-    async fn test_background_appender_record_within_limit() -> googletest::Result<()> {
+    async fn background_appender_record_within_limit() -> googletest::Result<()> {
         // Set up configuration with a large enough record size limit (10KB) to allow records
         let mut config = restate_types::config::Configuration::default();
         config.networking.message_size_limit = small_byte_limit(10 * 1024); // 10KB
@@ -1372,14 +1418,14 @@ mod tests {
         let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
 
         let background_appender: crate::BackgroundAppender<String> = bifrost
-            .create_background_appender(LogId::new(0), ErrorRecoveryStrategy::Wait, 10, 10)?;
+            .create_background_appender(LogId::new(0), ErrorRecoveryStrategy::Wait, None, 10)?;
 
         let mut handle = background_appender.start("test-appender")?;
         let sender = handle.sender();
 
         // With a 10KB limit, the ~2KB estimated record should succeed
         let payload = "test".to_string();
-        sender.enqueue(payload).await?;
+        sender.enqueue(payload)?;
 
         // Drain and wait for commit
         handle.drain().await?;
@@ -1389,7 +1435,7 @@ mod tests {
 
     /// Test that records enqueued rapidly are properly committed.
     #[restate_core::test]
-    async fn test_background_appender_rapid_enqueue() -> googletest::Result<()> {
+    async fn background_appender_rapid_enqueue() -> googletest::Result<()> {
         let mut config = restate_types::config::Configuration::default();
         config.networking.message_size_limit = small_byte_limit(50 * 1024); // 50KB
         let config = config.apply_cascading_values();
@@ -1399,21 +1445,16 @@ mod tests {
         let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
 
         let background_appender: crate::BackgroundAppender<String> = bifrost
-            .create_background_appender(LogId::new(0), ErrorRecoveryStrategy::Wait, 1000, 100)?;
+            .create_background_appender(LogId::new(0), ErrorRecoveryStrategy::Wait, None, 100)?;
 
         let mut handle = background_appender.start("test-appender")?;
         let sender = handle.sender();
 
-        // Rapidly enqueue many records using try_enqueue (non-blocking)
+        // Rapidly enqueue many records using enqueue
         let mut enqueued = 0;
         for i in 0..100 {
-            match sender.try_enqueue(format!("rapid-record-{i}")) {
-                Ok(()) => enqueued += 1,
-                Err(EnqueueError::Full(_)) => {
-                    // Queue is full, use async enqueue
-                    sender.enqueue(format!("rapid-record-{i}")).await?;
-                    enqueued += 1;
-                }
+            match sender.enqueue(format!("rapid-record-{i}")) {
+                Ok(_) => enqueued += 1,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -1421,7 +1462,7 @@ mod tests {
         assert_that!(enqueued, eq(100));
 
         // Wait for all to be committed
-        let token = sender.notify_committed().await?;
+        let token = sender.notify_committed()?;
         token.await?;
 
         handle.drain().await?;

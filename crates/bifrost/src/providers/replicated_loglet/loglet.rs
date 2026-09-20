@@ -21,7 +21,8 @@ use restate_core::my_node_id;
 use restate_core::network::{Networking, TransportConnect};
 use restate_types::logs::metadata::SegmentIndex;
 use restate_types::logs::{
-    KeyFilter, LogId, LogletOffset, Record, RecordCache, SequenceNumber, TailOffsetWatch, TailState,
+    KeyFilter, LogId, LogletId, LogletOffset, Record, RecordCache, SequenceNumber, TailOffsetWatch,
+    TailState,
 };
 use restate_types::replicated_loglet::ReplicatedLogletParams;
 
@@ -269,6 +270,10 @@ impl<T: TransportConnect> ReplicatedLoglet<T> {
 
 #[async_trait]
 impl<T: TransportConnect> Loglet for ReplicatedLoglet<T> {
+    fn id(&self) -> Option<LogletId> {
+        Some(self.my_params.loglet_id)
+    }
+
     fn debug_str(&self) -> Cow<'static, str> {
         Cow::from(format!("replicated/{}", self.my_params.loglet_id))
     }
@@ -512,7 +517,7 @@ mod tests {
 
     // ** Single-node replicated-loglet smoke tests **
     #[test(restate_core::test(start_paused = true))]
-    async fn test_append_local_sequencer_single_node() -> Result<()> {
+    async fn append_local_sequencer_single_node() -> Result<()> {
         let loglet_id = LogletId::new_unchecked(122);
         let params = ReplicatedLogletParams {
             loglet_id,
@@ -555,7 +560,7 @@ mod tests {
 
     // ** Single-node replicated-loglet seal **
     #[test(restate_core::test(start_paused = true))]
-    async fn test_seal_local_sequencer_single_node() -> Result<()> {
+    async fn seal_local_sequencer_single_node() -> Result<()> {
         let loglet_id = LogletId::new_unchecked(122);
         let params = ReplicatedLogletParams {
             loglet_id,

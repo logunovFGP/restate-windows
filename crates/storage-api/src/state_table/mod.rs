@@ -8,26 +8,76 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::ops::RangeInclusive;
-
 use bytes::Bytes;
+use bytestring::ByteString;
 use futures::Stream;
 
-use restate_types::identifiers::{PartitionKey, ServiceId};
+use restate_memory::{LocalMemoryLease, LocalMemoryPool, PinnableMemoryStream};
+use restate_types::identifiers::ServiceId;
+use restate_types::sharding::KeyRange;
 
-use crate::Result;
+use crate::{BudgetedReadError, Result};
 
 pub trait ReadStateTable {
     fn get_user_state(
         &mut self,
         service_id: &ServiceId,
-        state_key: impl AsRef<[u8]> + Send,
+        state_key: &Bytes,
     ) -> impl Future<Output = Result<Option<Bytes>>> + Send;
 
-    fn get_all_user_states_for_service(
-        &mut self,
+    /// Returns a lazy stream over all user states for the given service.
+    /// The stream borrows from `self` only, not from `service_id`.
+    fn get_all_user_states_for_service<'a>(
+        &'a self,
         service_id: &ServiceId,
-    ) -> Result<impl Stream<Item = Result<(Bytes, Bytes)>> + Send>;
+    ) -> Result<impl Stream<Item = Result<(Bytes, Bytes)>> + Send + 'a>;
+
+    /// Budget-gated state stream.
+    ///
+    /// Each state entry's raw byte size is peeked from the underlying store
+    /// **before** deserialization. A [`LocalMemoryLease`] is acquired from
+    /// `budget` for that size, and only then is the entry decoded.
+    fn get_all_user_states_budgeted<'a>(
+        &'a self,
+        service_id: &ServiceId,
+        budget: &'a mut LocalMemoryPool,
+    ) -> Result<
+        impl PinnableMemoryStream<
+            Item = std::result::Result<(Bytes, Bytes, LocalMemoryLease), BudgetedReadError>,
+        > + Send
+        + 'a,
+    >;
+
+    /// Budget-gated point reads of a specific set of state keys.
+    ///
+    /// Point-reads the requested `keys` (exact match) when polled, omitting keys
+    /// with no stored value. The stream borrows `self` and `budget`, but owns
+    /// its service ID and keys. Each entry's [`LocalMemoryLease`] is acquired
+    /// **before** its value is copied out.
+    ///
+    /// Like [`get_all_user_states_budgeted`], waits for reclaimable memory when
+    /// a reservation is feasible, and returns a budget error otherwise.
+    /// Storage and budget errors are yielded through the stream.
+    ///
+    /// [`get_all_user_states_budgeted`]: Self::get_all_user_states_budgeted
+    // The lazy stream retains a storage borrow and must be Send. The partition
+    // store's transaction contains a WriteBatchWithIndex, which is Send but not
+    // Sync: an exclusive borrow keeps the stream Send, while a shared borrow
+    // would require Sync.
+    // TODO: Introduce a snapshot-backed read-only transaction, or spawn invocation
+    //  tasks as local tasks and relax the stream's Send requirement, so this API
+    //  can use a shared borrow.
+    fn get_user_states_budgeted<'a>(
+        &'a mut self,
+        service_id: &ServiceId,
+        keys: &[ByteString],
+        budget: &'a mut LocalMemoryPool,
+    ) -> Result<
+        impl PinnableMemoryStream<
+            Item = std::result::Result<(Bytes, Bytes, LocalMemoryLease), BudgetedReadError>,
+        > + Send
+        + 'a,
+    >;
 }
 
 pub trait ScanStateTable {
@@ -35,7 +85,7 @@ pub trait ScanStateTable {
         F: FnMut((ServiceId, Bytes, &[u8])) -> std::ops::ControlFlow<()> + Send + Sync + 'static,
     >(
         &self,
-        range: RangeInclusive<PartitionKey>,
+        range: KeyRange,
         f: F,
     ) -> Result<impl Future<Output = Result<()>> + Send>;
 }
@@ -44,15 +94,11 @@ pub trait WriteStateTable {
     fn put_user_state(
         &mut self,
         service_id: &ServiceId,
-        state_key: impl AsRef<[u8]> + Send,
+        state_key: &Bytes,
         state_value: impl AsRef<[u8]> + Send,
     ) -> Result<()>;
 
-    fn delete_user_state(
-        &mut self,
-        service_id: &ServiceId,
-        state_key: impl AsRef<[u8]> + Send,
-    ) -> Result<()>;
+    fn delete_user_state(&mut self, service_id: &ServiceId, state_key: &Bytes) -> Result<()>;
 
     fn delete_all_user_state(&mut self, service_id: &ServiceId) -> Result<()>;
 }

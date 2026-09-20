@@ -8,10 +8,14 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use crate::cluster_marker::mark_cluster_as_provisioned;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tracing::{Level, debug, enabled, info, trace, warn};
+
 use restate_core::{MetadataWriter, ShutdownError, TaskCenter, cancellation_token};
 use restate_metadata_store::{MetadataStoreClient, ReadWriteError};
-use restate_types::PlainNodeId;
+use restate_types::cluster_marker::ClusterMarker;
 use restate_types::config::Configuration;
 use restate_types::errors::MaybeRetryableError;
 use restate_types::metadata_store::keys::NODES_CONFIG_KEY;
@@ -19,9 +23,7 @@ use restate_types::nodes_config::{
     MetadataServerConfig, MetadataServerState, NodeConfig, NodesConfiguration,
 };
 use restate_types::retries::RetryPolicy;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tracing::{Level, debug, enabled, info, trace, warn};
+use restate_types::{PlainNodeId, RestateVersion};
 
 #[derive(Debug, thiserror::Error)]
 enum JoinError {
@@ -78,7 +80,7 @@ impl<'a> NodeInit<'a> {
             // If we fail at this point, then we might restart as if the cluster has not been
             // provisioned yet. This is not a problem because the provisioning operation is
             // idempotent.
-            mark_cluster_as_provisioned()?;
+            ClusterMarker::mark_cluster_as_provisioned(nodes_configuration.cluster_fingerprint())?;
         }
 
         // Find my node in nodes configuration.
@@ -272,6 +274,7 @@ impl<'a> NodeInit<'a> {
                         node_config.roles = common.roles;
                         node_config.address = my_advertised_address.clone();
                         node_config.current_generation.bump_generation();
+                        node_config.binary_version = Some(RestateVersion::current());
 
                         node_config
                     } else {
@@ -304,6 +307,7 @@ impl<'a> NodeInit<'a> {
                             .metadata_server_config(MetadataServerConfig {
                                 metadata_server_state,
                             })
+                            .binary_version(RestateVersion::current())
                             .build()
                     };
 
@@ -329,7 +333,7 @@ mod tests {
     use restate_types::config::{Configuration, set_current_config};
     use restate_types::net::listener::AddressBook;
     use restate_types::nodes_config::{ClusterFingerprint, NodeConfig, NodesConfiguration};
-    use restate_types::{GenerationalNodeId, PlainNodeId, Version};
+    use restate_types::{GenerationalNodeId, PlainNodeId, RestateVersion, Version};
 
     use crate::init::NodeInit;
 
@@ -356,6 +360,7 @@ mod tests {
                     .advertised_address(&address_book),
             )
             .roles(EnumSet::default())
+            .binary_version(RestateVersion::current())
             .build();
         let mut nodes_configuration =
             NodesConfiguration::new(Version::MIN, cluster_name, ClusterFingerprint::generate());

@@ -23,7 +23,7 @@ use rand::seq::IteratorRandom;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use restate_bifrost::{Bifrost, MaybeSealedSegment};
 use restate_core::network::tonic_service_filter::{TonicServiceFilter, WaitForReady};
@@ -35,6 +35,10 @@ use restate_core::{cancellation_token, my_node_id};
 use restate_metadata_store::ReadModifyWriteError;
 use restate_storage_query_datafusion::BuildError;
 use restate_storage_query_datafusion::context::{ClusterTables, QueryContext};
+use restate_storage_query_datafusion::remote_query_scanner_client::create_remote_scanner_service;
+use restate_storage_query_datafusion::remote_query_scanner_manager::{
+    RemoteScannerManager, create_partition_locator,
+};
 use restate_types::cluster::cluster_state::LegacyClusterState;
 use restate_types::config::{AdminOptions, Configuration};
 use restate_types::health::HealthStatus;
@@ -107,14 +111,24 @@ where
         let options = configuration.live_load();
         let heartbeat_interval = Self::create_heartbeat_interval(&options.admin);
 
-        let cluster_query_context = QueryContext::create(
-            &options.admin.query_engine,
-            ClusterTables::new(
-                replica_set_states.clone(),
-                cluster_state_refresher.cluster_state_watcher().watch(),
+        let remote_scanner_manager = RemoteScannerManager::new(
+            create_remote_scanner_service(networking.clone()),
+            create_partition_locator(
+                restate_core::partitions::PartitionRouting::new(
+                    replica_set_states.clone(),
+                    TaskCenter::current(),
+                ),
+                Metadata::current(),
             ),
-        )
-        .await?;
+            Metadata::current(),
+        );
+        let cluster_tables = ClusterTables::new(
+            replica_set_states.clone(),
+            cluster_state_refresher.cluster_state_watcher().watch(),
+            remote_scanner_manager,
+        );
+        let cluster_query_context =
+            QueryContext::create(&options.admin.query_engine, cluster_tables).await?;
 
         // Registering ClusterCtrlSvc grpc service to network server
         server_builder.register_grpc_service(
@@ -199,8 +213,13 @@ enum ClusterControllerCommand {
         log_id: LogId,
         segment_index: Option<SegmentIndex>,
         permanent_seal: bool,
+        tail_lsn: Option<Lsn>,
         context: std::collections::HashMap<String, String>,
         response_tx: oneshot::Sender<anyhow::Result<Lsn>>,
+    },
+    SyncEpochMetadata {
+        partition_ids: Vec<PartitionId>,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
     },
 }
 
@@ -302,6 +321,7 @@ impl ClusterControllerHandle {
         segment_index: Option<SegmentIndex>,
         permanent_seal: bool,
         context: std::collections::HashMap<String, String>,
+        tail_lsn: Option<Lsn>,
     ) -> Result<anyhow::Result<Lsn>, ShutdownError> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -312,6 +332,7 @@ impl ClusterControllerHandle {
                 segment_index,
                 permanent_seal,
                 context,
+                tail_lsn,
                 response_tx,
             })
             .await;
@@ -333,6 +354,23 @@ impl ClusterControllerHandle {
                 log_id,
                 min_version,
                 extension,
+                response_tx,
+            })
+            .await;
+
+        response_rx.await.map_err(|_| ShutdownError)
+    }
+
+    pub async fn sync_epoch_metadata(
+        &self,
+        partition_ids: Vec<PartitionId>,
+    ) -> Result<anyhow::Result<()>, ShutdownError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let _ = self
+            .tx
+            .send(ClusterControllerCommand::SyncEpochMetadata {
+                partition_ids,
                 response_tx,
             })
             .await;
@@ -387,7 +425,7 @@ impl<T: TransportConnect> Service<T> {
                 },
                 Some(cmd) = self.command_rx.recv() => {
                     // it is still safe to handle cluster commands as a follower
-                    self.on_cluster_cmd(cmd).await;
+                    self.on_cluster_cmd(cmd, &state);
                 }
                 _ = config_watcher.changed() => {
                     debug!("Updating the cluster controller settings.");
@@ -456,7 +494,7 @@ impl<T: TransportConnect> Service<T> {
         };
     }
 
-    async fn on_cluster_cmd(&self, command: ClusterControllerCommand) {
+    fn on_cluster_cmd(&self, command: ClusterControllerCommand, state: &ClusterControllerState) {
         match command {
             ClusterControllerCommand::GetClusterState(tx) => {
                 let _ = tx.send(self.cluster_state_refresher.get_cluster_state());
@@ -533,6 +571,7 @@ impl<T: TransportConnect> Service<T> {
                 segment_index,
                 permanent_seal,
                 mut context,
+                tail_lsn,
                 response_tx,
             } => {
                 let bifrost = self.bifrost.clone();
@@ -545,6 +584,7 @@ impl<T: TransportConnect> Service<T> {
                         log_id,
                         segment_index,
                         permanent_seal,
+                        forced_tail_lsn: tail_lsn,
                         context,
                         bifrost,
                     }
@@ -589,6 +629,22 @@ impl<T: TransportConnect> Service<T> {
                     Ok(())
                 });
             }
+            ClusterControllerCommand::SyncEpochMetadata {
+                partition_ids,
+                response_tx,
+            } => match state {
+                ClusterControllerState::Leader(leader) => {
+                    let result = leader
+                        .sync_epoch_metadata_tx()
+                        .try_send(partition_ids)
+                        .map(|_| ())
+                        .map_err(|_| anyhow!("Scheduler task is not running"));
+                    let _ = response_tx.send(result);
+                }
+                ClusterControllerState::Follower => {
+                    let _ = response_tx.send(Err(anyhow!("Not the cluster controller leader")));
+                }
+            },
         }
     }
 }
@@ -735,6 +791,9 @@ struct SealChainTask {
     segment_index: Option<SegmentIndex>,
     permanent_seal: bool,
     context: std::collections::HashMap<String, String>,
+    /// If set, we will use this tail LSN value instead of the actual calculated tail from the
+    /// underlying loglet.
+    forced_tail_lsn: Option<Lsn>,
     bifrost: Bifrost,
 }
 
@@ -747,13 +806,26 @@ impl SealChainTask {
             .tail()
             .index();
 
+        if let Some(forced_tail_lsn) = &self.forced_tail_lsn {
+            warn!(
+                context = ?self.context,
+                "Force-sealing log {} with tail LSN {forced_tail_lsn} due to an admin request",
+                self.log_id
+            );
+        }
+
         let segment_index = self.segment_index.unwrap_or(actual_tail_segment);
         let seal_metadata = SealMetadata::with_context(self.permanent_seal, self.context);
 
         let tail_lsn = self
             .bifrost
             .admin()
-            .seal(self.log_id, segment_index, seal_metadata)
+            .seal(
+                self.log_id,
+                segment_index,
+                seal_metadata,
+                self.forced_tail_lsn,
+            )
             .await?;
 
         Ok(tail_lsn)

@@ -17,12 +17,12 @@ use bytes::Bytes;
 use futures::FutureExt;
 use tokio::sync::oneshot;
 
-use restate_time_util::DurationExt;
 use restate_types::net::address::AdvertisedAddress;
 use restate_types::net::address::FabricPort;
 use restate_types::net::metadata::MetadataKind;
 use restate_types::net::{ProtocolVersion, RpcResponse};
 use restate_types::{GenerationalNodeId, Version};
+use restate_util_time::DurationExt;
 
 use super::protobuf::network::{Header, rpc_reply};
 use super::{ConnectionClosed, MessageSendError};
@@ -201,7 +201,7 @@ pub enum RpcReplyError {
     ServiceStopped,
     #[error("the requested rpc service didn't recognize this message")]
     MessageUnrecognized,
-    #[error("peer dropped the request due to back-pressure")]
+    #[error("peer dropped the request due to load-shedding")]
     LoadShedding,
     #[error(
         "the target has the rpc service but it has rejected serving the request for the supplied sort code"

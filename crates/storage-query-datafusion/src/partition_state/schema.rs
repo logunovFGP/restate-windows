@@ -27,7 +27,7 @@ define_table!(
         /// Observed target run mode of partition (LEADER, FOLLOWER)
         target_mode: DataType::Utf8,
 
-        /// Effective partition run mode of partition (LEADER, FOLLOWER)
+        /// Effective partition run mode of partition (LEADER, BECOMING_LEADING, FOLLOWER)
         effective_mode: DataType::Utf8,
 
         /// Last updated
@@ -45,7 +45,7 @@ define_table!(
         /// Last record applied at
         last_record_applied_at: TimestampMillisecond,
 
-        /// Replay status
+        /// Replay status. NULL if the processor is broken, since it is not replaying
         replay_status: DataType::Utf8,
 
         /// Durable log LSN
@@ -56,5 +56,22 @@ define_table!(
 
         /// Target tail LSN
         target_tail_lsn: DataType::UInt64,
+
+        /// Version of the rule book currently applied by the partition processor
+        applied_rule_book_version: DataType::UInt32,
+
+        /// Version of the schema currently applied by the partition processor
+        applied_schema_version: DataType::UInt32,
+
+        /// State-machine features currently enabled on the partition processor.
+        /// Query membership with `array_has(enabled_features, 'vqueues')`.
+        enabled_features: Utf8List,
+
+        /// Why the node gave up on running this partition processor, if it did.
+        /// NULL while the processor is healthy.
+        broken_reason: DataType::Utf8,
+
+        /// Partition-store on-disk local storage features.
+        enabled_storage_features: Utf8List,
     )
 );

@@ -16,37 +16,37 @@ use enum_map::{EnumMap, enum_map};
 use futures::future::OptionFuture;
 use futures::{Stream, StreamExt};
 use metrics::counter;
-use opentelemetry::propagation::TextMapPropagator;
-use opentelemetry_sdk::propagation::TraceContextPropagator;
 use strum::IntoEnumIterator as _;
 use tokio::sync::oneshot;
-use tokio::time::Sleep;
+use tokio::time::{MissedTickBehavior, Sleep};
 use tracing::{Instrument, Span, debug, info, trace, warn};
 
 use restate_futures_util::overdue::OverdueLoggingExt;
 use restate_types::live::Live;
 use restate_types::logs::metadata::Logs;
-use restate_types::net::ServiceTag;
 use restate_types::net::metadata::MetadataKind;
 use restate_types::nodes_config::NodesConfiguration;
 use restate_types::partition_table::PartitionTable;
 use restate_types::schema::Schema;
 use restate_types::{Version, Versioned};
+use restate_util_time::DurationExt;
 
-use crate::network::incoming::{RawRpc, RawUnary, RpcReplyPort};
 use crate::network::io::EgressMessage;
-use crate::network::metric_definitions::NETWORK_MESSAGE_RECEIVED_BYTES;
+use crate::network::metric_definitions::NETWORK_SERVICE_REJECTED_REQUEST_BYTES;
 use crate::network::protobuf::network::message::{Body, Signal};
 use crate::network::protobuf::network::{Datagram, RpcReply, datagram, rpc_reply};
 use crate::network::protobuf::network::{Header, Message};
 use crate::network::tracking::ConnectionTracking;
 use crate::network::{
-    Connection, Incoming, MessageRouter, PeerMetadataVersion, ReplyEnvelope, RouterError,
-    RpcReplyError,
+    Connection, MessageRouter, PeerMetadataVersion, ReplyEnvelope, RouterError, RpcReplyError,
 };
 use crate::{Metadata, ShutdownError, TaskCenter, TaskContext, TaskId, TaskKind};
 
 use super::DrainReason;
+
+/// Interval at which we run garbage collection on the reply tracker to remove
+/// entries where the caller has dropped their receiver.
+const RPC_GC_INTERVAL: Duration = Duration::from_secs(5);
 
 enum Decision {
     Continue,
@@ -67,7 +67,6 @@ pub struct ConnectionReactor {
     state: State,
     connection: Connection,
     shared: super::Shared,
-    context_propagator: TraceContextPropagator,
     seen_versions: Option<MetadataVersions>,
     router: Arc<MessageRouter>,
 }
@@ -80,7 +79,6 @@ impl ConnectionReactor {
         peer_metadata: Option<PeerMetadataVersion>,
         router: Arc<MessageRouter>,
     ) -> Self {
-        let context_propagator = TraceContextPropagator::default();
         let mut seen_versions = MetadataVersions::new(Metadata::current());
         if let Some(peer_metadata) = peer_metadata {
             seen_versions.notify(peer_metadata, &connection);
@@ -89,7 +87,6 @@ impl ConnectionReactor {
             state: State::Active,
             connection,
             shared,
-            context_propagator,
             seen_versions: Some(seen_versions),
             router,
         }
@@ -153,6 +150,10 @@ impl ConnectionReactor {
         Span::current().record("task_id", tracing::field::display(current_task.id()));
         let mut cancellation = std::pin::pin!(current_task.cancellation_token().cancelled());
 
+        // Set up periodic garbage collection for the reply tracker
+        let mut gc_interval = tokio::time::interval(RPC_GC_INTERVAL.add_jitter(0.2));
+        gc_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
         conn_tracker.connection_created(&self.connection, is_dedicated);
 
         loop {
@@ -171,6 +172,10 @@ impl ConnectionReactor {
                             }
                             // we only drain the connection if we were the initiators of the termination
                         },
+                        _ = gc_interval.tick() => {
+                            self.shared.reply_tracker.gc();
+                            Decision::Continue
+                        },
                         msg = incoming.next() => {
                             self.handle_message(msg).await
                         }
@@ -183,6 +188,10 @@ impl ConnectionReactor {
                         () = drain_timeout => {
                             debug!("Drain timed out, closing connection");
                             Decision::Drop
+                        },
+                        _ = gc_interval.tick() => {
+                            self.shared.reply_tracker.gc();
+                            Decision::Continue
                         },
                         msg = incoming.next() => {
                             self.handle_message(msg).await
@@ -319,78 +328,40 @@ impl ConnectionReactor {
                     return Decision::Continue;
                 };
                 let target_service = rpc_call.service();
-                let parent_context = header
-                    .span_context
-                    .as_ref()
-                    .map(|span_ctx| self.context_propagator.extract(span_ctx));
+                let rpc_id = rpc_call.id;
+                let encoded_len = rpc_call.payload.len() as u64;
 
-                let encoded_len = rpc_call.payload.len();
-                let (reply_port, reply_rx) = RpcReplyPort::new();
-                let raw_rpc = RawRpc {
-                    reply_port,
-                    payload: rpc_call.payload,
-                    sort_code: rpc_call.sort_code,
-                    msg_type: rpc_call.msg_type,
-                };
-                let incoming = Incoming::new(
-                    self.connection.protocol_version,
-                    raw_rpc,
-                    self.connection.peer,
-                    PeerMetadataVersion::from(header),
-                    parent_context,
-                );
-                trace!(
-                    peer = %self.connection.peer(),
-                    rpc_id = %rpc_call.id,
-                    "Received RPC call: {target_service}::{}",
-                    incoming.msg_type()
-                );
-                // ship to the service router, dropping the reply port will close the responder
-                // task.
-                match tokio::task::unconstrained(self.router.call_rpc(target_service, incoming))
+                // Ship to the message router
+                match self
+                    .router
+                    .call_rpc(header, rpc_call, &self.connection)
                     .await
                 {
-                    Ok(()) => { /* spawn reply task */ }
+                    Ok(reply_rx) => {
+                        spawn_rpc_responder(tx.clone(), rpc_id, reply_rx);
+                    }
                     Err(err) => {
-                        send_rpc_error(tx, err, rpc_call.id);
+                        send_rpc_error(tx, err, rpc_id);
+                        counter!(NETWORK_SERVICE_REJECTED_REQUEST_BYTES, "target" => target_service.as_str_name()).increment(encoded_len);
                     }
                 }
-
-                counter!(NETWORK_MESSAGE_RECEIVED_BYTES, "target" => target_service.as_str_name())
-                    .increment(encoded_len as u64);
-
-                spawn_rpc_responder(tx.clone(), rpc_call.id, reply_rx, target_service);
-
                 Decision::Continue
             }
             // UNARY MESSAGE
             Body::Datagram(Datagram {
                 datagram: Some(datagram::Datagram::Unary(unary)),
             }) => {
-                let parent_context = header
-                    .span_context
-                    .as_ref()
-                    .map(|span_ctx| self.context_propagator.extract(span_ctx));
-                let metadata_versions = PeerMetadataVersion::from(header);
-                let target = unary.service();
-                let encoded_len = unary.payload.len();
-                let incoming = Incoming::new(
-                    self.connection.protocol_version,
-                    RawUnary {
-                        payload: unary.payload,
-                        sort_code: unary.sort_code,
-                        msg_type: unary.msg_type,
-                    },
-                    self.connection.peer(),
-                    metadata_versions,
-                    parent_context,
-                );
-                trace!("Received Unary call: {target}::{}", incoming.msg_type());
+                let target_service = unary.service();
+                let encoded_len = unary.payload.len() as u64;
 
-                let _ = tokio::task::unconstrained(self.router.call_unary(target, incoming)).await;
-
-                counter!(NETWORK_MESSAGE_RECEIVED_BYTES, "target" => target.as_str_name())
-                    .increment(encoded_len as u64);
+                if self
+                    .router
+                    .call_unary(header, unary, &self.connection)
+                    .await
+                    .is_err()
+                {
+                    counter!(NETWORK_SERVICE_REJECTED_REQUEST_BYTES, "target" => target_service.as_str_name()).increment(encoded_len);
+                }
                 Decision::Continue
             }
             // RPC REPLY
@@ -446,7 +417,7 @@ impl ConnectionReactor {
                     let datagram = Body::Datagram(Datagram {
                         datagram: Some(msg.flip().into()),
                     });
-                    let _ = tx.unbounded_send(EgressMessage::Message(datagram, None));
+                    let _ = tx.unbounded_send(EgressMessage::Message(datagram));
                 }
                 Decision::Continue
             }
@@ -471,7 +442,7 @@ fn send_rpc_error(tx: &super::UnboundedEgressSender, err: RouterError, id: u64) 
         datagram: Some(body.into()),
     });
 
-    let _ = tx.unbounded_send(EgressMessage::Message(datagram, None));
+    let _ = tx.unbounded_send(EgressMessage::Message(datagram));
 }
 
 /// A task to ship the reply or an error back to the caller
@@ -479,7 +450,6 @@ fn spawn_rpc_responder(
     tx: super::UnboundedEgressSender,
     id: u64,
     reply_rx: oneshot::Receiver<ReplyEnvelope>,
-    _target_service: ServiceTag,
 ) {
     // this is rpc-call, spawning a responder task
     tokio::spawn(async move {
@@ -490,10 +460,7 @@ fn spawn_rpc_responder(
                         trace!(rpc_id = %id, "Sending RPC response to caller");
                         let body = RpcReply { id, body: Some(envelope.body) };
                         let datagram = Body::Datagram(Datagram { datagram: Some(body.into())});
-                        let _ = tx.unbounded_send(EgressMessage::Message(
-                            datagram,
-                            Some(envelope.span),
-                        ));
+                        let _ = tx.unbounded_send(EgressMessage::Message(datagram));
                         // todo(asoli): here is a good place to measure total rpc
                         // processing time.
                     }
@@ -502,10 +469,7 @@ fn spawn_rpc_responder(
                         trace!(rpc_id = %id, "RPC was dropped, sending dropped notification to caller");
                         let body = RpcReply { id, body: Some(rpc_reply::Body::Status(rpc_reply::Status::Dropped.into())), };
                         let datagram = Body::Datagram(Datagram { datagram: Some(body.into())});
-                        let _ = tx.unbounded_send(EgressMessage::Message(
-                            datagram,
-                            None,
-                        ));
+                        let _ = tx.unbounded_send(EgressMessage::Message(datagram));
                     }
                 }
             }

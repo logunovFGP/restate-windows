@@ -1,22 +1,33 @@
+set positional-arguments := true
+
 export RUST_BACKTRACE := env_var_or_default("RUST_BACKTRACE", "short")
 export DOCKER_PROGRESS := env_var_or_default('DOCKER_PROGRESS', 'auto')
 export RESTATE_TEST_PORTS_POOL := "/tmp/restate_tests_ports_pool"
 
 dev_tools_image := "ghcr.io/restatedev/dev-tools:latest"
 
-# Docker image name & tag.
+# Docker image name & tag. We detect git first, then Sapling (sl), and fall back
+# to "unknown" when neither works, so evaluation doesn't crash inside the docker
+# build context where the worktree's `.git` pointer references a non-existent host path.
 docker_repo := "localhost/restatedev/restate"
-docker_tag := if path_exists(justfile_directory() / ".git") == "true" {
-        `git rev-parse --abbrev-ref HEAD | sed 's|/|.|g'` + "." + `git rev-parse --short HEAD`
-    } else {
-        "unknown"
-    }
+docker_tag := ```
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "$(git rev-parse --abbrev-ref HEAD | sed 's|/|.|g').$(git rev-parse --short HEAD)"
+    elif command -v sl >/dev/null 2>&1 && sl root >/dev/null 2>&1; then
+        bookmark="$(sl log -r . -T '{activebookmark}' 2>/dev/null | sed 's|/|.|g')"
+        hash="$(sl log -r . -T '{node|short}' 2>/dev/null)"
+        if [ -n "$bookmark" ]; then echo "$bookmark.$hash"; else echo "$hash"; fi
+    else
+        echo unknown
+    fi
+    ```
 docker_image := docker_repo + ":" + docker_tag
 
 features := ""
 libc := "gnu"
 arch := "" # use the default architecture
 os := "" # use the default os
+profile := "release" # cargo profile used by the `docker` recipe
 
 _features := if features == "all" {
         "--all-features"
@@ -124,26 +135,26 @@ chef-prepare:
 
 # Compile dependencies
 chef-cook *flags: (_target-installed target)
-    cargo chef cook --recipe-path recipe.json {{ _target-option }} {{ _features }} {{ flags }}
+    cargo chef cook --recipe-path recipe.json {{ _target-option }} {{ _features }} "$@"
 
 build *flags: (_target-installed target)
-    cargo build {{ _target-option }} {{ _features }} {{ flags }}
+    cargo build {{ _target-option }} {{ _features }} "$@"
 
 build-tools *flags: (_target-installed target)
-    cd {{justfile_directory()}}/tools/xtask; cargo build {{ _target-option }} {{ _features }} {{ flags }}
-    cd {{justfile_directory()}}/tools/service-protocol-wireshark-dissector; cargo build {{ _target-option }} {{ _features }} {{ flags }}
+    cd {{justfile_directory()}}/tools/xtask; cargo build {{ _target-option }} {{ _features }} "$@"
+    cd {{justfile_directory()}}/tools/service-protocol-wireshark-dissector; cargo build {{ _target-option }} {{ _features }} "$@"
 
 # Might be able to use cross-rs at some point but for now it could not handle a container image that
 # has a rust toolchain installed. Alternatively, we can create a separate cross-rs builder image.
 cross-build *flags:
     #!/usr/bin/env bash
     if [[ {{ target }} =~ "linux" ]]; then
-      docker run --rm -it -v `pwd`:/restate:Z -w /restate {{ dev_tools_image }} just _resolved_target={{ target }} features={{ features }} build {{ flags }}
+      docker run --rm -it -v `pwd`:/restate:Z -w /restate {{ dev_tools_image }} just _resolved_target={{ target }} features={{ features }} build "$@"
     elif [[ {{ target }} =~ "darwin" ]]; then
       if [[ {{ os() }} != "macos" ]]; then
         echo "Cannot built macos target on non-macos host";
       else
-        just _resolved_target={{ target }} features={{ features }} build {{ flags }};
+        just _resolved_target={{ target }} features={{ features }} build "$@";
       fi
     else
       echo "Unsupported target: {{ target }}";
@@ -153,15 +164,15 @@ print-target:
     @echo {{ _resolved_target }}
 
 run *flags: (_target-installed target)
-    cargo run {{ _target-option }} {{ flags }}
+    cargo run {{ _target-option }} "$@"
 
 test: (_target-installed target)
     # remove possible old test ports
     rm -rf {{RESTATE_TEST_PORTS_POOL}}
-    cargo nextest run {{ _target-option }} {{ _test_features }} --target-dir target/tests
+    cargo nextest run {{ _target-option }} {{ _test_features }}
 
 test-package package *flags:
-    cargo nextest run {{ _test_features }} --no-capture --package {{ package }} --target-dir target/tests {{ flags }}
+    shift && cargo nextest run {{ _test_features }} --no-capture --package {{ package }} "$@"
 
 doctest:
     cargo test --doc
@@ -211,19 +222,30 @@ windows-dep-guard:
 
 docker:
     # podman builds do not work without --platform set, even though it claims to default to host arch
-    docker buildx build . --platform linux/{{ _docker_arch }} --file docker/Dockerfile --tag={{ docker_image }} --progress='{{ DOCKER_PROGRESS }}' --build-arg RESTATE_FEATURES={{ features }} --load
+    docker buildx build . --platform linux/{{ _docker_arch }} --file docker/Dockerfile --tag={{ docker_image }} --progress='{{ DOCKER_PROGRESS }}' --build-arg RESTATE_FEATURES={{ features }} --build-arg CARGO_PROFILE={{ profile }} --load
 
 docker-debug:
     # podman builds do not work without --platform set, even though it claims to default to host arch
     docker buildx build . --platform linux/{{ _docker_arch }} --file docker/debug.Dockerfile --tag={{ docker_image }} --progress='{{ DOCKER_PROGRESS }}' --build-arg RESTATE_FEATURES={{ features }} --load
 
-docker-local-fedora:
+[arg("profile", long)]
+docker-local-fedora profile="dev":
+    #!/usr/bin/env bash
+    set -euo pipefail
     # Build the restate-server binary locally
-    just arch={{ _arch }} features={{ features }} build -p restate-server
-    # Move the binary to the location expected by the Dockerfile
-    cp target/debug/restate-server restate-server
+    just arch={{ _arch }} features={{ features }} build --profile="$1" -p restate-server
+    # Stage the binary in a temp dir inside the build context.
+    # Hard-link to avoid copying the (large) binary.
+    mkdir -p ./.docker-local-cache
+    trap 'rm -rf "./.docker-local-cache"' EXIT
+    case "$1" in
+      dev|test) profile_dir=debug ;;
+      release|bench) profile_dir=release ;;
+      *) profile_dir="$1" ;;
+    esac
+    cp -l "target/$profile_dir/restate-server" "./.docker-local-cache/restate-server" 2>/dev/null || cp "target/$profile_dir/restate-server" "./.docker-local-cache/restate-server"
     # Build the Docker image using the local.Dockerfile
-    docker buildx build . --platform linux/{{ _docker_arch }} --file docker/local-fedora.Dockerfile --tag={{ docker_image }} --progress='{{ DOCKER_PROGRESS }}' --load
+    docker buildx build . --platform linux/{{ _docker_arch }} --file docker/local-fedora.Dockerfile --build-arg RESTATE_BINARY_PATH="./.docker-local-cache/restate-server" --tag={{ docker_image }} --progress='{{ DOCKER_PROGRESS }}' --load
 
 notice-file:
     cargo license -d -a --avoid-build-deps --avoid-dev-deps {{ _features }} | (echo "Restate Runtime\nCopyright (c) 2023 - 2026 Restate Software, Inc., Restate GmbH <code@restate.dev>\n" && cat) > NOTICE
@@ -239,10 +261,10 @@ check-deny:
     fi
 
 flamegraph *flags:
-    cargo flamegraph {{ _flamegraph_options }} {{ flags }}
+    cargo flamegraph {{ _flamegraph_options }} "$@"
 
 udeps *flags:
-    RUSTC_BOOTSTRAP=1 cargo udeps --all-features --all-targets {{ flags }}
+    RUSTC_BOOTSTRAP=1 cargo udeps --all-features --all-targets "$@"
 
 _target-installed target:
     #!/usr/bin/env bash

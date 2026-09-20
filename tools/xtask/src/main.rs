@@ -22,15 +22,16 @@ use restate_admin::service::AdminService;
 use restate_core::partitions::PartitionRouting;
 use restate_core::{TaskCenter, TaskCenterBuilder, TestCoreEnv};
 use restate_core::{TaskCenterFutureExt, TaskKind};
-use restate_ingestion_client::IngestionClient;
+use restate_ingestion_client::{IngestionClient, SessionOptions};
 use restate_service_client::{AssumeRoleCacheMode, ServiceClient};
-use restate_service_protocol::discovery::ServiceDiscovery;
+use restate_service_protocol_v4::discovery::ServiceDiscovery;
+use restate_service_protocol_v4::serdes::SerdesClient;
 use restate_storage_query_datafusion::table_docs;
 use restate_types::config::Configuration;
-use restate_types::identifiers::{InvocationId, PartitionProcessorRpcRequestId, SubscriptionId};
+use restate_types::identifiers::{InvocationId, PartitionProcessorRpcRequestId};
 use restate_types::invocation::client::{
     AttachInvocationResponse, CancelInvocationResponse, GetInvocationOutputResponse,
-    InvocationClient, InvocationClientError, InvocationOutput, KillInvocationResponse,
+    GetInvocationStatusResponse, InvocationClient, InvocationOutput, KillInvocationResponse,
     PatchDeploymentId, PauseInvocationResponse, PurgeInvocationResponse,
     RestartAsNewInvocationResponse, ResumeInvocationResponse, SubmittedInvocationNotification,
 };
@@ -40,8 +41,10 @@ use restate_types::invocation::{
 use restate_types::journal_v2::{EntryIndex, Signal};
 use restate_types::live::Constant;
 use restate_types::net::listener::Listeners;
+use restate_types::partition_processor::client::PartitionProcessorClientError;
 use restate_types::partitions::state::PartitionReplicaSetStates;
 use restate_types::retries::RetryPolicy;
+use restate_types::schema::kafka::KafkaCluster;
 use restate_types::schema::subscriptions::Subscription;
 use restate_types::state_mut::ExternalStateMutation;
 use restate_worker::SubscriptionController;
@@ -86,15 +89,11 @@ impl WorkerHandle for Mock {
 }
 
 impl SubscriptionController for Mock {
-    async fn start_subscription(&self, _: Subscription) -> Result<(), WorkerHandleError> {
-        Ok(())
-    }
-
-    async fn stop_subscription(&self, _: SubscriptionId) -> Result<(), WorkerHandleError> {
-        Ok(())
-    }
-
-    async fn update_subscriptions(&self, _: Vec<Subscription>) -> Result<(), WorkerHandleError> {
+    async fn update_subscriptions(
+        &self,
+        _: Vec<KafkaCluster>,
+        _: Vec<Subscription>,
+    ) -> Result<(), WorkerHandleError> {
         Ok(())
     }
 }
@@ -104,8 +103,8 @@ impl InvocationClient for Mock {
         &self,
         _: PartitionProcessorRpcRequestId,
         _: Arc<InvocationRequest>,
-    ) -> impl Future<Output = Result<SubmittedInvocationNotification, InvocationClientError>> + Send
-    {
+    ) -> impl Future<Output = Result<SubmittedInvocationNotification, PartitionProcessorClientError>>
+    + Send {
         pending()
     }
 
@@ -113,7 +112,7 @@ impl InvocationClient for Mock {
         &self,
         _: PartitionProcessorRpcRequestId,
         _: Arc<InvocationRequest>,
-    ) -> impl Future<Output = Result<InvocationOutput, InvocationClientError>> + Send {
+    ) -> impl Future<Output = Result<InvocationOutput, PartitionProcessorClientError>> + Send {
         pending()
     }
 
@@ -121,7 +120,8 @@ impl InvocationClient for Mock {
         &self,
         _: PartitionProcessorRpcRequestId,
         _: InvocationQuery,
-    ) -> impl Future<Output = Result<AttachInvocationResponse, InvocationClientError>> + Send {
+    ) -> impl Future<Output = Result<AttachInvocationResponse, PartitionProcessorClientError>> + Send
+    {
         pending()
     }
 
@@ -129,7 +129,16 @@ impl InvocationClient for Mock {
         &self,
         _: PartitionProcessorRpcRequestId,
         _: InvocationQuery,
-    ) -> impl Future<Output = Result<GetInvocationOutputResponse, InvocationClientError>> + Send
+    ) -> impl Future<Output = Result<GetInvocationOutputResponse, PartitionProcessorClientError>> + Send
+    {
+        pending()
+    }
+
+    fn get_invocation_status(
+        &self,
+        _: PartitionProcessorRpcRequestId,
+        _: InvocationId,
+    ) -> impl Future<Output = Result<GetInvocationStatusResponse, PartitionProcessorClientError>> + Send
     {
         pending()
     }
@@ -138,7 +147,7 @@ impl InvocationClient for Mock {
         &self,
         _: PartitionProcessorRpcRequestId,
         _: InvocationResponse,
-    ) -> impl Future<Output = Result<(), InvocationClientError>> + Send {
+    ) -> impl Future<Output = Result<(), PartitionProcessorClientError>> + Send {
         pending()
     }
 
@@ -147,7 +156,7 @@ impl InvocationClient for Mock {
         _: PartitionProcessorRpcRequestId,
         _: InvocationId,
         _: Signal,
-    ) -> impl Future<Output = Result<(), InvocationClientError>> + Send {
+    ) -> impl Future<Output = Result<(), PartitionProcessorClientError>> + Send {
         pending()
     }
 
@@ -155,7 +164,8 @@ impl InvocationClient for Mock {
         &self,
         _: PartitionProcessorRpcRequestId,
         _: InvocationId,
-    ) -> impl Future<Output = Result<CancelInvocationResponse, InvocationClientError>> + Send {
+    ) -> impl Future<Output = Result<CancelInvocationResponse, PartitionProcessorClientError>> + Send
+    {
         pending()
     }
 
@@ -163,7 +173,8 @@ impl InvocationClient for Mock {
         &self,
         _: PartitionProcessorRpcRequestId,
         _: InvocationId,
-    ) -> impl Future<Output = Result<KillInvocationResponse, InvocationClientError>> + Send {
+    ) -> impl Future<Output = Result<KillInvocationResponse, PartitionProcessorClientError>> + Send
+    {
         pending()
     }
 
@@ -171,7 +182,8 @@ impl InvocationClient for Mock {
         &self,
         _: PartitionProcessorRpcRequestId,
         _: InvocationId,
-    ) -> impl Future<Output = Result<PurgeInvocationResponse, InvocationClientError>> + Send {
+    ) -> impl Future<Output = Result<PurgeInvocationResponse, PartitionProcessorClientError>> + Send
+    {
         pending()
     }
 
@@ -179,7 +191,8 @@ impl InvocationClient for Mock {
         &self,
         _: PartitionProcessorRpcRequestId,
         _: InvocationId,
-    ) -> impl Future<Output = Result<PurgeInvocationResponse, InvocationClientError>> + Send {
+    ) -> impl Future<Output = Result<PurgeInvocationResponse, PartitionProcessorClientError>> + Send
+    {
         pending()
     }
 
@@ -189,7 +202,7 @@ impl InvocationClient for Mock {
         _: InvocationId,
         _: EntryIndex,
         _: PatchDeploymentId,
-    ) -> impl Future<Output = Result<RestartAsNewInvocationResponse, InvocationClientError>> + Send
+    ) -> impl Future<Output = Result<RestartAsNewInvocationResponse, PartitionProcessorClientError>> + Send
     {
         pending()
     }
@@ -199,7 +212,8 @@ impl InvocationClient for Mock {
         _: PartitionProcessorRpcRequestId,
         _: InvocationId,
         _: PatchDeploymentId,
-    ) -> impl Future<Output = Result<ResumeInvocationResponse, InvocationClientError>> + Send {
+    ) -> impl Future<Output = Result<ResumeInvocationResponse, PartitionProcessorClientError>> + Send
+    {
         pending()
     }
 
@@ -207,7 +221,8 @@ impl InvocationClient for Mock {
         &self,
         _: PartitionProcessorRpcRequestId,
         _: InvocationId,
-    ) -> impl Future<Output = Result<PauseInvocationResponse, InvocationClientError>> + Send {
+    ) -> impl Future<Output = Result<PauseInvocationResponse, PartitionProcessorClientError>> + Send
+    {
         pending()
     }
 }
@@ -223,21 +238,23 @@ async fn generate_rest_api_doc() -> anyhow::Result<()> {
         node_env.metadata.updateable_partition_table(),
         PartitionRouting::new(PartitionReplicaSetStates::default(), TaskCenter::current()),
         NonZeroUsize::new(1000).unwrap(),
-        None,
+        SessionOptions::default(),
     );
 
     let socket_dir = tempfile::tempdir()?;
     let socket_path = socket_dir.path().join("admin.sock");
+    let service_client = ServiceClient::from_options(
+        &config.worker.invoker.service_client,
+        AssumeRoleCacheMode::None,
+    )
+    .unwrap();
     let admin_service = AdminService::new(
         Listeners::new_unix_listener(socket_path.clone())?,
         node_env.metadata_writer.clone(),
         ingress_client,
         Mock,
-        ServiceDiscovery::new(
-            RetryPolicy::default(),
-            ServiceClient::from_options(&config.common.service_client, AssumeRoleCacheMode::None)
-                .unwrap(),
-        ),
+        SerdesClient::new(service_client.clone()),
+        ServiceDiscovery::new(RetryPolicy::default(), service_client),
         None,
     );
 

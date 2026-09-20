@@ -8,13 +8,13 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use restate_serde_util::NonZeroByteCount;
-use restate_time_util::FriendlyDuration;
+use restate_util_bytecount::NonZeroByteCount;
+use restate_util_time::FriendlyDuration;
 
 #[serde_as]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, derive_builder::Builder, PartialEq)]
@@ -39,25 +39,11 @@ pub struct RocksDbOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     rocksdb_disable_direct_io_for_flush_and_compactions: Option<bool>,
 
-    /// # Disable WAL
-    ///
-    /// The default depends on the different rocksdb use-cases at Restate.
-    ///
-    /// Supports hot-reloading (Partial / Bifrost only)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rocksdb_disable_wal: Option<bool>,
-
     /// Disable rocksdb statistics collection
     ///
     /// Default: False (statistics enabled)
     #[serde(skip_serializing_if = "Option::is_none")]
     rocksdb_disable_statistics: Option<bool>,
-
-    /// # RocksDB max background jobs (flushes and compactions)
-    ///
-    /// Default: the number of CPU cores on this node.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rocksdb_max_background_jobs: Option<NonZeroU32>,
 
     /// # RocksDB compaction readahead size in bytes
     ///
@@ -128,6 +114,27 @@ pub struct RocksDbOptions {
     #[serde_as(as = "Option<NonZeroByteCount>")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<NonZeroByteCount>"))]
     rocksdb_block_size: Option<NonZeroUsize>,
+
+    /// # Disable WAL compression
+    ///
+    /// When false (the default), the Write-Ahead Log is compressed with Zstd.
+    /// Set to true to disable WAL compression. Only applies when WAL is enabled.
+    ///
+    /// Default: false (WAL compression enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rocksdb_disable_wal_compression: Option<bool>,
+
+    /// # Disable L0/L1 SST compression
+    ///
+    /// When false (the default), L0 and L1 SST files are compressed with Lz4.
+    /// Higher levels (L2+) always use Zstd regardless of this setting.
+    /// Set to true to disable compression for L0/L1, which can improve write
+    /// throughput at the cost of higher disk usage since these files are
+    /// short-lived and frequently compacted.
+    ///
+    /// Default: false (L0/L1 compression enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rocksdb_disable_l0_l1_compression: Option<bool>,
 }
 
 /// Verbosity of the LOG.
@@ -159,14 +166,8 @@ impl RocksDbOptions {
             self.rocksdb_disable_direct_io_for_flush_and_compactions =
                 Some(common.rocksdb_disable_direct_io_for_flush_and_compaction());
         }
-        if self.rocksdb_disable_wal.is_none() {
-            self.rocksdb_disable_wal = Some(common.rocksdb_disable_wal());
-        }
         if self.rocksdb_disable_statistics.is_none() {
             self.rocksdb_disable_statistics = Some(common.rocksdb_disable_statistics());
-        }
-        if self.rocksdb_max_background_jobs.is_none() {
-            self.rocksdb_max_background_jobs = Some(common.rocksdb_max_background_jobs());
         }
         if self.rocksdb_compaction_readahead_size.is_none() {
             self.rocksdb_compaction_readahead_size =
@@ -193,10 +194,13 @@ impl RocksDbOptions {
         if self.rocksdb_block_size.is_none() {
             self.rocksdb_block_size = Some(common.rocksdb_block_size());
         }
-    }
-
-    pub fn rocksdb_disable_wal(&self) -> bool {
-        self.rocksdb_disable_wal.unwrap_or(false)
+        if self.rocksdb_disable_wal_compression.is_none() {
+            self.rocksdb_disable_wal_compression = Some(common.rocksdb_disable_wal_compression());
+        }
+        if self.rocksdb_disable_l0_l1_compression.is_none() {
+            self.rocksdb_disable_l0_l1_compression =
+                Some(common.rocksdb_disable_l0_l1_compression());
+        }
     }
 
     pub fn rocksdb_disable_direct_io_for_reads(&self) -> bool {
@@ -210,15 +214,6 @@ impl RocksDbOptions {
 
     pub fn rocksdb_disable_statistics(&self) -> bool {
         self.rocksdb_disable_statistics.unwrap_or(false)
-    }
-
-    pub fn rocksdb_max_background_jobs(&self) -> NonZeroU32 {
-        self.rocksdb_max_background_jobs.unwrap_or(
-            std::thread::available_parallelism()
-                .unwrap_or(NonZeroUsize::new(2).unwrap())
-                .try_into()
-                .expect("number of cpu cores fits in u32"),
-        )
     }
 
     pub fn rocksdb_compaction_readahead_size(&self) -> NonZeroUsize {
@@ -257,6 +252,14 @@ impl RocksDbOptions {
     pub fn rocksdb_block_size(&self) -> NonZeroUsize {
         self.rocksdb_block_size
             .unwrap_or(NonZeroUsize::new(64 * 1024).unwrap())
+    }
+
+    pub fn rocksdb_disable_wal_compression(&self) -> bool {
+        self.rocksdb_disable_wal_compression.unwrap_or(false)
+    }
+
+    pub fn rocksdb_disable_l0_l1_compression(&self) -> bool {
+        self.rocksdb_disable_l0_l1_compression.unwrap_or(false)
     }
 }
 

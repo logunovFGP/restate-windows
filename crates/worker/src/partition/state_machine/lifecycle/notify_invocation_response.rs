@@ -8,6 +8,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use crate::partition::processor::ProcessorContext;
 use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext, entries};
 use restate_storage_api::fsm_table::WriteFsmTable;
 use restate_storage_api::invocation_status_table::{
@@ -15,6 +16,7 @@ use restate_storage_api::invocation_status_table::{
 };
 use restate_storage_api::journal_table as journal_table_v1;
 use restate_storage_api::journal_table_v2;
+use restate_storage_api::lock_table::WriteLockTable;
 use restate_storage_api::outbox_table::WriteOutboxTable;
 use restate_storage_api::promise_table::{ReadPromiseTable, WritePromiseTable};
 use restate_storage_api::state_table::{ReadStateTable, WriteStateTable};
@@ -38,7 +40,7 @@ pub struct OnNotifyInvocationResponse {
     pub result: ResponseResult,
 }
 
-impl<'ctx, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'ctx, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for OnNotifyInvocationResponse
 where
     S: journal_table_v1::WriteJournalTable
@@ -55,9 +57,11 @@ where
         + WriteStateTable
         + WriteOutboxTable
         + WriteVQueueTable
+        + WriteLockTable
         + ReadVQueueTable,
+    P: ProcessorContext,
 {
-    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
+    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S, P>) -> Result<(), Error> {
         let OnNotifyInvocationResponse {
             invocation_id,
             status,
@@ -167,9 +171,9 @@ mod tests {
     };
     use restate_types::journal_v2::EntryMetadata;
     use restate_types::journal_v2::{
-        CallCommand, CallInvocationIdCompletion, CallRequest, Entry, EntryType,
+        CallCommand, CallInvocationIdCompletion, CallRequest, Entry, EntryType, NotificationId,
     };
-    use restate_wal_protocol::Command;
+    use restate_wal_protocol::v2::{Command, commands};
 
     #[restate_core::test]
     async fn reply_to_call_with_failure_and_metadata() {
@@ -195,7 +199,7 @@ mod tests {
         let actions = test_env
             .apply_multiple([
                 fixtures::invoker_entry_effect(invocation_id, call_command.clone()),
-                Command::InvocationResponse(InvocationResponse {
+                commands::InvocationResponseCommand::test_envelope(InvocationResponse {
                     target: JournalCompletionTarget::from_parts(
                         invocation_id,
                         result_completion_id,
@@ -218,11 +222,13 @@ mod tests {
             all![
                 contains(matchers::actions::forward_notification(
                     invocation_id,
-                    call_invocation_id_completion.clone()
+                    2,
+                    NotificationId::CompletionId(invocation_id_completion_id),
                 )),
                 contains(matchers::actions::forward_notification(
                     invocation_id,
-                    call_completion.clone()
+                    3,
+                    NotificationId::CompletionId(result_completion_id),
                 ))
             ]
         );

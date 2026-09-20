@@ -8,20 +8,21 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use ulid::Ulid;
 
-use restate_core::network::{ServiceMessage, Verdict};
-use restate_invoker_impl::ChannelStatusReader;
-use restate_types::cluster::cluster_state::{PartitionProcessorStatus, ReplayStatus, RunMode};
-use restate_types::identifiers::{LeaderEpoch, PartitionKey};
+use restate_core::network::ShardSender;
+use restate_types::cluster::cluster_state::{
+    BrokenReason, PartitionProcessorStatus, ReplayStatus, RunMode,
+};
+use restate_types::identifiers::LeaderEpoch;
 use restate_types::net::partition_processor::PartitionLeaderService;
+use restate_types::sharding::KeyRange;
+use restate_types::time::MillisSinceEpoch;
 
 use crate::partition::{LeadershipInfo, TargetLeaderState};
 
@@ -50,6 +51,13 @@ pub enum ProcessorState {
     Stopping {
         processor: Option<StartedProcessor>,
     },
+    /// The processor hit a failure that retrying cannot resolve, so this node gave up on
+    /// running it. There is no runtime task backing this state; it is only cleared by an
+    /// operator action (see `restatectl`) or by losing membership of the partition.
+    Broken {
+        reason: BrokenReason,
+        since: MillisSinceEpoch,
+    },
 }
 
 impl ProcessorState {
@@ -59,6 +67,17 @@ impl ProcessorState {
             start_time: Instant::now(),
             delay,
         }
+    }
+
+    pub fn broken(reason: BrokenReason) -> Self {
+        Self::Broken {
+            reason,
+            since: MillisSinceEpoch::now(),
+        }
+    }
+
+    pub fn is_broken(&self) -> bool {
+        matches!(self, ProcessorState::Broken { .. })
     }
 
     pub fn stopping(processor: StartedProcessor) -> Self {
@@ -96,6 +115,11 @@ impl ProcessorState {
             ProcessorState::Stopping { .. } => {
                 // already stopping
             }
+            ProcessorState::Broken { .. } => {
+                // Nothing to stop; there is no runtime task that would report back a
+                // `Stopped` event. Callers that want to get rid of a broken processor must
+                // drop the state instead of waiting for it to terminate.
+            }
         };
     }
 
@@ -126,6 +150,9 @@ impl ProcessorState {
             }
             ProcessorState::Stopping { .. } => {
                 // we first need to stop before we check whether we should run again
+            }
+            ProcessorState::Broken { .. } => {
+                // a broken processor cannot run in any mode
             }
         }
     }
@@ -179,6 +206,10 @@ impl ProcessorState {
             }
             ProcessorState::Stopping { .. } => {
                 // we first need to stop before we check whether we should run again
+                None
+            }
+            ProcessorState::Broken { .. } => {
+                debug!("Ignoring leadership request for a broken partition processor.");
                 None
             }
         }
@@ -236,6 +267,9 @@ impl ProcessorState {
             ProcessorState::Stopping { .. } => {
                 debug!("Received leader epoch while stopping partition processor. Ignoring.");
             }
+            ProcessorState::Broken { .. } => {
+                debug!("Received leader epoch for a broken partition processor. Ignoring.");
+            }
         }
     }
 
@@ -245,7 +279,7 @@ impl ProcessorState {
             ProcessorState::Started { leader_state, .. } => {
                 matches!(leader_state, LeaderState::AwaitingLeaderEpoch(token) if *token == leader_epoch_token)
             }
-            ProcessorState::Stopping { .. } => false,
+            ProcessorState::Stopping { .. } | ProcessorState::Broken { .. } => false,
         }
     }
 
@@ -303,21 +337,13 @@ impl ProcessorState {
                 // todo report stopping status back to the cluster controller
                 None
             }
-        }
-    }
-
-    pub fn try_send_rpc(&self, msg: ServiceMessage<PartitionLeaderService>) {
-        match self {
-            ProcessorState::Starting { .. } => msg.fail(Verdict::LoadShedding),
-            ProcessorState::Started { processor, .. } => {
-                if let Err(err) = processor.as_ref().expect("must be some").try_send_rpc(msg) {
-                    match err {
-                        TrySendError::Full(msg) => msg.fail(Verdict::LoadShedding),
-                        TrySendError::Closed(msg) => msg.fail(Verdict::SortCodeNotFound),
-                    }
-                }
-            }
-            ProcessorState::Stopping { .. } => msg.fail(Verdict::SortCodeNotFound),
+            ProcessorState::Broken { reason, since } => Some(PartitionProcessorStatus {
+                broken_reason: *reason,
+                // report when we gave up rather than "now", so that operators can see how
+                // long the partition has been sitting broken.
+                updated_at: *since,
+                ..Default::default()
+            }),
         }
     }
 
@@ -341,28 +367,25 @@ impl ProcessorState {
 #[derive(Debug)]
 pub struct StartedProcessor {
     cancellation_token: CancellationToken,
-    key_range: RangeInclusive<PartitionKey>,
+    key_range: KeyRange,
     control_tx: watch::Sender<TargetLeaderState>,
-    status_reader: ChannelStatusReader,
-    network_svc_tx: mpsc::Sender<ServiceMessage<PartitionLeaderService>>,
+    rpc_shard_tx: ShardSender<PartitionLeaderService>,
     watch_rx: watch::Receiver<PartitionProcessorStatus>,
 }
 
 impl StartedProcessor {
     pub fn new(
         cancellation_token: CancellationToken,
-        key_range: RangeInclusive<PartitionKey>,
+        key_range: KeyRange,
         control_tx: watch::Sender<TargetLeaderState>,
-        status_reader: ChannelStatusReader,
-        network_svc_tx: mpsc::Sender<ServiceMessage<PartitionLeaderService>>,
+        rpc_shard_tx: ShardSender<PartitionLeaderService>,
         watch_rx: watch::Receiver<PartitionProcessorStatus>,
     ) -> Self {
         Self {
             cancellation_token,
             key_range,
             control_tx,
-            status_reader,
-            network_svc_tx,
+            rpc_shard_tx,
             watch_rx,
         }
     }
@@ -405,20 +428,11 @@ impl StartedProcessor {
     }
 
     #[inline]
-    pub fn key_range(&self) -> &RangeInclusive<PartitionKey> {
-        &self.key_range
+    pub fn key_range(&self) -> KeyRange {
+        self.key_range
     }
 
-    #[inline]
-    pub fn invoker_status_reader(&self) -> &ChannelStatusReader {
-        &self.status_reader
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn try_send_rpc(
-        &self,
-        msg: ServiceMessage<PartitionLeaderService>,
-    ) -> Result<(), TrySendError<ServiceMessage<PartitionLeaderService>>> {
-        self.network_svc_tx.try_send(msg)
+    pub fn rpc_shard_sender(&self) -> ShardSender<PartitionLeaderService> {
+        self.rpc_shard_tx.clone()
     }
 }

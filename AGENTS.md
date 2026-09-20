@@ -50,6 +50,9 @@ If these rules conflict with normal behavior, always follow the rules above.
 1. Maintenance of unit-tests is an overhead we need to keep in check. When adding new tests, focus on high-signal tests and the most important paths instead of full coverage. For any given test, try and cover more than one assertion to reduce verbosity and the total number of test functions.
 1. Check release-notes/README.md and make sure to propose changes to release-notes/unreleased/ if needed. This is of paramount importance if you are making changes that break existing behavior or change current behavior in a way that require cooperation from our service users.
 1. Check crates/cli-util/README.md when doing CLI changes to make sure that you are adhering to the CLI style guide.
+1. New or deprecated config options must have `/// Since vX.Y.Z` in their doc comment.
+1. Use `ByteCount::from(value)` (from `restate_memory`) when displaying byte sizes in errors/logs.
+1. Use `KeyRange` (from `restate_sharding`, re-exported via `restate_types::sharding::KeyRange`) instead of `std::ops::RangeInclusive<PartitionKey>` for partition key ranges. `KeyRange` is `Copy`, 16 bytes (vs 24), and has wire-compatible serde/bilrost encoding.
 
 
 # Validation Before Committing Changes
@@ -58,8 +61,9 @@ After making code changes, always run the following validation steps before comm
 1. **Build check**: Run `cargo check` to ensure the code compiles without errors.
 2. **Run tests**: Run `cargo nextest run --all-features` to ensure all tests pass.
 3. **Format check** (if you modified Rust files): Run `cargo fmt --all -- --check` to verify formatting.
-4. **Lint check** (if you modified Rust files): Run `cargo clippy --all-features --workspace -- -D warnings` to check for lint warnings.
+4. **Lint check** (if you modified Rust files): Run `cargo clippy --all-features --all-targets --workspace -- -D warnings` to check for lint warnings.
 5. **Deny check** (if you modified Cargo.toml or Cargo.lock): Run `cargo deny --all-features check` to check for license and security issues.
+6. If you are making changes to Cargo.toml files, make sure to also regenerate workspace-hack (cargo hakari generate)
 
 When renaming or changing trait methods, function signatures, or public APIs, search the entire codebase
 for all usages to ensure they are all updated consistently. Use `grep`, `rg`, or similar tools to find all
@@ -75,6 +79,9 @@ propose to write a micro-benchmark with Criterion to help guide the user's decis
 However, to make sure our priorities are clear. The priority should always for correctness before considering performance.
 
 Be extra careful when making changes to the latency critical paths of the system. Primarily, Bifrost, the networking layer, restate-core, the partition-processor state machine, and the invoker.
+
+# Benchmarking Tools
+- **`tools/logserver-bench`** — A standalone benchmark tool for the log-server's RocksDB storage layer. Use it to measure write throughput, mixed read/write/trim workloads, and to validate that log-server changes don't regress performance. See `tools/logserver-bench/README.md` for usage details.
 
 # Branching
 

@@ -8,21 +8,28 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::num::NonZeroU32;
+
 use rocksdb::{BlockBasedOptions, Cache, WriteBufferManager};
 
 use restate_types::config::{RocksDbLogLevel, RocksDbOptions, StatisticsLevel};
 
 use crate::logging::LoggingEventListener;
-use crate::{DbName, RocksAccess};
+use crate::{DbName, OpenMode, RocksAccess};
 
 /// A trait for customizing database options when it's being opened and enables live reaction to
 /// configuration changes.
 pub trait DbConfigurator {
+    fn get_db_open_mode(&self) -> OpenMode {
+        OpenMode::ReadWrite
+    }
+
     fn get_db_options(
         &self,
         db_name: &DbName,
         env: &rocksdb::Env,
         write_buffer_manager: &rocksdb::WriteBufferManager,
+        limiter: &rocksdb::RateLimiter,
     ) -> rocksdb::Options;
 
     fn apply_db_opts_from_config(
@@ -30,18 +37,12 @@ pub trait DbConfigurator {
         db_options: &mut rocksdb::Options,
         config: &RocksDbOptions,
     ) {
-        db_options.set_max_background_jobs(config.rocksdb_max_background_jobs().get() as i32);
         if !config.rocksdb_disable_statistics() {
             db_options.enable_statistics();
             db_options
                 .set_statistics_level(convert_statistics_level(config.rocksdb_statistics_level()));
         }
 
-        // no need to retain 1000 log files by default.
-        if !config.rocksdb_disable_wal() {
-            // RocksDB does not support recycling wal log files if wal is disabled when writing
-            db_options.set_recycle_log_file_num(4);
-        }
         db_options.set_compaction_readahead_size(config.rocksdb_compaction_readahead_size().get());
 
         // Use Direct I/O for reads, do not use OS page cache to cache compressed blocks.
@@ -60,28 +61,27 @@ pub trait DbConfigurator {
     fn note_config_update(&self, _db: &RocksAccess) {}
 }
 
+pub fn create_empty_db_options(db_name: DbName) -> rocksdb::Options {
+    let mut db_options = rocksdb::Options::default();
+    db_options.add_event_listener(LoggingEventListener::new(db_name));
+    db_options
+}
+
 pub fn create_default_db_options(
     env: &rocksdb::Env,
     db_name: &DbName,
-    create_db_if_missing: bool,
     write_buffer_manager: &rocksdb::WriteBufferManager,
+    limiter: &rocksdb::RateLimiter,
 ) -> rocksdb::Options {
     let mut db_options = rocksdb::Options::default();
     db_options.set_env(env);
-    if create_db_if_missing {
-        db_options.create_if_missing(true);
-    }
+    db_options.set_shared_ratelimiter(limiter);
+    db_options.create_if_missing(true);
     db_options.create_missing_column_families(true);
     // write buffer is controlled by write buffer manager
     db_options.set_write_buffer_manager(write_buffer_manager);
     db_options.set_avoid_unnecessary_blocking_io(true);
-    // Disable WAL archiving.
-    // the following two options has to be both 0 to disable WAL log archive.
-    db_options.set_wal_size_limit_mb(0);
-    db_options.set_wal_ttl_seconds(0);
-    //
     // Let rocksdb decide for level sizes.
-    //
     db_options.set_level_compaction_dynamic_level_bytes(true);
     //
     // [Not important setting, consider removing], allows to shard compressed
@@ -153,6 +153,25 @@ pub trait CfConfigurator {
     ) -> rocksdb::Options;
 }
 
+/// Sets the background flush and compaction concurrency for a database.
+///
+/// We intentionally use the deprecated `set_max_background_flushes` and
+/// `set_max_background_compactions` instead of the combined `set_max_background_jobs` to get
+/// precise control over how many slots are allocated to flushes vs compactions. When either of
+/// these deprecated options is set, RocksDB ignores `max_background_jobs` for the split
+/// calculation and uses the explicit values directly.
+pub fn set_background_work_budget(
+    db_options: &mut rocksdb::Options,
+    max_background_flushes: NonZeroU32,
+    max_background_compactions: NonZeroU32,
+) {
+    #[allow(deprecated)]
+    {
+        db_options.set_max_background_flushes(max_background_flushes.get() as i32);
+        db_options.set_max_background_compactions(max_background_compactions.get() as i32);
+    }
+}
+
 pub fn convert_statistics_level(input: StatisticsLevel) -> rocksdb::statistics::StatsLevel {
     use rocksdb::statistics::StatsLevel;
     match input {
@@ -175,4 +194,23 @@ pub fn convert_log_level(input: RocksDbLogLevel) -> rocksdb::LogLevel {
         RocksDbLogLevel::Info => LogLevel::Info,
         RocksDbLogLevel::Warn => LogLevel::Warn,
     }
+}
+
+/// Builds a per-level compression array for `num_levels` levels.
+///
+/// L0 and L1 use `l0_l1_compression`, remaining levels use `upper_compression`.
+pub fn build_compression_per_level(
+    num_levels: usize,
+    l0_l1_compression: rocksdb::DBCompressionType,
+    upper_compression: rocksdb::DBCompressionType,
+) -> Vec<rocksdb::DBCompressionType> {
+    (0..num_levels)
+        .map(|level| {
+            if level <= 1 {
+                l0_l1_compression
+            } else {
+                upper_compression
+            }
+        })
+        .collect()
 }

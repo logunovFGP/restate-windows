@@ -9,18 +9,17 @@
 // by the Apache License, Version 2.0.
 
 use std::fmt::Debug;
-use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use restate_partition_store::{PartitionStore, PartitionStoreManager};
 use restate_storage_api::StorageError;
 use restate_storage_api::promise_table::{OwnedPromiseRow, ScanPromiseTable};
-use restate_types::identifiers::PartitionKey;
+use restate_types::sharding::KeyRange;
 
 use super::row::append_promise_row;
 use super::schema::{SysPromiseBuilder, sys_promise_sort_order};
 use crate::context::{QueryContext, SelectPartitions};
-use crate::partition_filter::FirstMatchingPartitionKeyExtractor;
+use crate::filter::FirstMatchingPartitionKeyExtractor;
 use crate::partition_store_scanner::{LocalPartitionsScanner, ScanLocalPartition};
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::table_providers::{PartitionedTableProvider, ScanPartition};
@@ -43,7 +42,8 @@ pub(crate) fn register_self(
         SysPromiseBuilder::schema(),
         sys_promise_sort_order(),
         remote_scanner_manager.create_distributed_scanner(NAME, local_scanner),
-        FirstMatchingPartitionKeyExtractor::default().with_service_key("service_key"),
+        FirstMatchingPartitionKeyExtractor::default()
+            .with_scope_or_service_key("scope", "service_key"),
     );
     ctx.register_partitioned_table(NAME, Arc::new(table))
 }
@@ -55,6 +55,7 @@ impl ScanLocalPartition for PromiseScanner {
     type Builder = SysPromiseBuilder;
     type Item<'a> = OwnedPromiseRow;
     type ConversionError = std::convert::Infallible;
+    type Filter = KeyRange;
 
     fn for_each_row<
         F: for<'a> FnMut(
@@ -65,7 +66,7 @@ impl ScanLocalPartition for PromiseScanner {
             + 'static,
     >(
         partition_store: &PartitionStore,
-        range: RangeInclusive<PartitionKey>,
+        range: KeyRange,
         mut f: F,
     ) -> Result<impl Future<Output = restate_storage_api::Result<()>> + Send, StorageError> {
         partition_store.for_each_promise(range, move |item| f(item).map_break(Result::unwrap))

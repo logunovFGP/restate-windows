@@ -25,6 +25,7 @@ use crate::commands::replicated_loglet::ReplicatedLoglet;
 use crate::commands::snapshot::Snapshot;
 use crate::commands::sql::SqlOpts;
 use crate::commands::status::ClusterStatusOpts;
+use crate::commands::storage::Storage;
 use crate::connection::ConnectionInfo;
 
 /// Restate Cluster Administration Tool
@@ -84,8 +85,30 @@ pub enum Command {
     /// Generate or install shell completions
     #[clap(subcommand)]
     Completions(Completions),
+    /// Storage operations (RocksDB maintenance)
+    #[clap(subcommand)]
+    Storage(Storage),
 }
 
-fn init(common_opts: &CommonOpts) {
-    CliContext::new(common_opts.clone()).set_as_global();
+fn init(common_opts: &CommonOpts, connection: &ConnectionInfo) -> anyhow::Result<()> {
+    let ctx = CliContext::new(common_opts.clone());
+
+    // When TLS materials are provided, register the process-wide fabric TLS
+    // client config so every channel dialing an `https://` fabric address (nodes in
+    // `prefer`/`require` mode) uses TLS, presenting the client certificate when
+    // one is configured. Stopgap until internal/external services are split onto
+    // separate ports (#3583).
+    if let Some(ca) = connection.tls.tls_ca.as_deref() {
+        // Trust any server that presents a valid cert from the CA; identity
+        // pinning is a server-side concern for restatectl.
+        restate_core::network::tls::TlsClientConfig::new(
+            connection.tls.client_identity(),
+            &[ca],
+            &["*"],
+        )?
+        .set_global();
+    }
+
+    ctx.set_as_global();
+    Ok(())
 }

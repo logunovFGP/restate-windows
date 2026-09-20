@@ -61,7 +61,11 @@ jobs:
       - name: Setup Rust Caching
         uses: WarpBuilds/rust-cache@v2 # a fork of Swatinem/rust-cache@v2 that uses warpbuild cache
         with:
+          prefix-key: "v1-rust"
           cache-on-failure: "true"
+
+      - name: Disk usage after cache restore
+        run: df -h / && du -sh target/ 2>/dev/null || true
 
       - name: Install cargo-hakari
         uses: taiki-e/install-action@v2
@@ -87,19 +91,35 @@ jobs:
       - name: Check Cargo.lock file is updated
         run: cargo update -w --locked
 
-      - name: Run verify
-        run: just verify
-        id: justVerify
+      - name: Run lint
+        run: just lint
+
+      - name: Disk usage after lint
+        run: df -h / && du -sh target/ 2>/dev/null || true
+
+      - name: Run test
+        run: just test
         env:
           LOCAL_CLUSTER_RUNNER_FORWARD_LOGS: "true"
           LOCAL_CLUSTER_RUNNER_RETAIN_TEMPDIR: "true"
           LOCAL_CLUSTER_RUNNER_TEMPDIR: ${{ runner.temp }}/lcr
+
+      - name: Disk usage after test
+        if: always()
+        run: df -h / && du -sh target/ 2>/dev/null || true
+
+      - name: Run doctest
+        run: just doctest
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: local-cluster-runner
           path: ${{ runner.temp }}/lcr
+
+      - name: Disk usage before cache save
+        if: always()
+        run: df -h / && du -sh target/ 2>/dev/null || true
 
   docker:
     name: Create docker image
@@ -125,24 +145,6 @@ jobs:
       restateCommit: ${{ github.event.pull_request.head.sha || github.sha }}
       serviceImage: "ghcr.io/restatedev/test-services-java:main"
 
-  sdk-java-journal-table-v2:
-    name: Run SDK-Java integration tests with Journal Table v2
-    permissions:
-      contents: read
-      issues: read
-      checks: write
-      pull-requests: write
-      actions: read
-    secrets: inherit
-    needs: docker
-    uses: restatedev/sdk-java/.github/workflows/integration.yaml@main
-    with:
-      restateCommit: ${{ github.event.pull_request.head.sha || github.sha }}
-      serviceImage: "ghcr.io/restatedev/test-services-java:main"
-      testArtifactOutput: sdk-java-integration-test-journal-table-v2
-      envVars: |
-        RESTATE_INTERNAL_FORCE_MIN_RESTATE_VERSION=1.6.0-dev
-
   sdk-java-vqueues:
     name: Vqueues Run SDK-Java integration tests
     # for the time being we don't expect all tests to pass
@@ -158,7 +160,7 @@ jobs:
     with:
       restateCommit: ${{ github.event.pull_request.head.sha || github.sha }}
       serviceImage: "ghcr.io/restatedev/test-services-java:main"
-      testArtifactOutput: sdk-java-integration-test-vqueues
+      testArtifactOutput: sdk-java-integration-vqueues-test-report
       envVars: |
         RESTATE_EXPERIMENTAL_ENABLE_VQUEUES=true
       # we don't expect all tests to pass, that's why we continue on error
@@ -178,6 +180,24 @@ jobs:
     with:
       restateCommit: ${{ github.event.pull_request.head.sha || github.sha }}
       serviceImage: "ghcr.io/restatedev/test-services-python:main"
+
+  sdk-python-protocol-v7:
+    name: Run SDK-Python integration tests with Protocol V7
+    permissions:
+      contents: read
+      issues: read
+      checks: write
+      pull-requests: write
+      actions: read
+    secrets: inherit
+    needs: docker
+    uses: restatedev/sdk-python/.github/workflows/integration.yaml@main
+    with:
+      restateCommit: ${{ github.event.pull_request.head.sha || github.sha }}
+      serviceImage: "ghcr.io/restatedev/test-services-python:main"
+      envVars: |
+        RESTATE_experimental_enable_protocol_v7=true
+      testArtifactOutput: sdk-python-protocol-v7-test-report
 
   sdk-go:
     name: Run SDK-Go integration tests
@@ -208,6 +228,40 @@ jobs:
       restateCommit: ${{ github.event.pull_request.head.sha || github.sha }}
       serviceImage: "ghcr.io/restatedev/test-services-node:main"
 
+  sdk-typescript-protocol-v7:
+    name: Run SDK-Typescript integration tests with Protocol V7
+    permissions:
+      contents: read
+      issues: read
+      checks: write
+      pull-requests: write
+      actions: read
+    secrets: inherit
+    needs: docker
+    uses: restatedev/sdk-typescript/.github/workflows/integration.yaml@main
+    with:
+      restateCommit: ${{ github.event.pull_request.head.sha || github.sha }}
+      envVars: |
+        RESTATE_experimental_enable_protocol_v7=true
+      testArtifactOutput: sdk-typescript-protocol-v7-test-report
+
+  sdk-typescript-bilrost-schema:
+    name: Run SDK-Typescript integration tests with Bilrost schema encoding
+    permissions:
+      contents: read
+      issues: read
+      checks: write
+      pull-requests: write
+      actions: read
+    secrets: inherit
+    needs: docker
+    uses: restatedev/sdk-typescript/.github/workflows/integration.yaml@main
+    with:
+      restateCommit: ${{ github.event.pull_request.head.sha || github.sha }}
+      envVars: |
+        RESTATE_experimental_enable_schema_bilrost_encoding=true
+      testArtifactOutput: sdk-typescript-bilrost-schema-test-report
+
   sdk-rust:
     name: Run SDK-Rust integration tests
     permissions:
@@ -221,6 +275,7 @@ jobs:
     uses: restatedev/sdk-rust/.github/workflows/integration.yaml@main
     with:
       restateCommit: ${{ github.event.pull_request.head.sha || github.sha }}
+      serviceImage: "ghcr.io/restatedev/test-services-rust:main"
 
   e2e:
     name: Run E2E tests
@@ -258,20 +313,16 @@ jobs:
 
       ### Run e2e tests
       - name: Run E2E tests
-        uses: restatedev/e2e@main
+        uses: restatedev/e2e/e2e-tests@main
         with:
           testArtifactOutput: e2e-test-report
           restateContainerImage: localhost/restatedev/restate-commit-download:latest
-          # RESTATE_WORKER__INVOKER__experimental_features_allow_protocol_v6=true is needed for forward compatibility
-          # tests 1.6 -> 1.5. The e2e tests create a v1.5 Restate server which gets the same env variables passed in,
-          # and we need to enable the protocol v6 which is being used by 1.6.
-          # todo remove once we use v1.6 as the LAST_COMPATIBLE_RESTATE_SERVER_VERSION in the e2e tests
-          envVars: |
-            RESTATE_WORKER__INVOKER__experimental_features_allow_protocol_v6=true
 
-  e2e-enable-journal-table-v2:
-    name: Run E2E tests with Journal Table V2 feature
+  e2e-bilrost-schema:
+    name: Run E2E tests with bilrost schema
     runs-on: warp-ubuntu-latest-x64-4x
+    # we don't expect all tests to pass, that's why we continue on error
+    continue-on-error: true
     permissions:
       contents: read
       issues: read
@@ -303,23 +354,22 @@ jobs:
           docker tag "${output#*: }" "localhost/restatedev/restate-commit-download:latest"
           docker image ls -a
 
-      ### Run e2e tests
+      ### Run e2e tests with bilrost schema enabled.
       - name: Run E2E tests
-        uses: restatedev/e2e@main
+        uses: restatedev/e2e/e2e-tests@main
         with:
-          testArtifactOutput: e2e-journal-table-v2-test-report
+          testArtifactOutput: e2e-test-bilrost-schema-report
           restateContainerImage: localhost/restatedev/restate-commit-download:latest
           envVars: |
-            RESTATE_INTERNAL_FORCE_MIN_RESTATE_VERSION=1.6.0-dev
-          # Ignore forward compatibility tests as long as the previous version is not at least v1.6.0-dev. Otherwise,
-          # the previous version will hang at applying the version barrier with version 1.6.0-dev.
+            RESTATE_experimental_enable_schema_bilrost_encoding=true
           exclusions: |
             exclusions:
               "versionCompat":
                 - "dev.restate.sdktesting.tests.ForwardCompatibilityTest.*"
+                - "dev.restate.sdktesting.tests.BackwardCompatibilityTest.*"
 
   e2e-vqueues:
-    name: Vqueues Run E2E tests
+    name: Run E2E tests with vqueues
     runs-on: warp-ubuntu-latest-x64-4x
     # we don't expect all tests to pass, that's why we continue on error
     continue-on-error: true
@@ -355,8 +405,8 @@ jobs:
           docker image ls -a
 
       ### Run e2e tests with vqueues enabled.
-      - name: Vqueues Run E2E tests
-        uses: restatedev/e2e@main
+      - name: Run E2E tests
+        uses: restatedev/e2e/e2e-tests@main
         with:
           testArtifactOutput: e2e-test-vqueues-report
           restateContainerImage: localhost/restatedev/restate-commit-download:latest

@@ -12,13 +12,15 @@ use crate::table_macro::*;
 
 use datafusion::arrow::datatypes::DataType;
 
-define_sort_order!(sys_journal(partition_key, id));
+// Mixed V1/V2 journals can violate this ordering because the two scans are concatenated rather
+// than merged. We accept this compromise while the deprecated V1 journal is phased out.
+define_sort_order!(sys_journal(partition_key));
 
 define_table!(sys_journal (
     /// Internal column that is used for partitioning the services invocations. Can be ignored.
     partition_key: DataType::UInt64,
 
-    /// [Invocation ID](/operate/invocation#invocation-identifier).
+    /// [Invocation ID](/services/invocation/managing-invocations#invocation-id).
     id: DataType::LargeUtf8,
 
     /// The index of this journal entry.
@@ -52,6 +54,10 @@ define_table!(sys_journal (
     /// Raw binary representation of the entry. Check the [service protocol](https://github.com/restatedev/service-protocol)
     /// for more details to decode it.
     raw: DataType::LargeBinary,
+
+    /// The byte length of the raw entry. If you are writing a query that only needs to know the length,
+    /// reading this field will be much more efficient than reading length(raw).
+    raw_length: DataType::UInt64,
 
     /// The journal version.
     version: DataType::UInt32,

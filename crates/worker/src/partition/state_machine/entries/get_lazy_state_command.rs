@@ -8,22 +8,29 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
-use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
+use tracing::warn;
+
 use restate_storage_api::state_table::ReadStateTable;
 use restate_types::journal_v2::{
     EntryMetadata, GetLazyStateCommand, GetLazyStateCompletion, GetStateResult,
 };
-use tracing::warn;
+
+use crate::partition::processor::Processor;
+use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
+use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
 
 pub(super) type ApplyGetLazyStateCommand<'e> = ApplyJournalCommandEffect<'e, GetLazyStateCommand>;
 
-impl<'e, 'ctx: 'e, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'e, 'ctx: 'e, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for ApplyGetLazyStateCommand<'e>
 where
     S: ReadStateTable,
+    P: Processor,
 {
-    async fn apply(mut self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
+    async fn apply(
+        mut self,
+        ctx: &'ctx mut StateMachineApplyContext<'s, S, P>,
+    ) -> Result<(), Error> {
         let invocation_metadata = self
             .invocation_status
             .get_invocation_metadata()
@@ -32,7 +39,7 @@ where
         let result =
             if let Some(service_id) = invocation_metadata.invocation_target.as_keyed_service_id() {
                 ctx.storage
-                    .get_user_state(&service_id, &self.entry.key)
+                    .get_user_state(&service_id, self.entry.key.as_bytes())
                     .await?
                     .map(GetStateResult::Success)
                     .unwrap_or(GetStateResult::Void)

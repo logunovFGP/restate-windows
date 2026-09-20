@@ -29,15 +29,19 @@ use crate::deployment::{
 use crate::identifiers::{DeploymentId, LambdaARN, ServiceRevision, SubscriptionId};
 use crate::net::address::{AdvertisedAddress, HttpIngressPort};
 use crate::schema::deployment::{Deployment, DeploymentResolver, DeploymentType};
+use crate::schema::kafka::{KafkaCluster, KafkaClusterName, KafkaClusterResolver};
 use crate::schema::metadata::updater;
-use crate::schema::metadata::updater::{SchemaError, SchemaUpdater, ServiceError};
+use crate::schema::metadata::updater::{
+    KafkaClusterError, SchemaError, SchemaUpdater, ServiceError,
+};
 use crate::schema::service::{HandlerMetadata, ServiceMetadata, ServiceMetadataResolver};
 use crate::schema::subscriptions::{ListSubscriptionFilter, Subscription, SubscriptionResolver};
 
+use crate::schema::Redaction;
 pub use crate::schema::metadata::updater::{
-    AddDeploymentResult, AllowBreakingChanges, ModifyServiceRequest, Overwrite,
+    AddDeploymentResult, AllowBreakingChanges, AllowOrphanSubscriptions, ModifyServiceRequest,
+    Overwrite,
 };
-
 // -- Schema registry error and other types
 
 #[derive(Debug, thiserror::Error, codederror::CodedError)]
@@ -58,10 +62,18 @@ impl SchemaRegistryError {
             SchemaRegistryErrorInner::Schema(schema_error) => match schema_error {
                 SchemaError::NotFound(_) => StatusCode::NOT_FOUND,
                 SchemaError::Service(ServiceError::DifferentType { .. })
-                | SchemaError::Service(ServiceError::RemovedHandlers { .. }) => {
-                    StatusCode::CONFLICT
-                }
+                | SchemaError::KafkaCluster(KafkaClusterError::AlreadyExists { .. })
+                | SchemaError::KafkaCluster(
+                    KafkaClusterError::RemovalLeadsToOrphanSubscription { .. },
+                )
+                | SchemaError::KafkaCluster(
+                    KafkaClusterError::CannotUpdateStaticClusterConfiguration { .. },
+                )
+                | SchemaError::KafkaCluster(KafkaClusterError::ConflictsWithStaticConfig {
+                    ..
+                }) => StatusCode::CONFLICT,
                 SchemaError::Service(_) => StatusCode::BAD_REQUEST,
+                SchemaError::KafkaCluster(_) => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_REQUEST,
             },
             SchemaRegistryErrorInner::UpdateDeployment { .. } => StatusCode::BAD_REQUEST,
@@ -103,6 +115,119 @@ enum SchemaRegistryErrorInner {
     #[error("internal error: {0}")]
     #[code(unknown)]
     Internal(String),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("invalid HTTP auth configuration: field={field}: {message}")]
+pub struct HttpAuthValidationError {
+    field: &'static str,
+    message: String,
+}
+
+impl HttpAuthValidationError {
+    fn invalid_field(field: &'static str, message: String) -> Self {
+        Self { field, message }
+    }
+
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Validate the per-deployment HTTP `auth` invariants against the effective (uri,
+/// additional_headers) tuple. The URI must be https or point to a loopback/private host to avoid
+/// leaking bearer tokens in cleartext. A customer-supplied `X-Serverless-Authorization` header is
+/// rejected because the dispatch path always uses that header for the minted ID token.
+pub fn validate_http_auth(
+    uri: &Uri,
+    additional_headers: Option<&Headers>,
+) -> Result<(), HttpAuthValidationError> {
+    let scheme_ok = uri
+        .scheme()
+        .map(|s| s.as_str().eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+    if !scheme_ok && !is_loopback_or_private_host(uri) {
+        return Err(HttpAuthValidationError::invalid_field(
+            "auth",
+            format!(
+                "GCP authentication requires an https URI for non-loopback/private hosts; got {uri}"
+            ),
+        ));
+    }
+
+    if let Some(headers) = additional_headers {
+        let has_xserv = headers.keys().any(|k| {
+            k.as_str()
+                .eq_ignore_ascii_case("x-serverless-authorization")
+        });
+        if has_xserv {
+            return Err(HttpAuthValidationError::invalid_field(
+                "additional_headers",
+                "X-Serverless-Authorization in additional_headers is not allowed when \
+                 GCP auth is enabled; the minted ID token uses this header. Place any \
+                 static bearer on Authorization instead; Cloud Run forwards it to the \
+                 workload unchanged."
+                    .to_owned(),
+            ));
+        }
+    }
+
+    if is_loopback_or_private_host(uri) {
+        tracing::warn!(
+            uri = %uri,
+            "GCP auth configured for a loopback/private deployment URI; \
+             tokens will still be minted and attached"
+        );
+    }
+
+    Ok(())
+}
+
+pub fn effective_http_patch_inputs<'a>(
+    patch_uri: Option<&'a Uri>,
+    patch_headers: Option<&'a Headers>,
+    existing_uri: &'a Uri,
+    existing_headers: &'a Headers,
+) -> (&'a Uri, std::borrow::Cow<'a, Headers>) {
+    let effective_uri = patch_uri.unwrap_or(existing_uri);
+    let effective_headers = match patch_headers {
+        Some(h) => std::borrow::Cow::Borrowed(h),
+        None => std::borrow::Cow::Borrowed(existing_headers),
+    };
+    (effective_uri, effective_headers)
+}
+
+fn is_loopback_or_private_host(uri: &Uri) -> bool {
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let host = authority.host();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // Strip IPv6 brackets if present.
+    let host_clean = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ipv4) = host_clean.parse::<std::net::Ipv4Addr>() {
+        return ipv4.is_loopback() || ipv4.is_private();
+    }
+    if let Ok(ipv6) = host_clean.parse::<std::net::Ipv6Addr>() {
+        // Loopback, ULA (fc00::/7), or link-local (fe80::/10).
+        if ipv6.is_loopback() {
+            return true;
+        }
+        let segs = ipv6.segments();
+        let ula = (segs[0] & 0xfe00) == 0xfc00;
+        let ll = (segs[0] & 0xffc0) == 0xfe80;
+        return ula || ll;
+    }
+    false
 }
 
 /// Whether to apply the changes or not
@@ -185,6 +310,10 @@ impl<Metadata: MetadataService, Discovery: DiscoveryClient, Telemetry: Telemetry
             apply_mode,
         }: RegisterDeploymentRequest,
     ) -> Result<(AddDeploymentResult, Deployment, Vec<ServiceMetadata>), SchemaRegistryError> {
+        // The wire-to-persisted conversion at the REST boundary has already materialised any
+        // derived `auth` fields (today: the OIDC `audience` for `GoogleIdToken`). The persisted
+        // type enforces that invariant at compile time, so no rewriting is needed here.
+
         // Verify first if we have the service. If we do, no need to do anything here.
         if overwrite == Overwrite::No {
             // Verify if we have a service for this endpoint already or not
@@ -288,6 +417,11 @@ impl<Metadata: MetadataService, Discovery: DiscoveryClient, Telemetry>
             return Err(SchemaError::NotFound(deployment_id.to_string()).into());
         };
 
+        let existing_http_auth = match &existing_deployment.ty {
+            DeploymentType::Http { auth, .. } => auth.clone(),
+            DeploymentType::Lambda { .. } => None,
+        };
+
         // Merge with update changes requested
         let (deployment_address, use_http_11) =
             match (update_deployment_address, existing_deployment.ty) {
@@ -298,7 +432,9 @@ impl<Metadata: MetadataService, Discovery: DiscoveryClient, Telemetry>
                     }),
                     _,
                 ) => (
-                    DeploymentAddress::Http(HttpDeploymentAddress::new(uri)),
+                    DeploymentAddress::Http(
+                        HttpDeploymentAddress::new(uri).with_auth(existing_http_auth.clone()),
+                    ),
                     use_http_11.unwrap_or(false),
                 ),
                 (
@@ -322,7 +458,9 @@ impl<Metadata: MetadataService, Discovery: DiscoveryClient, Telemetry>
                         ..
                     },
                 ) => (
-                    DeploymentAddress::Http(HttpDeploymentAddress::new(address)),
+                    DeploymentAddress::Http(
+                        HttpDeploymentAddress::new(address).with_auth(existing_http_auth.clone()),
+                    ),
                     use_http_11.unwrap_or(http_version == http::Version::HTTP_11),
                 ),
                 (
@@ -338,7 +476,7 @@ impl<Metadata: MetadataService, Discovery: DiscoveryClient, Telemetry>
                 ) => (
                     DeploymentAddress::Lambda(LambdaDeploymentAddress::new(
                         arn,
-                        update_assume_role_arn.or(assume_role_arn.map(Into::into)),
+                        update_assume_role_arn.or_else(|| assume_role_arn.map(Into::into)),
                     )),
                     false,
                 ),
@@ -364,7 +502,9 @@ impl<Metadata: MetadataService, Discovery: DiscoveryClient, Telemetry>
                         ..
                     },
                 ) => (
-                    DeploymentAddress::Http(HttpDeploymentAddress::new(address)),
+                    DeploymentAddress::Http(
+                        HttpDeploymentAddress::new(address).with_auth(existing_http_auth.clone()),
+                    ),
                     http_version == http::Version::HTTP_11,
                 ),
                 (
@@ -382,6 +522,11 @@ impl<Metadata: MetadataService, Discovery: DiscoveryClient, Telemetry>
                     false,
                 ),
             };
+
+        // PATCH preserves the persisted `auth` field verbatim. To rotate audience or
+        // impersonation, the operator must re-register with `--force`, which re-runs derivation
+        // against the new URI at the REST boundary.
+
         let additional_headers =
             additional_headers.unwrap_or(existing_deployment.additional_headers);
 
@@ -544,13 +689,26 @@ impl<Metadata: MetadataService, Discovery, Telemetry>
             .resolve_latest_service_openapi(&service_name, ingress_address)
     }
 
-    pub fn get_deployment(
+    pub fn get_deployment_and_services(
         &self,
         deployment_id: DeploymentId,
     ) -> Option<(Deployment, Vec<ServiceMetadata>)> {
         self.metadata_service
             .get()
             .get_deployment_and_services(&deployment_id)
+    }
+
+    pub fn get_deployment(&self, deployment_id: DeploymentId) -> Option<Deployment> {
+        self.metadata_service.get().get_deployment(&deployment_id)
+    }
+
+    pub fn resolve_latest_deployment_for_service(
+        &self,
+        service_name: impl AsRef<str>,
+    ) -> Option<Deployment> {
+        self.metadata_service
+            .get()
+            .resolve_latest_deployment_for_service(&service_name)
     }
 
     pub fn list_deployments(&self) -> Vec<(Deployment, Vec<(String, ServiceRevision)>)> {
@@ -581,11 +739,34 @@ impl<Metadata: MetadataService, Discovery, Telemetry>
     pub fn get_subscription(&self, subscription_id: SubscriptionId) -> Option<Subscription> {
         self.metadata_service
             .get()
-            .get_subscription(subscription_id)
+            .get_subscription(subscription_id, Redaction::Yes)
     }
 
     pub fn list_subscriptions(&self, filters: &[ListSubscriptionFilter]) -> Vec<Subscription> {
-        self.metadata_service.get().list_subscriptions(filters)
+        self.metadata_service
+            .get()
+            .list_subscriptions(filters, Redaction::Yes)
+    }
+
+    pub fn get_kafka_cluster(&self, cluster_name: &str) -> Option<KafkaCluster> {
+        self.metadata_service
+            .get()
+            .get_kafka_cluster(cluster_name, Redaction::Yes)
+    }
+
+    pub fn get_kafka_cluster_and_subscriptions(
+        &self,
+        cluster_name: &str,
+    ) -> Option<(KafkaCluster, Vec<Subscription>)> {
+        self.metadata_service
+            .get()
+            .get_kafka_cluster_and_subscriptions(cluster_name, Redaction::Yes)
+    }
+
+    pub fn get_kafka_clusters(&self) -> Vec<KafkaCluster> {
+        self.metadata_service
+            .get()
+            .list_kafka_clusters(Redaction::Yes)
     }
 
     pub async fn create_subscription(
@@ -598,17 +779,88 @@ impl<Metadata: MetadataService, Discovery, Telemetry>
             .metadata_service
             .update(|schema| {
                 SchemaUpdater::update_and_return(schema, |updater| {
-                    updater.add_subscription(None, source.clone(), sink.clone(), options.clone())
+                    updater.add_subscription(source.clone(), sink.clone(), options.clone())
                 })
                 .map_err(Into::into)
             })
             .await?;
 
         let subscription = schema
-            .get_subscription(subscription_id)
+            .get_subscription(subscription_id, Redaction::Yes)
             .expect("subscription was just added");
 
         Ok(subscription)
+    }
+
+    pub async fn create_kafka_cluster(
+        &self,
+        name: KafkaClusterName,
+        properties: HashMap<String, String>,
+    ) -> Result<KafkaCluster, SchemaRegistryError> {
+        let (kafka_cluster_name, schema) = self
+            .metadata_service
+            .update(|schema| {
+                SchemaUpdater::update_and_return(schema, |updater| {
+                    updater.add_kafka_cluster(name.clone(), properties.clone())
+                })
+                .map_err(Into::into)
+            })
+            .await?;
+
+        let kafka_cluster = schema
+            .get_kafka_cluster(kafka_cluster_name.as_str(), Redaction::Yes)
+            .expect("kafka cluster was just added");
+
+        Ok(kafka_cluster)
+    }
+
+    pub async fn update_kafka_cluster(
+        &self,
+        name: KafkaClusterName,
+        properties: HashMap<String, String>,
+    ) -> Result<KafkaCluster, SchemaRegistryError> {
+        let (_, schema) = self
+            .metadata_service
+            .update(|schema| {
+                Ok((
+                    (),
+                    SchemaUpdater::update(schema, |updater| {
+                        updater.update_kafka_cluster(name.as_str(), properties.clone())
+                    })?,
+                ))
+            })
+            .await?;
+
+        Ok(schema
+            .get_kafka_cluster(name.as_str(), Redaction::Yes)
+            .expect("kafka cluster was just added"))
+    }
+
+    pub async fn delete_kafka_cluster(
+        &self,
+        name: KafkaClusterName,
+        allow_orphan_subscriptions: AllowOrphanSubscriptions,
+    ) -> Result<(), SchemaRegistryError> {
+        self.metadata_service
+            .update(|schema| {
+                Ok((
+                    (),
+                    SchemaUpdater::update(schema, |updater| {
+                        if updater
+                            .remove_kafka_cluster(name.as_str(), allow_orphan_subscriptions)?
+                        {
+                            Ok(())
+                        } else {
+                            Err(SchemaError::NotFound(format!(
+                                "kafka cluster named '{name}'"
+                            )))
+                        }
+                    })?,
+                ))
+            })
+            .await?;
+
+        Ok(())
     }
 }
 

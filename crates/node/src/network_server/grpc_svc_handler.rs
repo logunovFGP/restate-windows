@@ -12,9 +12,10 @@ use std::cmp::max_by_key;
 
 use anyhow::Context;
 use bytes::BytesMut;
+use tokio::sync::oneshot;
 use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use restate_metadata_server_grpc::grpc::new_metadata_server_client;
 use restate_metadata_store::protobuf::metadata_proxy_svc::metadata_proxy_svc_server::{
@@ -28,20 +29,25 @@ use restate_types::net::connect_opts::GrpcConnectionOptions;
 use restate_core::network::net_util::{DNSResolution, create_tonic_channel};
 use restate_core::protobuf::node_ctl_svc::node_ctl_svc_server::{NodeCtlSvc, NodeCtlSvcServer};
 use restate_core::protobuf::node_ctl_svc::{
-    ClusterHealthResponse, EmbeddedMetadataClusterHealth, GetMetadataRequest, GetMetadataResponse,
-    IdentResponse, ProvisionClusterRequest, ProvisionClusterResponse,
+    ClusterHealthResponse, DatabaseCompactionResult, EmbeddedMetadataClusterHealth,
+    GetMetadataRequest, GetMetadataResponse, IdentResponse, ProvisionClusterRequest,
+    ProvisionClusterResponse, TriggerCompactionRequest, TriggerCompactionResponse,
+    cluster_features_from_proto,
 };
-use restate_core::{Identification, MetadataWriter};
+use restate_core::{Identification, MetadataWriter, TaskCenter, TaskKind};
 use restate_core::{Metadata, MetadataKind};
-use restate_metadata_store::{MetadataStoreClient, WriteError};
+use restate_metadata_store::{MetadataStoreClient, ReadError, WriteError};
+use restate_rocksdb::RocksDbManager;
 use restate_types::Version;
 use restate_types::config::{Configuration, NetworkingOptions};
-use restate_types::errors::ConversionError;
+use restate_types::errors::{ConversionError, MaybeRetryableError};
 use restate_types::logs::metadata::{NodeSetSize, ProviderConfiguration};
 use restate_types::metadata::VersionedValue;
-use restate_types::nodes_config::Role;
+use restate_types::nodes_config::{ClusterFeature, Role};
 use restate_types::protobuf::cluster::ClusterConfiguration as ProtoClusterConfiguration;
+use restate_types::protobuf::common::DatabaseKind;
 use restate_types::replication::ReplicationProperty;
+use restate_types::rocksdb::ManualCompactionOptions;
 use restate_types::storage::StorageCodec;
 
 use crate::{ClusterConfiguration, provision_cluster_metadata};
@@ -167,12 +173,16 @@ impl NodeCtlSvc for NodeCtlSvcHandler {
         let config = Configuration::pinned();
 
         let dry_run = request.dry_run;
+        let disabled = cluster_features_from_proto(&request.disabled_features)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let features = ClusterFeature::default_features() - disabled;
         let cluster_configuration = Self::resolve_cluster_configuration(&config, request)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
         if dry_run {
             return Ok(Response::new(ProvisionClusterResponse::dry_run(
                 ProtoClusterConfiguration::from(cluster_configuration),
+                features,
             )));
         }
 
@@ -180,6 +190,7 @@ impl NodeCtlSvc for NodeCtlSvcHandler {
             &self.metadata_writer,
             &config.common,
             &cluster_configuration,
+            features,
         )
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
@@ -192,6 +203,7 @@ impl NodeCtlSvc for NodeCtlSvcHandler {
 
         Ok(Response::new(ProvisionClusterResponse::provisioned(
             ProtoClusterConfiguration::from(cluster_configuration),
+            features,
         )))
     }
 
@@ -259,6 +271,95 @@ impl NodeCtlSvc for NodeCtlSvcHandler {
 
         Ok(Response::new(cluster_state_response))
     }
+
+    async fn trigger_compaction(
+        &self,
+        request: Request<TriggerCompactionRequest>,
+    ) -> Result<Response<TriggerCompactionResponse>, Status> {
+        let request = request.into_inner();
+
+        let compact_all = request.databases.is_empty();
+        let requested_kinds: Vec<DatabaseKind> = request
+            .databases
+            .into_iter()
+            .map(|raw| {
+                let kind = DatabaseKind::try_from(raw).map_err(|_| {
+                    Status::invalid_argument(format!("unknown database kind id {raw}"))
+                })?;
+                if kind == DatabaseKind::Unspecified {
+                    return Err(Status::invalid_argument(
+                        "database kind 'unspecified' is not a valid selection",
+                    ));
+                }
+                Ok(kind)
+            })
+            .collect::<Result<_, _>>()?;
+        let options: ManualCompactionOptions = request
+            .options
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(|err: anyhow::Error| Status::invalid_argument(err.to_string()))?
+            .unwrap_or_default();
+
+        let Some(manager) = RocksDbManager::maybe_get() else {
+            return Err(Status::unavailable("RocksDB manager not initialized"));
+        };
+
+        let all_dbs = manager.get_all_dbs();
+        let (result_tx, result_rx) = oneshot::channel();
+        TaskCenter::spawn(
+            TaskKind::Disposable,
+            "manual-rocksdb-compaction",
+            async move {
+                let mut results = Vec::new();
+
+                // Compact sequentially to limit the I/O pressure on each node.
+                for db in all_dbs {
+                    let db_name = db.name().to_string();
+                    let kind = db.kind();
+                    let should_compact = compact_all
+                        || (kind != DatabaseKind::Unspecified
+                            && requested_kinds.contains(&kind));
+
+                    if !should_compact {
+                        continue;
+                    }
+
+                    info!(db = %db_name, "Starting manual RocksDB compaction");
+                    let cf_count = db.cfs().len() as u32;
+                    match db.compact_all(options).await {
+                        Ok(()) => {
+                            info!(db = %db_name, "Manual RocksDB compaction task completed");
+                            results.push(DatabaseCompactionResult {
+                                db_name,
+                                success: true,
+                                error: None,
+                                column_families_compacted: cf_count,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(db = %db_name, error = %e, "Manual RocksDB compaction task failed");
+                            results.push(DatabaseCompactionResult {
+                                db_name,
+                                success: false,
+                                error: Some(e.to_string()),
+                                column_families_compacted: 0,
+                            });
+                        }
+                    }
+                }
+
+                let _ = result_tx.send(TriggerCompactionResponse { results });
+                Ok(())
+            },
+        )
+        .map_err(|_| Status::unavailable("node is shutting down"))?;
+
+        result_rx
+            .await
+            .map(Response::new)
+            .map_err(|_| Status::unavailable("compaction task was aborted"))
+    }
 }
 
 pub struct MetadataProxySvcHandler {
@@ -304,7 +405,7 @@ impl MetadataProxySvc for MetadataProxySvcHandler {
             .inner()
             .get(request.key.into())
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(read_err_to_status)?;
 
         let response = GetResponse {
             value: value.map(Into::into),
@@ -324,7 +425,7 @@ impl MetadataProxySvc for MetadataProxySvcHandler {
             .inner()
             .get_version(request.key.into())
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(read_err_to_status)?;
 
         let response = GetVersionResponse {
             version: value.map(Into::into),
@@ -351,10 +452,7 @@ impl MetadataProxySvc for MetadataProxySvcHandler {
             .inner()
             .put(request.key.into(), value, precondition)
             .await
-            .map_err(|err| match err {
-                WriteError::FailedPrecondition(msg) => Status::failed_precondition(msg),
-                err => Status::internal(err.to_string()),
-            })?;
+            .map_err(write_err_to_status)?;
 
         Ok(Response::new(()))
     }
@@ -373,11 +471,40 @@ impl MetadataProxySvc for MetadataProxySvcHandler {
             .inner()
             .delete(request.key.into(), precondition)
             .await
-            .map_err(|err| match err {
-                WriteError::FailedPrecondition(msg) => Status::failed_precondition(msg),
-                err => Status::internal(err.to_string()),
-            })?;
+            .map_err(write_err_to_status)?;
 
         Ok(Response::new(()))
+    }
+}
+
+fn read_err_to_status(err: ReadError) -> Status {
+    if err.retryable() {
+        Status::unavailable(err.to_string())
+    } else {
+        Status::internal(err.to_string())
+    }
+}
+
+fn write_err_to_status(err: WriteError) -> Status {
+    match err {
+        WriteError::FailedPrecondition(msg) => Status::failed_precondition(msg),
+        err if err.retryable() => Status::unavailable(err.to_string()),
+        err => Status::internal(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use restate_types::protobuf::common::DatabaseKind;
+
+    #[test]
+    fn database_kind_db_names() {
+        assert_eq!(DatabaseKind::LogServer.db_name(), "log-server");
+        assert_eq!(
+            DatabaseKind::MetadataServer.db_name(),
+            "replicated-metadata-server"
+        );
+        assert_eq!(DatabaseKind::LocalLoglet.db_name(), "local-loglet");
+        assert_eq!(DatabaseKind::PartitionStore.db_name(), "db");
     }
 }

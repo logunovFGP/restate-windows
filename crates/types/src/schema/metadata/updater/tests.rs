@@ -11,11 +11,16 @@
 use super::*;
 use std::convert::Infallible;
 
+use bytestring::ByteString;
+
 use crate::Versioned;
 use crate::schema::deployment::DeploymentResolver;
 use crate::schema::deployment::ProtocolType;
-use crate::schema::info::Info;
-use crate::schema::invocation_target::InvocationTargetResolver;
+use crate::schema::info::SchemaInfo;
+use crate::schema::invocation_target::{
+    DEFAULT_IDEMPOTENCY_RETENTION, DEFAULT_WORKFLOW_COMPLETION_RETENTION, InvocationTargetResolver,
+    StatePreloadPolicy,
+};
 use crate::schema::service::ServiceMetadataResolver;
 use crate::service_protocol::{
     MAX_INFLIGHT_SERVICE_PROTOCOL_VERSION, MIN_INFLIGHT_SERVICE_PROTOCOL_VERSION,
@@ -46,6 +51,7 @@ fn greeter_service_greet_handler() -> endpoint_manifest::Handler {
         journal_retention: None,
         workflow_completion_retention: None,
         enable_lazy_state: None,
+        eager_state_keys_whitelist: vec![],
         ingress_private: None,
         retry_policy_on_max_attempts: None,
     }
@@ -69,6 +75,7 @@ fn greeter_workflow_greet_handler() -> endpoint_manifest::Handler {
         journal_retention: None,
         workflow_completion_retention: None,
         enable_lazy_state: None,
+        eager_state_keys_whitelist: vec![],
         ingress_private: None,
         retry_policy_on_max_attempts: None,
     }
@@ -91,6 +98,7 @@ fn greeter_service() -> endpoint_manifest::Service {
         journal_retention: None,
         metadata: Default::default(),
         enable_lazy_state: None,
+        eager_state_keys_whitelist: vec![],
         retry_policy_on_max_attempts: None,
     }
 }
@@ -123,6 +131,7 @@ fn greeter_virtual_object() -> endpoint_manifest::Service {
             journal_retention: None,
             workflow_completion_retention: None,
             enable_lazy_state: None,
+            eager_state_keys_whitelist: vec![],
             ingress_private: None,
             retry_policy_on_max_attempts: None,
         }],
@@ -131,6 +140,7 @@ fn greeter_virtual_object() -> endpoint_manifest::Service {
         journal_retention: None,
         metadata: Default::default(),
         enable_lazy_state: None,
+        eager_state_keys_whitelist: vec![],
         retry_policy_on_max_attempts: None,
     }
 }
@@ -152,6 +162,7 @@ fn greeter_workflow() -> endpoint_manifest::Service {
         journal_retention: None,
         metadata: Default::default(),
         enable_lazy_state: None,
+        eager_state_keys_whitelist: vec![],
         retry_policy_on_max_attempts: None,
     }
 }
@@ -184,6 +195,7 @@ fn another_greeter_service() -> endpoint_manifest::Service {
             journal_retention: None,
             workflow_completion_retention: None,
             enable_lazy_state: None,
+            eager_state_keys_whitelist: vec![],
             ingress_private: None,
             retry_policy_on_max_attempts: None,
         }],
@@ -192,6 +204,7 @@ fn another_greeter_service() -> endpoint_manifest::Service {
         journal_retention: None,
         metadata: Default::default(),
         enable_lazy_state: None,
+        eager_state_keys_whitelist: vec![],
         retry_policy_on_max_attempts: None,
     }
 }
@@ -352,7 +365,7 @@ mod routing_header {
 
         // Update providing the same routing header-> conflict
         let ((result, expected_dp_id_2), schema) =
-            SchemaUpdater::update_and_return(schema.clone(), |updater| {
+            SchemaUpdater::update_and_return(schema, |updater| {
                 updater.add_deployment(AddDeploymentRequest {
                     additional_headers: [(
                         HeaderName::from_static("x-routing"),
@@ -857,147 +870,6 @@ fn register_two_deployments_then_remove_second() {
     assert!(schemas.get_deployment(&deployment_id_2).is_none());
 }
 
-mod remove_handler {
-    use super::*;
-
-    use restate_test_util::{check, let_assert};
-    use test_log::test;
-
-    fn greeter_v1_service() -> endpoint_manifest::Service {
-        endpoint_manifest::Service {
-            abort_timeout: None,
-            documentation: None,
-            ingress_private: None,
-            ty: endpoint_manifest::ServiceType::Service,
-            name: GREETER_SERVICE_NAME.parse().unwrap(),
-            retry_policy_exponentiation_factor: None,
-            retry_policy_initial_interval: None,
-            retry_policy_max_attempts: None,
-            retry_policy_max_interval: None,
-            handlers: vec![
-                endpoint_manifest::Handler {
-                    abort_timeout: None,
-                    documentation: None,
-                    idempotency_retention: None,
-                    name: "greet".parse().unwrap(),
-                    ty: None,
-                    input: None,
-                    output: None,
-                    retry_policy_exponentiation_factor: None,
-                    retry_policy_initial_interval: None,
-                    retry_policy_max_attempts: None,
-                    retry_policy_max_interval: None,
-                    metadata: Default::default(),
-                    inactivity_timeout: None,
-                    journal_retention: None,
-                    workflow_completion_retention: None,
-                    enable_lazy_state: None,
-                    ingress_private: None,
-                    retry_policy_on_max_attempts: None,
-                },
-                endpoint_manifest::Handler {
-                    abort_timeout: None,
-                    documentation: None,
-                    idempotency_retention: None,
-                    name: "doSomething".parse().unwrap(),
-                    ty: None,
-                    input: None,
-                    output: None,
-                    retry_policy_exponentiation_factor: None,
-                    retry_policy_initial_interval: None,
-                    retry_policy_max_attempts: None,
-                    retry_policy_max_interval: None,
-                    metadata: Default::default(),
-                    inactivity_timeout: None,
-                    journal_retention: None,
-                    workflow_completion_retention: None,
-                    enable_lazy_state: None,
-                    ingress_private: None,
-                    retry_policy_on_max_attempts: None,
-                },
-            ],
-            idempotency_retention: None,
-            inactivity_timeout: None,
-            journal_retention: None,
-            metadata: Default::default(),
-            enable_lazy_state: None,
-            retry_policy_on_max_attempts: None,
-        }
-    }
-
-    fn greeter_v2_service() -> endpoint_manifest::Service {
-        endpoint_manifest::Service {
-            abort_timeout: None,
-            documentation: None,
-            ingress_private: None,
-            ty: endpoint_manifest::ServiceType::Service,
-            name: GREETER_SERVICE_NAME.parse().unwrap(),
-            retry_policy_exponentiation_factor: None,
-            retry_policy_initial_interval: None,
-            retry_policy_max_attempts: None,
-            retry_policy_max_interval: None,
-            handlers: vec![endpoint_manifest::Handler {
-                abort_timeout: None,
-                documentation: None,
-                idempotency_retention: None,
-                name: "greet".parse().unwrap(),
-                ty: None,
-                input: None,
-                output: None,
-                retry_policy_exponentiation_factor: None,
-                retry_policy_initial_interval: None,
-                retry_policy_max_attempts: None,
-                retry_policy_max_interval: None,
-                metadata: Default::default(),
-                inactivity_timeout: None,
-                journal_retention: None,
-                workflow_completion_retention: None,
-                enable_lazy_state: None,
-                ingress_private: None,
-                retry_policy_on_max_attempts: None,
-            }],
-            idempotency_retention: None,
-            inactivity_timeout: None,
-            journal_retention: None,
-            metadata: Default::default(),
-            enable_lazy_state: None,
-            retry_policy_on_max_attempts: None,
-        }
-    }
-
-    #[test]
-    fn reject_removing_existing_methods() {
-        let mut updater = SchemaUpdater::default();
-
-        updater
-            .add_deployment(AddDeploymentRequest {
-                deployment_address: DeploymentAddress::mock_uri("http://localhost:9080"),
-                ..add_deployment_request(vec![greeter_v1_service()])
-            })
-            .unwrap();
-        let schemas = updater.into_inner();
-        schemas.assert_service_revision(GREETER_SERVICE_NAME, 1);
-
-        updater = SchemaUpdater::new(schemas);
-        let rejection = updater
-            .add_deployment(AddDeploymentRequest {
-                deployment_address: DeploymentAddress::mock_uri("http://localhost:9081"),
-                ..add_deployment_request(vec![greeter_v2_service()])
-            })
-            .unwrap_err();
-
-        let schemas = updater.into_inner();
-        schemas.assert_service_revision(GREETER_SERVICE_NAME, 1); // unchanged
-
-        let_assert!(
-            SchemaError::Service(ServiceError::RemovedHandlers(service, missing_methods)) =
-                rejection
-        );
-        check!(service == GREETER_SERVICE_NAME);
-        check!(missing_methods == &["doSomething"]);
-    }
-}
-
 #[test]
 fn update_latest_deployment() {
     let mut updater = SchemaUpdater::default();
@@ -1184,6 +1056,7 @@ fn update_latest_deployment_add_handler() {
             journal_retention: None,
             workflow_completion_retention: None,
             enable_lazy_state: None,
+            eager_state_keys_whitelist: vec![],
             ingress_private: None,
             retry_policy_on_max_attempts: None,
         });
@@ -1258,6 +1131,7 @@ fn update_draining_deployment_add_handler() {
             journal_retention: None,
             workflow_completion_retention: None,
             enable_lazy_state: None,
+            eager_state_keys_whitelist: vec![],
             ingress_private: None,
             retry_policy_on_max_attempts: None,
         });
@@ -1450,7 +1324,7 @@ mod endpoint_manifest_options_propagation {
     use crate::schema::invocation_target::{InvocationAttemptOptions, InvocationTargetMetadata};
     use crate::schema::service::{HandlerMetadata, ServiceMetadata};
     use googletest::prelude::*;
-    use restate_time_util::FriendlyDuration;
+    use restate_util_time::FriendlyDuration;
     use std::time::Duration;
     use test_log::test;
 
@@ -1971,7 +1845,7 @@ mod endpoint_manifest_options_propagation {
         let service_metadata = schema.assert_service(GREETER_SERVICE_NAME);
         assert_that!(
             service_metadata.info,
-            contains(predicate(|info: &Info| info
+            contains(predicate(|info: &SchemaInfo| info
                 .message()
                 .contains("journal_retention is clamped")))
         );
@@ -2052,7 +1926,7 @@ mod endpoint_manifest_options_propagation {
         let service_metadata = schema.assert_service(GREETER_SERVICE_NAME);
         assert_that!(
             service_metadata.info,
-            contains(predicate(|info: &Info| info
+            contains(predicate(|info: &SchemaInfo| info
                 .message()
                 .contains("journal_retention is clamped")))
         );
@@ -2061,7 +1935,7 @@ mod endpoint_manifest_options_propagation {
         let handler_metadata = schema.assert_handler(GREETER_SERVICE_NAME, GREET_HANDLER_NAME);
         assert_that!(
             handler_metadata.info,
-            contains(predicate(|info: &Info| info
+            contains(predicate(|info: &SchemaInfo| info
                 .message()
                 .contains("journal_retention is clamped")))
         );
@@ -2150,6 +2024,88 @@ mod endpoint_manifest_options_propagation {
     }
 
     #[test]
+    fn idempotency_retention_default_and_max() {
+        // Custom default kicks in when neither service nor handler sets it; max clamps an SDK-set value.
+        let mut config = Configuration::default();
+        config.invocation.default_idempotency_retention = FriendlyDuration::from_secs(120);
+        config.invocation.max_idempotency_retention = Some(FriendlyDuration::from_secs(60));
+        crate::config::set_current_config(config);
+
+        // No idempotency_retention in the manifest -> config default applies, then clamps to max (60s).
+        let target = init_discover_and_resolve_target(
+            greeter_service(),
+            GREETER_SERVICE_NAME,
+            GREET_HANDLER_NAME,
+        );
+        assert_that!(
+            target.compute_retention(true), // has_idempotency_key = true to exercise completion_retention
+            eq(InvocationRetention {
+                completion_retention: Duration::from_secs(60),
+                journal_retention: Duration::from_secs(60),
+            })
+        );
+
+        // SDK requests 5 minutes -> still clamped to max (60s).
+        let target = init_discover_and_resolve_target(
+            endpoint_manifest::Service {
+                idempotency_retention: Some(5 * 60 * 1000),
+                ..greeter_service()
+            },
+            GREETER_SERVICE_NAME,
+            GREET_HANDLER_NAME,
+        );
+        assert_that!(
+            target.compute_retention(true),
+            eq(InvocationRetention {
+                completion_retention: Duration::from_secs(60),
+                journal_retention: Duration::from_secs(60),
+            })
+        );
+    }
+
+    #[test]
+    fn workflow_completion_retention_default_and_max() {
+        let mut config = Configuration::default();
+        config.invocation.default_workflow_completion_retention = FriendlyDuration::from_secs(120);
+        config.invocation.max_workflow_completion_retention = Some(FriendlyDuration::from_secs(60));
+        crate::config::set_current_config(config);
+
+        // No workflow_completion_retention in the manifest -> config default applies, then clamps to max (60s).
+        let target = init_discover_and_resolve_target(
+            greeter_workflow(),
+            GREETER_SERVICE_NAME,
+            GREET_HANDLER_NAME,
+        );
+        assert_that!(
+            target.compute_retention(false),
+            eq(InvocationRetention {
+                completion_retention: Duration::from_secs(60),
+                journal_retention: Duration::from_secs(60),
+            })
+        );
+
+        // SDK requests 5 minutes -> still clamped to max (60s).
+        let target = init_discover_and_resolve_target(
+            endpoint_manifest::Service {
+                handlers: vec![endpoint_manifest::Handler {
+                    workflow_completion_retention: Some(5 * 60 * 1000),
+                    ..greeter_workflow_greet_handler()
+                }],
+                ..greeter_workflow()
+            },
+            GREETER_SERVICE_NAME,
+            GREET_HANDLER_NAME,
+        );
+        assert_that!(
+            target.compute_retention(false),
+            eq(InvocationRetention {
+                completion_retention: Duration::from_secs(60),
+                journal_retention: Duration::from_secs(60),
+            })
+        );
+    }
+
+    #[test]
     fn max_journal_retention_zero_wins_over_default_and_set_values() {
         // Create a service with default journal_retention
         let mut config = Configuration::default();
@@ -2217,7 +2173,7 @@ mod endpoint_manifest_options_propagation {
             eq(InvocationAttemptOptions {
                 abort_timeout: Some(Duration::from_secs(120)),
                 inactivity_timeout: Some(Duration::from_secs(60)),
-                enable_lazy_state: None,
+                state_preload_policy: StatePreloadPolicy::All,
             })
         )
     }
@@ -2242,8 +2198,27 @@ mod endpoint_manifest_options_propagation {
             eq(InvocationAttemptOptions {
                 abort_timeout: Some(Duration::from_secs(120)),
                 inactivity_timeout: Some(Duration::from_secs(30)),
-                enable_lazy_state: None,
+                state_preload_policy: StatePreloadPolicy::All,
             })
+        )
+    }
+
+    #[test]
+    fn per_key_state_config_handler_overrides_service() {
+        let mut svc = greeter_virtual_object();
+        svc.enable_lazy_state = Some(true);
+        svc.eager_state_keys_whitelist = vec!["service-key".to_owned()];
+        svc.handlers[0].eager_state_keys_whitelist = vec!["handler-key".to_owned()];
+
+        let resolved = init_discover_and_resolve_timeouts(svc, GREETER_SERVICE_NAME, "greet");
+
+        // The handler-level always-eager list fully replaces the service-level one, under the
+        // resolved lazy default.
+        assert_that!(
+            resolved.state_preload_policy,
+            eq(StatePreloadPolicy::Partial(vec![ByteString::from_static(
+                "handler-key"
+            )]))
         )
     }
 
@@ -2300,7 +2275,7 @@ mod modify_service {
     use crate::schema::invocation_target::{InvocationAttemptOptions, InvocationTargetMetadata};
     use crate::schema::service::ServiceMetadata;
     use googletest::prelude::*;
-    use restate_time_util::FriendlyDuration;
+    use restate_util_time::FriendlyDuration;
     use test_log::test;
 
     #[test]
@@ -2559,6 +2534,706 @@ mod modify_service {
                 inactivity_timeout: eq(DEFAULT_INACTIVITY_TIMEOUT),
                 abort_timeout: eq(DEFAULT_ABORT_TIMEOUT),
             })
+        );
+    }
+}
+
+mod kafka_cluster {
+    use super::*;
+
+    use crate::config::{
+        ConfigurationBuilder, IngressOptionsBuilder, KafkaClusterOptions, set_current_config,
+    };
+    use crate::schema::Redaction;
+    use crate::schema::kafka::KafkaClusterResolver;
+    use crate::schema::subscriptions::SubscriptionResolver;
+    use googletest::prelude::*;
+    use restate_test_util::{assert, assert_eq};
+    use std::collections::HashMap;
+    use test_log::test;
+
+    fn kafka_cluster_properties() -> HashMap<String, String> {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "bootstrap.servers".to_string(),
+            "localhost:9092".to_string(),
+        );
+        properties.insert("security.protocol".to_string(), "SASL_SSL".to_string());
+        properties.insert("sasl.mechanism".to_string(), "PLAIN".to_string());
+        properties.insert("sasl.username".to_string(), "my-user".to_string());
+        properties.insert(
+            "sasl.password".to_string(),
+            "super-secret-password".to_string(),
+        );
+        properties
+    }
+
+    #[test]
+    fn add_kafka_cluster() {
+        let schema = Schema::default();
+        let initial_version = schema.version();
+
+        let (_, schema) = SchemaUpdater::update_and_return(schema, |updater| {
+            updater.add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+        })
+        .unwrap();
+
+        // Version should be bumped
+        assert!(initial_version < schema.version());
+
+        // Cluster should be retrievable
+        let cluster = schema
+            .get_kafka_cluster("my-cluster", Redaction::No)
+            .expect("cluster should exist");
+
+        assert_eq!(cluster.name(), "my-cluster");
+        assert_eq!(cluster.properties(), &kafka_cluster_properties());
+    }
+
+    #[test]
+    fn add_kafka_cluster_missing_broker_config() {
+        let mut updater = SchemaUpdater::default();
+        let mut properties = HashMap::new();
+        properties.insert("security.protocol".to_string(), "SASL_SSL".to_string());
+
+        let result = updater.add_kafka_cluster("my-cluster".parse().unwrap(), properties);
+
+        assert_that!(
+            result,
+            err(pat!(SchemaError::KafkaCluster(pat!(
+                KafkaClusterError::MissingBrokerConfiguration(_)
+            ))))
+        );
+    }
+
+    #[test]
+    fn add_kafka_cluster_with_metadata_broker_list() {
+        let mut updater = SchemaUpdater::default();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "metadata.broker.list".to_string(),
+            "localhost:9092,localhost:9093".to_string(),
+        );
+
+        updater
+            .add_kafka_cluster("my-cluster".parse().unwrap(), properties)
+            .expect("should accept metadata.broker.list");
+    }
+
+    #[test]
+    fn add_duplicate_kafka_cluster() {
+        let mut updater = SchemaUpdater::default();
+
+        updater
+            .add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+            .expect("first add should succeed");
+
+        let result =
+            updater.add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties());
+
+        assert_that!(
+            result,
+            err(pat!(SchemaError::KafkaCluster(pat!(
+                KafkaClusterError::AlreadyExists(_)
+            ))))
+        );
+    }
+
+    #[test]
+    fn remove_kafka_cluster() {
+        let schema = Schema::default();
+
+        let (_, schema) = SchemaUpdater::update_and_return(schema, |updater| {
+            updater
+                .add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+                .unwrap();
+            updater.remove_kafka_cluster("my-cluster", AllowOrphanSubscriptions::No)
+        })
+        .unwrap();
+
+        // Cluster should not exist
+        assert!(
+            schema
+                .get_kafka_cluster("my-cluster", Redaction::No)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remove_nonexistent_kafka_cluster() {
+        let schema = Schema::default();
+
+        let (removed, _) = SchemaUpdater::update_and_return(schema, |updater| {
+            updater.remove_kafka_cluster("nonexistent", AllowOrphanSubscriptions::No)
+        })
+        .unwrap();
+
+        assert!(!removed);
+    }
+
+    #[test]
+    fn remove_kafka_cluster_with_orphan_subscriptions() {
+        let schema = Schema::default();
+
+        let result = SchemaUpdater::update_and_return(schema, |updater| {
+            // Add deployment and service
+            updater
+                .add_deployment(add_deployment_request(vec![greeter_service()]))
+                .unwrap();
+
+            // Add kafka cluster
+            updater
+                .add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+                .unwrap();
+
+            // Add subscription referencing the cluster
+            updater
+                .add_subscription(
+                    "kafka://my-cluster/my-topic".parse().unwrap(),
+                    format!("service://{}/greet", GREETER_SERVICE_NAME)
+                        .parse()
+                        .unwrap(),
+                    None,
+                )
+                .unwrap();
+
+            // Try to remove the cluster without allowing orphan subscriptions
+            updater.remove_kafka_cluster("my-cluster", AllowOrphanSubscriptions::No)
+        });
+
+        assert_that!(
+            result,
+            err(pat!(SchemaError::KafkaCluster(pat!(
+                KafkaClusterError::RemovalLeadsToOrphanSubscription(_, _)
+            ))))
+        );
+    }
+
+    #[test]
+    fn remove_kafka_cluster_with_force() {
+        let schema = Schema::default();
+
+        let (removed, schema) = SchemaUpdater::update_and_return(schema, |updater| {
+            // Add deployment and service
+            updater
+                .add_deployment(add_deployment_request(vec![greeter_service()]))
+                .unwrap();
+
+            // Add kafka cluster
+            updater
+                .add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+                .unwrap();
+
+            // Add subscription referencing the cluster
+            updater
+                .add_subscription(
+                    "kafka://my-cluster/my-topic".parse().unwrap(),
+                    format!("service://{}/greet", GREETER_SERVICE_NAME)
+                        .parse()
+                        .unwrap(),
+                    None,
+                )
+                .unwrap();
+
+            // Remove the cluster with force (allowing orphan subscriptions)
+            updater.remove_kafka_cluster("my-cluster", AllowOrphanSubscriptions::Yes)
+        })
+        .unwrap();
+
+        assert!(removed);
+        // Cluster should not exist
+        assert!(
+            schema
+                .get_kafka_cluster("my-cluster", Redaction::No)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn update_kafka_cluster() {
+        let schema = Schema::default();
+
+        let (_, schema) = SchemaUpdater::update_and_return(schema, |updater| {
+            updater
+                .add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+                .unwrap();
+
+            let mut new_properties = HashMap::new();
+            new_properties.insert("bootstrap.servers".to_string(), "new-host:9092".to_string());
+            new_properties.insert("sasl.password".to_string(), "new-password".to_string());
+
+            updater.update_kafka_cluster("my-cluster", new_properties)
+        })
+        .unwrap();
+
+        // Cluster should have updated properties
+        let cluster = schema
+            .get_kafka_cluster("my-cluster", Redaction::No)
+            .expect("cluster should exist");
+        assert_eq!(
+            cluster.properties().get("bootstrap.servers").unwrap(),
+            "new-host:9092"
+        );
+        assert_eq!(
+            cluster.properties().get("sasl.password").unwrap(),
+            "new-password"
+        );
+        // Old properties should be gone
+        assert!(cluster.properties().get("security.protocol").is_none());
+    }
+
+    #[test]
+    fn update_kafka_cluster_missing_broker_config() {
+        let mut updater = SchemaUpdater::default();
+        updater
+            .add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+            .unwrap();
+
+        let mut new_properties = HashMap::new();
+        new_properties.insert("security.protocol".to_string(), "SASL_SSL".to_string());
+
+        let result = updater.update_kafka_cluster("my-cluster", new_properties);
+
+        assert_that!(
+            result,
+            err(pat!(SchemaError::KafkaCluster(pat!(
+                KafkaClusterError::MissingBrokerConfiguration(_)
+            ))))
+        );
+    }
+
+    #[test]
+    fn update_nonexistent_kafka_cluster() {
+        let mut updater = SchemaUpdater::default();
+
+        let result = updater.update_kafka_cluster("nonexistent", kafka_cluster_properties());
+
+        assert_that!(result, err(pat!(SchemaError::NotFound(_))));
+    }
+
+    #[test]
+    fn redact_sensitive_properties() {
+        let schema = Schema::default();
+
+        let (_, schema) = SchemaUpdater::update_and_return(schema, |updater| {
+            let mut properties = HashMap::new();
+            properties.insert("bootstrap.servers".to_string(), "localhost:9092".to_string());
+            properties.insert("sasl.username".to_string(), "my-user".to_string());
+            properties.insert(
+                "sasl.password".to_string(),
+                "super-secret-password".to_string(),
+            );
+            properties.insert(
+                "sasl.jaas.config".to_string(),
+                "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"user\" password=\"pass\";".to_string(),
+            );
+            properties.insert(
+                "ssl.key.password".to_string(),
+                "keystore-password".to_string(),
+            );
+            properties.insert(
+                "sasl.oauthbearer.client.secret".to_string(),
+                "oauth-secret".to_string(),
+            );
+
+            updater.add_kafka_cluster("my-cluster".parse().unwrap(), properties)
+        })
+        .unwrap();
+
+        // Without redaction
+        let cluster_no_redact = schema
+            .get_kafka_cluster("my-cluster", Redaction::No)
+            .expect("cluster should exist");
+        assert_eq!(
+            cluster_no_redact.properties().get("sasl.password").unwrap(),
+            "super-secret-password"
+        );
+        assert_eq!(
+            cluster_no_redact.properties().get("sasl.username").unwrap(),
+            "my-user"
+        );
+        assert!(
+            cluster_no_redact
+                .properties()
+                .get("sasl.jaas.config")
+                .unwrap()
+                .contains("password")
+        );
+
+        // With redaction
+        let cluster_redacted = schema
+            .get_kafka_cluster("my-cluster", Redaction::Yes)
+            .expect("cluster should exist");
+
+        // Non-sensitive properties should remain
+        assert_eq!(
+            cluster_redacted
+                .properties()
+                .get("bootstrap.servers")
+                .unwrap(),
+            "localhost:9092"
+        );
+
+        // Sensitive properties should be redacted
+        assert_eq!(
+            cluster_redacted.properties().get("sasl.password").unwrap(),
+            "***"
+        );
+        assert_eq!(
+            cluster_redacted.properties().get("sasl.username").unwrap(),
+            "***"
+        );
+        assert_eq!(
+            cluster_redacted
+                .properties()
+                .get("sasl.jaas.config")
+                .unwrap(),
+            "***"
+        );
+        assert_eq!(
+            cluster_redacted
+                .properties()
+                .get("ssl.key.password")
+                .unwrap(),
+            "***"
+        );
+        assert_eq!(
+            cluster_redacted
+                .properties()
+                .get("sasl.oauthbearer.client.secret")
+                .unwrap(),
+            "***"
+        );
+    }
+
+    #[test]
+    fn list_kafka_clusters() {
+        let schema = Schema::default();
+
+        let (_, schema) = SchemaUpdater::update_and_return(schema, |updater| {
+            updater
+                .add_kafka_cluster("cluster-1".parse().unwrap(), kafka_cluster_properties())
+                .unwrap();
+            updater
+                .add_kafka_cluster("cluster-2".parse().unwrap(), kafka_cluster_properties())
+                .unwrap();
+            Ok::<(), SchemaError>(())
+        })
+        .unwrap();
+
+        let clusters = schema.list_kafka_clusters(Redaction::No);
+        assert_eq!(clusters.len(), 2);
+
+        let cluster_names: Vec<&str> = clusters.iter().map(|c| c.name()).collect();
+        assert!(cluster_names.contains(&"cluster-1"));
+        assert!(cluster_names.contains(&"cluster-2"));
+    }
+
+    #[test]
+    fn kafka_cluster_with_subscription() {
+        let schema = Schema::default();
+
+        let (_, schema) = SchemaUpdater::update_and_return(schema, |updater| {
+            // Add deployment and service first
+            let _ = updater
+                .add_deployment(add_deployment_request(vec![greeter_service()]))
+                .unwrap()
+                .1;
+
+            // Add kafka cluster
+            updater
+                .add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+                .unwrap();
+
+            // Add subscription referencing the cluster
+            updater.add_subscription(
+                "kafka://my-cluster/my-topic".parse().unwrap(),
+                format!("service://{}/greet", GREETER_SERVICE_NAME)
+                    .parse()
+                    .unwrap(),
+                None,
+            )
+        })
+        .unwrap();
+
+        // Subscription should exist
+        let subscriptions = schema.list_subscriptions(&[], Redaction::No);
+        assert_eq!(subscriptions.len(), 1);
+
+        let subscription = &subscriptions[0];
+        let KafkaSource { cluster, topic } = subscription.source();
+        assert_eq!(cluster, "my-cluster");
+        assert_eq!(topic, "my-topic");
+    }
+
+    #[test]
+    fn subscription_with_nonexistent_kafka_cluster() {
+        let mut updater = SchemaUpdater::default();
+
+        // Add deployment and service first
+        updater
+            .add_deployment(add_deployment_request(vec![greeter_service()]))
+            .unwrap();
+
+        // Try to add subscription with nonexistent cluster
+        let result = updater.add_subscription(
+            "kafka://nonexistent-cluster/my-topic".parse().unwrap(),
+            format!("service://{}/greet", GREETER_SERVICE_NAME)
+                .parse()
+                .unwrap(),
+            None,
+        );
+
+        assert_that!(
+            result,
+            err(pat!(SchemaError::Subscription(pat!(
+                SubscriptionError::Validation(_)
+            ))))
+        );
+    }
+
+    #[test]
+    fn get_kafka_cluster_and_subscriptions() {
+        let schema = Schema::default();
+
+        let (subscription_id, schema) = SchemaUpdater::update_and_return(schema, |updater| {
+            // Add deployment and service
+            updater
+                .add_deployment(add_deployment_request(vec![greeter_service()]))
+                .unwrap();
+
+            // Add kafka cluster
+            updater
+                .add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+                .unwrap();
+
+            // Add subscription
+            updater.add_subscription(
+                "kafka://my-cluster/my-topic".parse().unwrap(),
+                format!("service://{}/greet", GREETER_SERVICE_NAME)
+                    .parse()
+                    .unwrap(),
+                None,
+            )
+        })
+        .unwrap();
+
+        // Get cluster with its subscriptions
+        let (cluster, subscriptions) = schema
+            .get_kafka_cluster_and_subscriptions("my-cluster", Redaction::No)
+            .expect("should return cluster and subscriptions");
+
+        assert_eq!(cluster.name(), "my-cluster");
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].id(), subscription_id);
+    }
+
+    #[test]
+    fn subscription_metadata_redaction() {
+        let schema = Schema::default();
+
+        let (_, schema) = SchemaUpdater::update_and_return(schema, |updater| {
+            // Add deployment and service
+            updater
+                .add_deployment(add_deployment_request(vec![greeter_service()]))
+                .unwrap();
+
+            // Add kafka cluster
+            updater
+                .add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+                .unwrap();
+
+            // Add subscription with sensitive metadata
+            let mut metadata = HashMap::new();
+            metadata.insert("custom.username".to_string(), "user".to_string());
+            metadata.insert(
+                "custom.password".to_string(),
+                "sensitive-password".to_string(),
+            );
+            metadata.insert("custom.property".to_string(), "non-sensitive".to_string());
+
+            updater.add_subscription(
+                "kafka://my-cluster/my-topic".parse().unwrap(),
+                format!("service://{}/greet", GREETER_SERVICE_NAME)
+                    .parse()
+                    .unwrap(),
+                Some(metadata),
+            )
+        })
+        .unwrap();
+
+        let subscriptions = schema.list_subscriptions(&[], Redaction::No);
+        let subscription_no_redact = &subscriptions[0];
+        assert_eq!(
+            subscription_no_redact
+                .metadata()
+                .get("custom.password")
+                .unwrap(),
+            "sensitive-password"
+        );
+
+        let subscriptions_redacted = schema.list_subscriptions(&[], Redaction::Yes);
+        let subscription_redacted = &subscriptions_redacted[0];
+        assert_eq!(
+            subscription_redacted
+                .metadata()
+                .get("custom.password")
+                .unwrap(),
+            "***"
+        );
+        assert_eq!(
+            subscription_redacted
+                .metadata()
+                .get("custom.property")
+                .unwrap(),
+            "non-sensitive"
+        );
+    }
+
+    fn set_current_kafka_config(config_cluster: KafkaClusterOptions) {
+        let config = ConfigurationBuilder::default()
+            .ingress(
+                IngressOptionsBuilder::default()
+                    .kafka_clusters(vec![config_cluster])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        set_current_config(config);
+    }
+
+    #[test]
+    fn list_kafka_clusters_includes_configuration_clusters() {
+        // Set up configuration with a kafka cluster
+        set_current_kafka_config(KafkaClusterOptions {
+            name: "config-cluster".to_string(),
+            brokers: vec!["config-broker:9092".to_string()],
+            additional_options: Default::default(),
+        });
+
+        // Create schema with a schema-based kafka cluster
+        let (_, schema) = SchemaUpdater::update_and_return(Schema::default(), |updater| {
+            updater.add_kafka_cluster(
+                "schema-cluster".parse().unwrap(),
+                kafka_cluster_properties(),
+            )
+        })
+        .unwrap();
+
+        // list_kafka_clusters should include both
+        let clusters = schema.list_kafka_clusters(Redaction::No);
+        let cluster_names: Vec<&str> = clusters.iter().map(|c| c.name()).collect();
+
+        assert!(cluster_names.contains(&"schema-cluster"));
+        assert!(cluster_names.contains(&"config-cluster"));
+        assert_eq!(clusters.len(), 2);
+    }
+
+    #[test]
+    fn get_kafka_cluster_from_configuration() {
+        // Set up configuration with a kafka cluster
+        set_current_kafka_config(KafkaClusterOptions {
+            name: "config-cluster".to_string(),
+            brokers: vec!["config-broker:9092".to_string()],
+            additional_options: HashMap::from([(
+                "security.protocol".to_string(),
+                "PLAINTEXT".to_string(),
+            )]),
+        });
+
+        let schema = Schema::default();
+
+        // get_kafka_cluster should find the cluster from configuration
+        let cluster = schema
+            .get_kafka_cluster("config-cluster", Redaction::No)
+            .expect("cluster should exist");
+
+        assert_eq!(cluster.name(), "config-cluster");
+        assert_eq!(
+            cluster.properties().get("metadata.broker.list").unwrap(),
+            "config-broker:9092"
+        );
+        assert_eq!(
+            cluster.properties().get("security.protocol").unwrap(),
+            "PLAINTEXT"
+        );
+    }
+
+    #[test]
+    fn subscription_with_configuration_kafka_cluster() {
+        // Set up configuration with a kafka cluster
+        set_current_kafka_config(KafkaClusterOptions {
+            name: "config-cluster".to_string(),
+            brokers: vec!["config-broker:9092".to_string()],
+            additional_options: Default::default(),
+        });
+
+        let schema = Schema::default();
+
+        // Create subscription using the config-based cluster
+        let (subscription_id, schema) = SchemaUpdater::update_and_return(schema, |updater| {
+            // Add deployment and service first
+            updater
+                .add_deployment(add_deployment_request(vec![greeter_service()]))
+                .unwrap();
+
+            // Add subscription referencing the config cluster
+            updater.add_subscription(
+                "kafka://config-cluster/my-topic".parse().unwrap(),
+                format!("service://{}/greet", GREETER_SERVICE_NAME)
+                    .parse()
+                    .unwrap(),
+                None,
+            )
+        })
+        .unwrap();
+
+        // Subscription should exist and reference the config cluster
+        let subscriptions = schema.list_subscriptions(&[], Redaction::No);
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].id(), subscription_id);
+
+        let KafkaSource { cluster, topic } = subscriptions[0].source();
+
+        assert_eq!(cluster, "config-cluster");
+        assert_eq!(topic, "my-topic");
+
+        // get_kafka_cluster_and_subscriptions should work with config cluster
+        let (cluster, subs) = schema
+            .get_kafka_cluster_and_subscriptions("config-cluster", Redaction::No)
+            .expect("should return cluster and subscriptions");
+
+        assert_eq!(cluster.name(), "config-cluster");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id(), subscription_id);
+    }
+
+    #[test]
+    fn schema_cluster_takes_precedence_over_configuration_cluster() {
+        // Create schema with same-named cluster (different broker)
+        let (_, schema) = SchemaUpdater::update_and_return(Schema::default(), |updater| {
+            updater.add_kafka_cluster("my-cluster".parse().unwrap(), kafka_cluster_properties())
+        })
+        .unwrap();
+
+        // Now set up configuration with a kafka cluster, with same name
+        set_current_kafka_config(KafkaClusterOptions {
+            name: "my-cluster".to_string(),
+            brokers: vec!["config-broker:9092".to_string()],
+            additional_options: Default::default(),
+        });
+
+        // get_kafka_cluster should return the schema cluster, not config cluster
+        let cluster = schema
+            .get_kafka_cluster("my-cluster", Redaction::No)
+            .expect("cluster should exist");
+
+        assert_eq!(cluster.name(), "my-cluster");
+        // Schema cluster has localhost:9092, config cluster has config-broker:9092
+        assert_eq!(
+            cluster.properties().get("bootstrap.servers").unwrap(),
+            "localhost:9092"
         );
     }
 }

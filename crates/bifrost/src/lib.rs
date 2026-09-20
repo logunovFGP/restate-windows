@@ -12,12 +12,14 @@ mod appender;
 mod background_appender;
 mod bifrost;
 mod bifrost_admin;
+mod data_record;
 mod error;
 mod log_chain_writer;
 pub mod loglet;
 mod loglet_wrapper;
 pub mod providers;
 mod read_stream;
+pub mod read_stream_registry;
 mod record;
 mod sealed_loglet;
 mod service;
@@ -25,11 +27,15 @@ mod types;
 mod watchdog;
 
 pub use appender::Appender;
-pub use background_appender::{AppenderHandle, BackgroundAppender, CommitToken, LogSender};
+pub use background_appender::{
+    AppenderHandle, BackgroundAppender, CommitToken, EnqueueWithNotificationResult, LogSender,
+};
 pub use bifrost::{Bifrost, ErrorRecoveryStrategy};
 pub use bifrost_admin::{BifrostAdmin, MaybeSealedSegment};
-pub use error::{Error, Result};
+pub use data_record::{DataRecord, DataRecordError};
+pub use error::{EnqueueError, Error, Result};
 pub use read_stream::LogReadStream;
+pub use read_stream_registry::ActiveReadStreamRegistry;
 pub use record::{InputRecord, LogEntry, MaybeRecord, RecordKind};
 pub use service::BifrostService;
 pub use types::*;

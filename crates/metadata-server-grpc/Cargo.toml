@@ -20,7 +20,7 @@ restate-types = { workspace = true }
 
 bytes = { workspace = true }
 bytestring = { workspace = true }
-derive_more = { workspace = true }
+derive_more = { workspace = true, features = ["display"] }
 itertools = { workspace = true }
 prost = { workspace = true }
 prost-dto = { workspace = true }
@@ -33,3 +33,6 @@ ulid = { workspace = true, features = ["serde"] }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
+
+[lints]
+workspace = true

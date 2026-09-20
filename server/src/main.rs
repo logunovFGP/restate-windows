@@ -51,7 +51,7 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 // On linux, run jemalloc with profiling enabled, but inactive (so there is no performance impact)
-// If needed, profiling can be activated with :5122/debug/pprof/heap/activate, or by overriding this value with $MALLOC_CONF
+// If needed, profiling can be activated with :5122/debug/heap/activate, or by overriding this value with $MALLOC_CONF
 #[cfg(target_os = "linux")]
 #[unsafe(export_name = "malloc_conf")]
 pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
@@ -126,7 +126,7 @@ fn main() {
 
     let config_loader = config_loader_builder
         .load_env(true)
-        .path(config_path.clone())
+        .path(config_path)
         .cli_override(cli_args.opts_overrides.clone())
         .metadata_migration_mode(cli_args.metadata_migration_mode)
         .build()
@@ -239,10 +239,12 @@ fn main() {
             } else {
                 "[default]".to_owned()
             };
+
             info!(
                 node_name = Configuration::pinned().node_name(),
                 config_source = %config_source,
                 base_dir = %restate_types::config::node_filepath("").display(),
+                cpus = % Configuration::num_cpus(),
                 "Starting Restate Server {}",
                 build_info::build_info()
             );
@@ -259,7 +261,7 @@ fn main() {
             config_loader.start();
 
             // Initialize telemetry
-            let telemetry = telemetry::Telemetry::create(&Configuration::pinned().common);
+            let telemetry = telemetry::Telemetry::create(&Configuration::pinned());
             telemetry.start();
 
             let node = Node::create(Configuration::live(), prometheus, address_book).await;
@@ -293,6 +295,7 @@ fn main() {
                         );
                     },
                     _ = config_update_watcher.changed(), if !shutdown => {
+                        TaskCenter::with_current(|tc| tc.memory_controller().notify_config_update());
                         tracing_guard.on_config_update();
                     },
                     _ = signal::sighup_compact(), if !shutdown => {},

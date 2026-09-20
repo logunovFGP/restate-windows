@@ -15,7 +15,7 @@ use bytes::{Buf, BufMut};
 use restate_types::logs::{LogletId, LogletOffset};
 
 // log-store marker
-pub(super) const MARKER_KEY: &[u8] = b"storage-marker";
+pub const MARKER_KEY: &[u8] = b"storage-marker";
 
 // makes sure that it doesn't go unnoticed if this changed by mistake.
 static_assertions::const_assert_eq!(9, KeyPrefix::size());
@@ -25,9 +25,15 @@ static_assertions::const_assert_eq!(9, KeyPrefix::size());
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::TryFrom)]
 #[try_from(repr)]
 #[repr(u8)]
-pub(super) enum KeyPrefixKind {
+pub enum KeyPrefixKind {
     // data column family
     DataRecord = b'd',
+    /// Introduced in v1.7.0. No compatibility version barrier required.
+    /// Will receive writes in v1.7.0
+    LastKnownGlobalTail = b'g',
+    // Introduced in v1.7.0 for forward-compatibility.
+    // Should receive writes in >= v1.8
+    LocalTail = b'l',
     // metadata column family
     Sequencer = b's',
     TrimPoint = b't',
@@ -37,7 +43,7 @@ pub(super) enum KeyPrefixKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct KeyPrefix {
+pub struct KeyPrefix {
     kind: KeyPrefixKind,
     loglet_id: LogletId,
 }
@@ -85,13 +91,13 @@ impl KeyPrefix {
     }
 
     /// The number of bytes required for the binary representation of this value
-    pub(super) const fn size() -> usize {
+    pub const fn size() -> usize {
         size_of::<KeyPrefixKind>() + size_of::<LogletId>()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct DataRecordKey {
+pub struct DataRecordKey {
     prefix: KeyPrefix,
     offset: LogletOffset,
 }
@@ -152,7 +158,7 @@ impl DataRecordKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MetadataKey {
+pub struct MetadataKey {
     prefix: KeyPrefix,
 }
 
@@ -196,7 +202,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_data_record_key() {
+    fn data_record_key() {
         let key = DataRecordKey::new(1.into(), LogletOffset::new(2));
         let bytes = key.to_binary_array();
         let key2 = DataRecordKey::from_slice(&mut bytes.as_slice());
@@ -204,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_key() {
+    fn metadata_key() {
         let key = MetadataKey::new(KeyPrefixKind::Seal, 1.into());
         assert_eq!(*key.loglet_id(), 1);
         assert_eq!(key.kind(), KeyPrefixKind::Seal);
@@ -214,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn test_upper_bound() {
+    fn upper_bound() {
         // loglet is within bounds
         let my_key = DataRecordKey::new(10.into(), 10.into());
         let upper_bound_bytes = DataRecordKey::exclusive_upper_bound(10.into());

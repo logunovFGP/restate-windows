@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_with::{serde_as, skip_serializing_none};
 
-use restate_time_util::NonZeroFriendlyDuration;
+use restate_util_time::NonZeroFriendlyDuration;
 
 use crate::PlainNodeId;
 use crate::locality::NodeLocation;
@@ -123,7 +123,7 @@ pub struct CommonOptionCliOverride {
     #[clap(long, global = true)]
     pub metadata_store_address: Option<AdvertisedAddress<FabricPort>>,
 
-    /// Address to bind for the node-to-node communication. e.g. `0.0.0.0:5122`.
+    /// Address to bind for the node-to-node communication. e.g. `[::]:5122`.
     /// This overrides bind-ip and bind-port if set.
     #[clap(long, env = "RESTATE_BIND_ADDRESS", global = true)]
     pub bind_address: Option<BindAddress<FabricPort>>,
@@ -142,8 +142,6 @@ pub struct CommonOptionCliOverride {
     ///
     /// NOTE 1: This config entry only impacts the initial number of partitions, the
     /// value of this entry is ignored for bootstrapped nodes/clusters.
-    ///
-    /// NOTE 2: This will be renamed to `default-num-partitions` by default as of v1.3+
     ///
     /// Default: 24
     #[clap(long, global = true, alias = "bootstrap-num-partitions")]

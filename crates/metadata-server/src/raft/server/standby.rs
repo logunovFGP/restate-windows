@@ -22,12 +22,12 @@ use tracing::{Span, debug, instrument, trace};
 use restate_core::network::net_util::{DNSResolution, create_tonic_channel};
 use restate_core::{Metadata, MetadataWriter};
 use restate_metadata_providers::replicated::KnownLeader;
-use restate_time_util::DurationExt;
 use restate_types::Version;
 use restate_types::config::Configuration;
 use restate_types::net::metadata::MetadataKind;
 use restate_types::nodes_config::{MetadataServerState, NodesConfiguration, Role};
 use restate_types::retries::RetryPolicy;
+use restate_util_time::DurationExt;
 
 use crate::raft::network::ConnectionManager;
 use crate::raft::network::grpc_svc::new_metadata_server_network_client;
@@ -121,7 +121,7 @@ impl Standby {
                         // nodes_config might still be uninitialized if we haven't joined a cluster yet.
                         // Once nodes store the last seen nodes configuration, we can assume that the
                         // nodes configuration is valid when starting the metadata server in standby.
-                        if let Some(my_cluster_fingerprint) = nodes_config.try_cluster_fingerprint() && my_cluster_fingerprint != incoming_fingerprint {
+                        if let Some(my_cluster_fingerprint) = nodes_config.cluster_fingerprint() && my_cluster_fingerprint != incoming_fingerprint {
                             request.fail(RequestError::ClusterIdentityMismatch(format!("cluster fingerprint mismatch: expected {}, got {}", my_cluster_fingerprint, incoming_fingerprint)));
                             continue;
                         }
@@ -292,7 +292,7 @@ impl Standby {
             .join_cluster(network::grpc_svc::JoinClusterRequest {
                 node_id: u32::from(member_id.node_id),
                 created_at_millis: member_id.created_at_millis,
-                cluster_fingerprint: nodes_config.cluster_fingerprint().to_u64(),
+                cluster_fingerprint: nodes_config.cluster_fingerprint().map_or(0, |f| f.to_u64()),
                 cluster_name: Some(nodes_config.cluster_name().to_owned()),
             })
             .await
@@ -301,7 +301,7 @@ impl Standby {
                 .into_inner()
                 .nodes_config_version
                 .map(Version::from)
-                .unwrap_or(Metadata::with_current(|m| m.nodes_config_version()))),
+                .unwrap_or_else(|| Metadata::with_current(|m| m.nodes_config_version()))),
             Err(status) => {
                 let known_leader = KnownLeader::from_status(&status);
                 Err(JoinError::Rpc(Box::new(status), known_leader))

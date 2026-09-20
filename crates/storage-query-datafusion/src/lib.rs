@@ -8,27 +8,31 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-mod analyzer;
 pub mod context;
 
 pub mod remote_query_scanner_server;
 
+pub mod bifrost_read_stream;
+pub mod config;
 mod deployment;
-mod idempotency;
 mod inbox;
 mod invocation_state;
 mod invocation_status;
 mod journal;
 mod journal_events;
-mod keyed_service_status;
+mod locks;
 mod log;
+pub mod loglet_worker;
 mod node;
+pub mod node_fan_out;
 mod partition;
 mod partition_replica_set;
 mod partition_state;
 mod partition_store_scanner;
 mod promise;
+mod rules;
 mod scanner_task;
+mod scheduler_status;
 mod service;
 mod state;
 mod statistics;
@@ -36,7 +40,12 @@ mod statistics;
 pub mod table_docs;
 mod table_macro;
 mod table_providers;
-mod table_util;
+mod user_limits;
+mod vqueue_entry_status;
+mod vqueue_meta;
+mod vqueues;
+pub use table_providers::Scan;
+pub mod table_util;
 
 use std::sync::Arc;
 
@@ -54,7 +63,7 @@ use prost::Message;
 pub(crate) mod mocks;
 
 pub mod empty_invoker_status_handle;
-mod partition_filter;
+mod filter;
 pub mod remote_query_scanner_client;
 pub mod remote_query_scanner_manager;
 #[cfg(test)]

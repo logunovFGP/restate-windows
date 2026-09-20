@@ -9,46 +9,33 @@
 // by the Apache License, Version 2.0.
 
 use super::*;
-use restate_types::identifiers::{InvocationId, WithPartitionKey};
+use restate_types::identifiers::InvocationId;
 use restate_types::invocation::{
     IngressInvocationResponseSink, InvocationMutationResponseSink, PurgeInvocationRequest,
 };
-use restate_types::net::partition_processor::PurgeInvocationRpcResponse;
-use restate_wal_protocol::Command;
+use restate_wal_protocol::v2::commands;
 
 pub(super) struct Request {
     pub(super) request_id: PartitionProcessorRpcRequestId,
     pub(super) invocation_id: InvocationId,
 }
 
-impl<'a, TActuator: Actuator, TSchemas, TStorage> RpcHandler<Request>
-    for RpcContext<'a, TActuator, TSchemas, TStorage>
-{
-    type Output = PurgeInvocationRpcResponse;
-    type Error = ();
-
+impl<'a, TSchemas, TStorage> RpcHandler<Request> for RpcContext<'a, TSchemas, TStorage> {
     async fn handle(
         self,
         Request {
             request_id,
             invocation_id,
         }: Request,
-        replier: Replier<Self::Output>,
-    ) -> Result<(), Self::Error> {
-        self.proposer
-            .handle_rpc_proposal_command(
-                invocation_id.partition_key(),
-                Command::PurgeInvocation(PurgeInvocationRequest {
-                    invocation_id,
-                    response_sink: Some(InvocationMutationResponseSink::Ingress(
-                        IngressInvocationResponseSink { request_id },
-                    )),
-                }),
-                request_id,
-                replier,
-            )
-            .await;
-
-        Ok(())
+    ) -> Decision {
+        Decision::Propose(RpcProposal::new(
+            commands::PurgeInvocationCommand::from(PurgeInvocationRequest {
+                invocation_id,
+                response_sink: Some(InvocationMutationResponseSink::Ingress(
+                    IngressInvocationResponseSink { request_id },
+                )),
+            }),
+            ReplyOn::Apply { request_id },
+        ))
     }
 }

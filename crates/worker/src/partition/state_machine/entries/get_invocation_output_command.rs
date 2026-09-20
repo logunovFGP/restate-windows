@@ -8,31 +8,37 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
-use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
 use restate_storage_api::fsm_table::WriteFsmTable;
-use restate_storage_api::outbox_table::{OutboxMessage, WriteOutboxTable};
+use restate_storage_api::outbox_table::WriteOutboxTable;
 use restate_storage_api::timer_table::WriteTimerTable;
 use restate_types::invocation::{AttachInvocationRequest, ServiceInvocationResponseSink};
 use restate_types::journal_v2::GetInvocationOutputCommand;
+use restate_wal_protocol::v2::commands;
+
+use crate::partition::processor::*;
+use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
+use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
 
 pub(super) type ApplyGetInvocationOutputCommand<'e> =
     ApplyJournalCommandEffect<'e, GetInvocationOutputCommand>;
 
-impl<'e, 'ctx: 'e, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'e, 'ctx: 'e, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for ApplyGetInvocationOutputCommand<'e>
 where
     S: WriteTimerTable + WriteOutboxTable + WriteFsmTable,
+    P: ProcessorContext,
 {
-    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
-        ctx.handle_outgoing_message(OutboxMessage::AttachInvocation(AttachInvocationRequest {
-            invocation_query: self.entry.target.into(),
-            block_on_inflight: false,
-            response_sink: ServiceInvocationResponseSink::partition_processor(
-                self.invocation_id,
-                self.entry.completion_id,
-            ),
-        }))?;
+    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S, P>) -> Result<(), Error> {
+        ctx.do_enqueue_into_outbox(commands::AttachInvocationCommand::from(
+            AttachInvocationRequest {
+                invocation_query: self.entry.target.into(),
+                block_on_inflight: false,
+                response_sink: ServiceInvocationResponseSink::partition_processor(
+                    self.invocation_id,
+                    self.entry.completion_id,
+                ),
+            },
+        ))?;
 
         Ok(())
     }
@@ -55,8 +61,9 @@ mod tests {
     use restate_types::journal_v2::{
         AttachInvocationTarget, CommandType, Entry, EntryMetadata, EntryType,
         GetInvocationOutputCommand, GetInvocationOutputCompletion, GetInvocationOutputResult,
+        NotificationId,
     };
-    use restate_wal_protocol::Command;
+    use restate_wal_protocol::v2::{Command, commands};
     use rstest::rstest;
 
     #[rstest]
@@ -89,12 +96,14 @@ mod tests {
             completion_id,
         };
         let response_command = if complete_using_notify_get_invocation_output {
-            Command::NotifyGetInvocationOutputResponse(GetInvocationOutputResponse {
-                target: JournalCompletionTarget::from_parts(invocation_id, completion_id),
-                result: expected_get_invocation_result.clone(),
-            })
+            commands::NotifyGetInvocationOutputResponseCommand::test_envelope(
+                GetInvocationOutputResponse {
+                    target: JournalCompletionTarget::from_parts(invocation_id, completion_id),
+                    result: expected_get_invocation_result.clone(),
+                },
+            )
         } else {
-            Command::InvocationResponse(InvocationResponse {
+            commands::InvocationResponseCommand::test_envelope(InvocationResponse {
                 target: JournalCompletionTarget::from_parts(invocation_id, completion_id),
                 result: if complete_with_not_ready {
                     ResponseResult::Failure(NOT_READY_INVOCATION_ERROR)
@@ -136,7 +145,8 @@ mod tests {
                 })),
                 contains(matchers::actions::forward_notification(
                     invocation_id,
-                    get_invocation_output_completion.clone()
+                    2,
+                    NotificationId::CompletionId(completion_id),
                 ))
             ]
         );

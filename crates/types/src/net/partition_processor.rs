@@ -11,20 +11,25 @@
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::identifiers::{
     DeploymentId, EntryIndex, InvocationId, PartitionId, PartitionKey,
     PartitionProcessorRpcRequestId, WithPartitionKey,
 };
 use crate::invocation::client::{
-    CancelInvocationResponse, InvocationOutput, KillInvocationResponse, PatchDeploymentId,
-    PauseInvocationResponse, PurgeInvocationResponse, RestartAsNewInvocationResponse,
-    ResumeInvocationResponse, SubmittedInvocationNotification,
+    CancelInvocationResponse, InvocationOutput, InvocationStatus, KillInvocationResponse,
+    PatchDeploymentId, PauseInvocationResponse, PurgeInvocationResponse,
+    RestartAsNewInvocationResponse, ResumeInvocationResponse, SubmittedInvocationNotification,
 };
 use crate::invocation::{InvocationQuery, InvocationRequest, InvocationResponse};
 use crate::journal_v2::Signal;
-use crate::net::ServiceTag;
+use crate::net::codec::{
+    EncodeError, WireDecode, WireEncode, decode_as_flexbuffers, encode_as_flexbuffers,
+};
+use crate::net::{ProtocolVersion, ServiceTag};
 use crate::net::{default_wire_codec, define_rpc, define_service};
-use serde::{Deserialize, Serialize};
+use crate::time::MillisSinceEpoch;
 
 pub struct PartitionLeaderService;
 
@@ -38,7 +43,7 @@ define_rpc! {
     @response = Result<PartitionProcessorRpcResponse, PartitionProcessorRpcError>,
     @service = PartitionLeaderService,
 }
-default_wire_codec!(PartitionProcessorRpcRequest);
+
 default_wire_codec!(Result<PartitionProcessorRpcResponse, PartitionProcessorRpcError>);
 
 /// Requests to individual partition processors. We still need to route them through the PP manager.
@@ -46,12 +51,53 @@ default_wire_codec!(Result<PartitionProcessorRpcResponse, PartitionProcessorRpcE
 pub struct PartitionProcessorRpcRequest {
     pub request_id: PartitionProcessorRpcRequestId,
     pub partition_id: PartitionId,
+    /// Time at which the source node sent the request.
+    pub sent_at: Option<MillisSinceEpoch>,
     pub inner: PartitionProcessorRpcRequestInner,
+}
+
+impl WireEncode for PartitionProcessorRpcRequest {
+    fn encode_to_bytes(
+        &self,
+        protocol_version: ProtocolVersion,
+    ) -> Result<::bytes::Bytes, EncodeError> {
+        // PauseInvocation required protocol version V3
+        if matches!(
+            &self.inner,
+            PartitionProcessorRpcRequestInner::PauseInvocation { .. },
+        ) && protocol_version < ProtocolVersion::V3
+        {
+            return Err(EncodeError::IncompatibleVersion {
+                type_tag: stringify!(PartitionProcessorRpcRequest),
+                min_required: ProtocolVersion::V3,
+                actual: protocol_version,
+            });
+        }
+
+        Ok(::bytes::Bytes::from(encode_as_flexbuffers(self)))
+    }
+}
+
+impl WireDecode for PartitionProcessorRpcRequest {
+    type Error = anyhow::Error;
+
+    fn try_decode(
+        buf: impl bytes::Buf,
+        protocol_version: ProtocolVersion,
+    ) -> Result<Self, anyhow::Error>
+    where
+        Self: Sized,
+    {
+        decode_as_flexbuffers(buf, protocol_version)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AppendInvocationReplyOn {
     /// With this mode, the PP will reply as soon as the log append is done with [`PartitionProcessorRpcResponse::Appended`].
+    ///
+    /// The record is appended without dedup information so it is never filtered during leadership
+    /// transitions.
     Appended,
     /// With this mode, the PP will reply with the [`PartitionProcessorRpcResponse::Submitted`] when available.
     Submitted,
@@ -71,6 +117,9 @@ pub enum GetInvocationOutputResponseMode {
 pub enum PartitionProcessorRpcRequestInner {
     AppendInvocation(Arc<InvocationRequest>, AppendInvocationReplyOn),
     GetInvocationOutput(InvocationQuery, GetInvocationOutputResponseMode),
+    GetInvocationStatus {
+        invocation_id: InvocationId,
+    },
     AppendInvocationResponse(InvocationResponse),
     AppendSignal(InvocationId, Signal),
     CancelInvocation {
@@ -94,6 +143,7 @@ pub enum PartitionProcessorRpcRequestInner {
         invocation_id: InvocationId,
         deployment_id: PatchDeploymentId,
     },
+    // *Since v1.6/Protocol Version V3*
     PauseInvocation {
         invocation_id: InvocationId,
     },
@@ -125,6 +175,9 @@ impl WithPartitionKey for PartitionProcessorRpcRequestInner {
                 invocation_id.partition_key()
             }
             PartitionProcessorRpcRequestInner::PauseInvocation { invocation_id } => {
+                invocation_id.partition_key()
+            }
+            PartitionProcessorRpcRequestInner::GetInvocationStatus { invocation_id } => {
                 invocation_id.partition_key()
             }
         }
@@ -488,6 +541,7 @@ pub enum PartitionProcessorRpcResponse {
     NotSupported,
     Submitted(SubmittedInvocationNotification),
     Output(InvocationOutput),
+    Status(InvocationStatus),
     CancelInvocation(CancelInvocationRpcResponse),
     KillInvocation(KillInvocationRpcResponse),
     PurgeInvocation(PurgeInvocationRpcResponse),

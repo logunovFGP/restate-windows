@@ -16,19 +16,20 @@ restate-workspace-hack = { workspace = true }
 
 restate-core = { workspace = true }
 restate-errors = { workspace = true }
-restate-serde-util = { workspace = true }
-restate-time-util = { workspace = true }
 restate-types = { workspace = true }
+restate-util-bytecount = { workspace = true, features = ["serde"] }
+restate-util-random = { workspace = true }
+restate-util-time = { workspace = true }
 
 anyhow = { workspace = true }
 bytes = { workspace = true }
 codederror = { workspace = true }
 derive_builder = { workspace = true }
-derive_more = { workspace = true }
+derive_more = { workspace = true, features = ["as_ref", "debug", "deref", "display", "from", "into"] }
 metrics = {workspace = true }
 parking_lot = { workspace = true }
 rocksdb = { workspace = true }
-smartstring = { workspace = true }
+restate-util-string = { workspace = true }
 static_assertions = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
@@ -45,3 +46,6 @@ tikv-jemalloc-sys = { workspace = true }
 [dev-dependencies]
 restate-test-util = { workspace = true }
 restate-types = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

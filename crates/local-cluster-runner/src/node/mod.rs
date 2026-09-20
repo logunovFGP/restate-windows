@@ -55,12 +55,12 @@ use restate_metadata_server_grpc::grpc::{
 };
 use restate_metadata_store::protobuf::metadata_proxy_svc::client::MetadataStoreProxy;
 use restate_metadata_store::{MetadataStoreClient, ReadError};
-use restate_types::config::InvalidConfigurationError;
+use restate_types::config::{InvalidConfigurationError, TlsMode};
 use restate_types::logs::metadata::ProviderConfiguration;
 use restate_types::net::address::{
     AdminPort, AdvertisedAddress, FabricPort, HttpIngressPort, ListenerPort, PeerNetAddress,
 };
-use restate_types::nodes_config::MetadataServerState;
+use restate_types::nodes_config::{ClusterFeature, MetadataServerState};
 use restate_types::protobuf::common::MetadataServerStatus;
 use restate_types::replication::ReplicationProperty;
 use restate_types::retries::RetryPolicy;
@@ -95,6 +95,12 @@ pub struct NodeSpec {
     inherit_env: bool,
     #[builder(default)]
     env: Vec<(String, String)>,
+    /// If true, child processes are placed in their own process group,
+    /// isolating them from terminal signals (e.g. Ctrl+C). Default is false,
+    /// meaning children share the parent's process group and receive signals
+    /// like SIGINT directly.
+    #[builder(default = false)]
+    isolate_process_group: bool,
     #[builder(default)]
     #[serde(skip)]
     searcher: Searcher,
@@ -128,14 +134,30 @@ fn alloc_test_port() -> SocketAddr {
     crate::random_socket_address().expect("a free TCP port for the test node")
 }
 
+/// The address the harness uses to reach a pinned TCP socket.
+///
+/// Only the fabric port carries TLS, and only when fabric TLS is configured -- which tests
+/// do after building the node, so the scheme is decided here rather than at pin time.
+fn tcp_advertised<P: ListenerPort>(addr: SocketAddr, tls: bool) -> AdvertisedAddress<P> {
+    let scheme = if tls { "https" } else { "http" };
+    format!("{scheme}://{addr}")
+        .parse()
+        .expect("a socket address forms a valid uri")
+}
+
 impl NodeSpec {
     /// The address the harness uses to reach this node's fabric port.
     ///
     /// A TCP socket pinned at construction where unix domain sockets are unavailable,
     /// otherwise the socket path under this node's base dir.
     pub fn fabric_advertised_address(&self, node_base_dir: &Path) -> AdvertisedAddress<FabricPort> {
-        let (fabric, _, _) = self.base_config.pinned_advertised_addresses();
-        fabric.unwrap_or_else(|| AdvertisedAddress::with_node_base_dir(node_base_dir))
+        match self.base_config.pinned_bind_sockets().0 {
+            Some(addr) => tcp_advertised(
+                addr,
+                self.base_config.common.fabric_tls_mode() != TlsMode::Off,
+            ),
+            None => AdvertisedAddress::with_node_base_dir(node_base_dir),
+        }
     }
 
     pub fn node_name(&self) -> &str {
@@ -256,6 +278,7 @@ impl NodeSpec {
             args,
             inherit_env,
             env,
+            isolate_process_group,
             searcher,
         } = &self;
 
@@ -268,16 +291,26 @@ impl NodeSpec {
         .map_err(NodeStartError::Absolute)?;
 
         // set advertised addresses to make it easier to address this node from the test harness.
-        let (pinned_fabric, pinned_admin, pinned_ingress) =
-            base_config.pinned_advertised_addresses();
-        let fabric_advertised_address =
-            pinned_fabric.unwrap_or_else(|| AdvertisedAddress::with_node_base_dir(&node_base_dir));
-        let ingress_advertised_address = base_config.has_role(Role::HttpIngress).then(|| {
-            pinned_ingress.unwrap_or_else(|| AdvertisedAddress::with_node_base_dir(&node_base_dir))
-        });
-        let admin_advertised_address = base_config.has_role(Role::Admin).then(|| {
-            pinned_admin.unwrap_or_else(|| AdvertisedAddress::with_node_base_dir(&node_base_dir))
-        });
+        let (pinned_fabric, pinned_admin, pinned_ingress) = base_config.pinned_bind_sockets();
+        let fabric_tls = base_config.common.fabric_tls_mode() != TlsMode::Off;
+        let fabric_advertised_address = match pinned_fabric {
+            Some(addr) => tcp_advertised(addr, fabric_tls),
+            None => AdvertisedAddress::with_node_base_dir(&node_base_dir),
+        };
+        let ingress_advertised_address =
+            base_config
+                .has_role(Role::HttpIngress)
+                .then(|| match pinned_ingress {
+                    Some(addr) => tcp_advertised(addr, false),
+                    None => AdvertisedAddress::with_node_base_dir(&node_base_dir),
+                });
+        let admin_advertised_address =
+            base_config
+                .has_role(Role::Admin)
+                .then(|| match pinned_admin {
+                    Some(addr) => tcp_advertised(addr, false),
+                    None => AdvertisedAddress::with_node_base_dir(&node_base_dir),
+                });
 
         if !node_base_dir.exists() {
             std::fs::create_dir_all(&node_base_dir).map_err(NodeStartError::CreateDirectory)?;
@@ -327,9 +360,15 @@ impl NodeSpec {
         .kill_on_drop(true)
         .args(args);
 
-        // On Unix, use process_group(0) to avoid terminal control C being propagated
+        // process_group(0) avoids terminal Ctrl+C being propagated. It is a Unix-only
+        // CommandExt method, so it is gated as well as opt-in.
         #[cfg(unix)]
-        cmd.process_group(0);
+        if *isolate_process_group {
+            cmd.process_group(0);
+        }
+        // there is no process-group equivalent here, so the flag is inert off Unix
+        #[cfg(not(unix))]
+        let _ = isolate_process_group;
 
         let mut child = cmd.spawn().map_err(NodeStartError::SpawnError)?;
         let pid = child.id().expect("child to have a pid");
@@ -648,10 +687,10 @@ impl StartedNode {
         info!("Restarting node '{}'", self.config().node_name());
 
         match termination_signal {
-            TerminationSignal::SIGKILL => {
+            TerminationSignal::Sigkill => {
                 self.kill().await?;
             }
-            TerminationSignal::SIGTERM => {
+            TerminationSignal::Sigterm => {
                 self.terminate()?;
                 (&mut self.status).await?;
             }
@@ -920,6 +959,7 @@ impl StartedNode {
         num_partitions: Option<NonZeroU16>,
         partition_replication: ReplicationProperty,
         provider_configuration: Option<ProviderConfiguration>,
+        disabled_features: EnumSet<ClusterFeature>,
     ) -> anyhow::Result<bool> {
         let channel = create_tonic_channel(
             self.advertised_address().clone(),
@@ -943,6 +983,10 @@ impl StartedNode {
                     .target_nodeset_size()
                     .map(|nodeset_size| nodeset_size.as_u32())
             }),
+            disabled_features: disabled_features
+                .iter()
+                .map(|f| restate_core::protobuf::node_ctl_svc::ClusterFeature::from(f) as i32)
+                .collect(),
         };
 
         let retry_policy = RetryPolicy::exponential(
@@ -1033,8 +1077,8 @@ impl StartedNode {
 /// How to terminate a running Restate process
 #[derive(Debug, Clone, Copy, strum::EnumIter)]
 pub enum TerminationSignal {
-    SIGKILL,
-    SIGTERM,
+    Sigkill,
+    Sigterm,
 }
 
 impl TerminationSignal {

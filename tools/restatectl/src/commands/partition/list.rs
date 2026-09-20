@@ -21,7 +21,8 @@ use restate_core::protobuf::cluster_ctrl_svc::{ClusterStateRequest, new_cluster_
 use restate_types::logs::Lsn;
 use restate_types::nodes_config::Role;
 use restate_types::protobuf::cluster::{
-    DeadNode, PartitionProcessorStatus, ReplayStatus, RunMode, node_state,
+    BrokenReason, DeadNode, DetailedRunMode, PartitionProcessorStatus, ReplayStatus, RunMode,
+    node_state,
 };
 use restate_types::{GenerationalNodeId, PlainNodeId, Version};
 
@@ -91,11 +92,11 @@ pub async fn list_partitions(
                         .as_ref()
                         .expect("alive partition has a node id");
                     let host_node = GenerationalNodeId::from(*host);
+                    let leadership_epoch =
+                        status.last_observed_leader_epoch.unwrap_or_default().value;
                     let details = PartitionListEntry { host_node, status };
                     partitions.push((partition_id, details));
 
-                    let leadership_epoch =
-                        status.last_observed_leader_epoch.unwrap_or_default().value;
                     max_epoch_per_partition
                         .entry(partition_id)
                         .and_modify(|existing| {
@@ -110,7 +111,18 @@ pub async fn list_partitions(
     // Show information organized by partition and node
     let mut partitions_table = Table::new_styled();
     partitions_table.set_styled_header(vec![
-        "ID", "NODE", "MODE", "STATUS", "EPOCH", "APPLIED", "DURABLE", "ARCHIVED", "LSN-LAG",
+        "ID",
+        "NODE",
+        "MODE",
+        "STATUS",
+        "EPOCH",
+        "APPLIED",
+        "DURABLE",
+        "ARCHIVED",
+        "LSN-LAG",
+        "SCHEMA",
+        "RULE-BOOK",
+        "FEATURES",
         "UPDATED",
     ]);
 
@@ -165,12 +177,14 @@ pub async fn list_partitions(
                 Cell::new(processor.host_node),
                 render_mode(
                     processor.status.planned_mode(),
+                    processor.status.detailed_effective_mode(),
                     processor.status.effective_mode(),
                     outdated_leadership_epoch,
                 ),
                 render_replay_status(
                     processor.status.effective_mode(),
                     processor.status.replay_status(),
+                    processor.status.broken_reason(),
                     processor.status.target_tail_lsn.map(Into::into),
                 ),
                 Cell::new(
@@ -178,7 +192,7 @@ pub async fn list_partitions(
                         .status
                         .last_observed_leader_epoch
                         .map(|x| x.to_string())
-                        .unwrap_or("-".to_owned()),
+                        .unwrap_or_else(|| "-".to_owned()),
                 )
                 .fg(observed_leader_color),
                 Cell::new(
@@ -186,21 +200,21 @@ pub async fn list_partitions(
                         .status
                         .last_applied_log_lsn
                         .map(|x| x.to_string())
-                        .unwrap_or("-".to_owned()),
+                        .unwrap_or_else(|| "-".to_owned()),
                 ),
                 Cell::new(
                     processor
                         .status
                         .durable_lsn
                         .map(|x| x.to_string())
-                        .unwrap_or("-".to_owned()),
+                        .unwrap_or_else(|| "-".to_owned()),
                 ),
                 Cell::new(
                     processor
                         .status
                         .last_archived_log_lsn
                         .map(|x| x.to_string())
-                        .unwrap_or("-".to_owned()),
+                        .unwrap_or_else(|| "-".to_owned()),
                 ),
                 Cell::new(
                     processor
@@ -211,8 +225,27 @@ pub async fn list_partitions(
                             // (tail - 1) - applied_lsn = tail - (applied_lsn + 1)
                             tail.value.saturating_sub(applied.value + 1).to_string()
                         })
-                        .unwrap_or("-".to_owned()),
+                        .unwrap_or_else(|| "-".to_owned()),
                 ),
+                Cell::new(
+                    processor
+                        .status
+                        .last_applied_schema_version
+                        .map(|v| Version::from(v).to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                ),
+                Cell::new(
+                    processor
+                        .status
+                        .last_applied_rule_book_version
+                        .map(|v| Version::from(v).to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                ),
+                Cell::new(if processor.status.enabled_features.is_empty() {
+                    "-".to_owned()
+                } else {
+                    processor.status.enabled_features.join(",")
+                }),
                 render_as_duration(processor.status.updated_at, Tense::Past),
             ]);
         });
@@ -247,20 +280,45 @@ pub async fn list_partitions(
     Ok(())
 }
 
-fn render_mode(planned: RunMode, effective: RunMode, outdated_leadership_epoch: bool) -> Cell {
-    match (planned, planned == effective, outdated_leadership_epoch) {
+fn render_mode(
+    planned: RunMode,
+    detailed_mode: DetailedRunMode,
+    effective: RunMode,
+    outdated_leadership_epoch: bool,
+) -> Cell {
+    let detailed: DetailedRunMode = match detailed_mode {
+        DetailedRunMode::Unknown => effective.into(),
+        other => other,
+    };
+
+    match (planned, detailed == planned, outdated_leadership_epoch) {
         (RunMode::Leader, true, false) => Cell::new("Leader")
             .fg(Color::Blue)
             .add_attribute(Attribute::Bold),
         (RunMode::Leader, true, true) => Cell::new("Leader").fg(Color::Red),
         (RunMode::Follower, true, _) => Cell::new("Follower"),
-        (_, false, false) => Cell::new(format!("{effective}->{planned}")).fg(Color::Magenta),
-        (_, false, true) => Cell::new(format!("{effective}->{planned}")).fg(Color::Red),
+        (_, false, false) => Cell::new(format!("{detailed}->{planned}")).fg(Color::Magenta),
+        (_, false, true) => Cell::new(format!("{detailed}->{planned}")).fg(Color::Red),
         (RunMode::Unknown, _, _) => Cell::new("UNKNOWN").fg(Color::Red),
     }
 }
 
-fn render_replay_status(effective: RunMode, status: ReplayStatus, target_lsn: Option<Lsn>) -> Cell {
+fn render_replay_status(
+    effective: RunMode,
+    status: ReplayStatus,
+    broken_reason: BrokenReason,
+    target_lsn: Option<Lsn>,
+) -> Cell {
+    // A broken processor isn't running at all, so its replay status carries no information.
+    match broken_reason {
+        BrokenReason::NotBroken => {}
+        BrokenReason::AheadOfLog => {
+            return Cell::new("Broken (ahead-of-log)")
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold);
+        }
+    }
+
     match (status, effective) {
         (ReplayStatus::Unknown, _) => Cell::new("UNKNOWN").fg(Color::Red),
         (ReplayStatus::Starting, _) => Cell::new("Starting").fg(Color::Yellow),
@@ -269,7 +327,9 @@ fn render_replay_status(effective: RunMode, status: ReplayStatus, target_lsn: Op
         (ReplayStatus::Active, RunMode::Unknown) => Cell::new("Active?").fg(Color::Red),
         (ReplayStatus::CatchingUp, _) => Cell::new(format!(
             "Catching Up ({})",
-            target_lsn.map(|x| x.to_string()).unwrap_or("-".to_owned())
+            target_lsn
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "-".to_owned())
         ))
         .fg(Color::Magenta),
     }

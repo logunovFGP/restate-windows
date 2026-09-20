@@ -26,7 +26,7 @@ use crate::nodes_config::{NodesConfiguration, StorageState};
 use super::DecoratedNodeSet;
 use super::{NodeSet, ReplicationProperty};
 
-type SmartString = smartstring::SmartString<smartstring::LazyCompact>;
+use restate_util_string::ReString;
 
 /// Possible results of f-majority checks for a subset of the NodeSet.
 /// Read variant docs for details.
@@ -498,7 +498,7 @@ impl<Attr: Eq + Hash + Clone + std::fmt::Debug> NodeSetChecker<Attr> {
                 .as_mut_ref()
                 .per_attribute_counter
                 .entry(attr.clone())
-                .or_insert(Count::default());
+                .or_insert_with(Count::default);
             counters.increment(storage_state);
             let counters_num_authoritative_nodes = counters.num_authoritative_nodes;
             let counters_num_readable_nodes = counters.num_readable_nodes;
@@ -674,7 +674,7 @@ impl<Attr> HashPtr<Attr> {
 #[derive(Debug)]
 struct LocationScopeState<Attr> {
     /// domains at that scope
-    failure_domains: HashMap<SmartString, Box<FailureDomainState<Attr>>>,
+    failure_domains: HashMap<ReString, Box<FailureDomainState<Attr>>>,
     /// maps between node-id to the domain it belongs to for fast lookups
     node_to_fd: HashMap<PlainNodeId, HashPtr<Attr>>,
     /// replication factor at that scope
@@ -784,7 +784,7 @@ mod tests {
     use crate::nodes_config::{
         LogServerConfig, NodeConfig, NodesConfiguration, Role, StorageState,
     };
-    use crate::{GenerationalNodeId, PlainNodeId};
+    use crate::{GenerationalNodeId, PlainNodeId, RestateVersion};
 
     /// Generate a test address that works on the current platform
     fn test_address(id: PlainNodeId) -> String {
@@ -812,6 +812,7 @@ mod tests {
             .address(test_address(id).parse().unwrap())
             .roles(Role::LogServer.into())
             .log_server_config(LogServerConfig { storage_state })
+            .binary_version(RestateVersion::current())
             .build()
     }
 

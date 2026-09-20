@@ -15,12 +15,11 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use bytestring::ByteString;
 use metrics::{counter, histogram};
-use restate_serde_util::ByteCount;
 use restate_types::config::Configuration;
+use restate_util_bytecount::ByteCount;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use restate_time_util::DurationExt;
 use restate_types::errors::{
     BoxedMaybeRetryableError, GenericError, IntoMaybeRetryable, MaybeRetryableError,
 };
@@ -31,6 +30,7 @@ use restate_types::retries::RetryPolicy;
 use restate_types::schema::Schema;
 use restate_types::storage::{StorageCodec, StorageDecode, StorageEncode, StorageEncodeError};
 use restate_types::{Version, Versioned};
+use restate_util_time::DurationExt;
 
 use crate::metric_definitions::{
     METADATA_CLIENT_GET_DURATION, METADATA_CLIENT_GET_TOTAL, METADATA_CLIENT_GET_VERSION_DURATION,
@@ -443,7 +443,10 @@ impl MetadataStoreClient {
                             );
                             tokio::time::sleep(backoff).await;
                         } else {
-                            return Err(ReadWriteError::RetriesExhausted(key));
+                            return Err(ReadWriteError::RetriesExhausted(
+                                key,
+                                WriteError::FailedPrecondition(msg).into(),
+                            ));
                         }
                     }
                     Err(err) => return Err(err.into()),
@@ -491,7 +494,11 @@ impl MetadataStoreClient {
                             );
                             tokio::time::sleep(backoff).await;
                         } else {
-                            return Err(ReadWriteError::RetriesExhausted(key).into());
+                            return Err(ReadWriteError::RetriesExhausted(
+                                key,
+                                WriteError::FailedPrecondition(msg).into(),
+                            )
+                            .into());
                         }
                     }
                     Err(err) => return Err(ReadModifyWriteError::ReadWrite(err.into())),
@@ -580,8 +587,8 @@ pub enum ReadWriteError {
     Other(BoxedMaybeRetryableError),
     #[error("codec error: {0}")]
     Codec(GenericError),
-    #[error("retries for operation on key '{0}' exhausted")]
-    RetriesExhausted(ByteString),
+    #[error("retries for operation on key '{0}' exhausted; last error: {1}")]
+    RetriesExhausted(ByteString, GenericError),
 }
 
 impl MaybeRetryableError for ReadWriteError {
@@ -589,7 +596,7 @@ impl MaybeRetryableError for ReadWriteError {
         match self {
             ReadWriteError::Other(err) => err.retryable(),
             ReadWriteError::Codec(_) => false,
-            ReadWriteError::RetriesExhausted(_) => true,
+            ReadWriteError::RetriesExhausted(_, _) => true,
         }
     }
 }

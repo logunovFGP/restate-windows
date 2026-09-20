@@ -595,7 +595,7 @@ pub mod tests {
         LogServerConfig, NodeConfig, NodesConfiguration, Role, StorageState,
     };
     use crate::replication::{NodeSet, ReplicationProperty};
-    use crate::{GenerationalNodeId, PlainNodeId};
+    use crate::{GenerationalNodeId, PlainNodeId, RestateVersion};
 
     use super::*;
 
@@ -644,6 +644,7 @@ pub mod tests {
             .address(test_address(id).parse().unwrap())
             .roles(role.into())
             .log_server_config(LogServerConfig { storage_state })
+            .binary_version(RestateVersion::current())
             .build()
     }
 

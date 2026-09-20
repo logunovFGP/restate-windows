@@ -27,7 +27,7 @@ pub(crate) fn append_partition_row(
     row.fmt_gen_node_id(node_id);
     row.fmt_target_mode(state.planned_mode);
 
-    row.fmt_effective_mode(state.effective_mode);
+    row.fmt_effective_mode(state.effective_mode());
 
     row.updated_at(state.updated_at.as_u64() as i64);
     if let Some(epoch) = state.last_observed_leader_epoch {
@@ -46,7 +46,14 @@ pub(crate) fn append_partition_row(
         row.last_record_applied_at(ts.as_u64() as i64);
     }
 
-    row.fmt_replay_status(state.replay_status);
+    if state.is_broken() {
+        // A parked processor is not replaying anything. Leave the column NULL rather than
+        // reporting the default `starting`, which would read as progress.
+        row.fmt_broken_reason(state.broken_reason);
+    } else {
+        row.fmt_replay_status(state.replay_status);
+    }
+
     if let Some(lsn) = state.durable_lsn {
         row.durable_log_lsn(lsn.into());
     }
@@ -58,4 +65,16 @@ pub(crate) fn append_partition_row(
     if let Some(lsn) = state.target_tail_lsn {
         row.target_tail_lsn(lsn.into());
     }
+
+    if let Some(version) = state.last_applied_rule_book_version {
+        row.applied_rule_book_version(u32::from(version));
+    }
+
+    if let Some(version) = state.last_applied_schema_version {
+        row.applied_schema_version(u32::from(version));
+    }
+
+    row.enabled_features(state.enabled_features.enabled_names().map(Some));
+
+    row.enabled_storage_features(state.enabled_storage_features.iter().map(Some));
 }

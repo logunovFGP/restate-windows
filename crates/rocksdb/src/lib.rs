@@ -35,18 +35,20 @@ use rocksdb::statistics::HistogramData;
 use rocksdb::statistics::Ticker;
 
 use restate_core::ShutdownError;
+use restate_types::protobuf::common::DatabaseKind;
+pub use restate_types::rocksdb::{BottommostLevelCompaction, ManualCompactionOptions};
 
 // re-exports
+pub use self::background::StorageTaskKind;
 pub use self::db_manager::RocksDbManager;
 pub use self::db_spec::*;
 pub use self::error::*;
 pub use self::iterator::IterAction;
 use self::iterator::RocksIterator;
-pub use self::perf::RocksDbPerfGuard;
+pub use self::perf::{RocksDbReadPerfGuard, RocksDbWritePerfGuard};
 pub use self::rock_access::RocksAccess;
 
 use self::background::StorageTask;
-use self::background::StorageTaskKind;
 use self::metric_definitions::*;
 
 pub type RawRocksDb = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
@@ -112,6 +114,10 @@ impl RocksDb {
         &self.db.spec().name
     }
 
+    pub fn kind(&self) -> DatabaseKind {
+        self.db.spec().kind
+    }
+
     pub(crate) async fn open(
         manager: &'static RocksDbManager,
         spec: DbSpec,
@@ -119,12 +125,13 @@ impl RocksDb {
         let task = StorageTask::default()
             .kind(StorageTaskKind::OpenDb)
             .op(move || {
-                let _x = RocksDbPerfGuard::new("open-db");
+                let _x = RocksDbReadPerfGuard::new("open-db");
                 RocksAccess::open_db(
                     spec,
                     &manager.env,
                     &manager.write_buffer_manager,
                     &manager.cache,
+                    &manager.rate_limiter,
                 )
             })
             .build()
@@ -155,6 +162,10 @@ impl RocksDb {
         self.db.cfs()
     }
 
+    /// Write a [`rocksdb::WriteBatch`] to the database.
+    ///
+    /// On success, returns the batch so callers can reuse it (e.g. via
+    /// [`rocksdb::WriteBatch::clear()`]) without re-allocating.
     #[tracing::instrument(skip_all, fields(db = %self.name()))]
     pub async fn write_batch(
         self: &Arc<Self>,
@@ -163,17 +174,21 @@ impl RocksDb {
         io_mode: IoMode,
         write_options: rocksdb::WriteOptions,
         write_batch: rocksdb::WriteBatch,
-    ) -> Result<(), RocksError> {
+    ) -> Result<rocksdb::WriteBatch, RocksError> {
         self.write_batch_internal(
             name,
             priority,
             io_mode,
             write_options,
-            move |db, write_options| db.write_batch(&write_batch, write_options),
+            write_batch,
+            |db, write_options, batch| db.write_batch(batch, write_options),
         )
         .await
     }
 
+    /// Write a [`rocksdb::WriteBatchWithIndex`] to the database.
+    ///
+    /// On success, returns the batch so callers can reuse it.
     #[tracing::instrument(skip_all, fields(db = %self.name()))]
     pub async fn write_batch_with_index(
         self: &Arc<Self>,
@@ -182,44 +197,51 @@ impl RocksDb {
         io_mode: IoMode,
         write_options: rocksdb::WriteOptions,
         write_batch: rocksdb::WriteBatchWithIndex,
-    ) -> Result<(), RocksError> {
+    ) -> Result<rocksdb::WriteBatchWithIndex, RocksError> {
         self.write_batch_internal(
             name,
             priority,
             io_mode,
             write_options,
-            move |db, write_options| db.write_batch_with_index(&write_batch, write_options),
+            write_batch,
+            |db, write_options, batch| db.write_batch_with_index(batch, write_options),
         )
         .await
     }
 
-    async fn write_batch_internal<OP>(
+    async fn write_batch_internal<B, OP>(
         self: &Arc<Self>,
         name: &'static str,
         priority: Priority,
         io_mode: IoMode,
         mut write_options: rocksdb::WriteOptions,
+        batch: B,
         write_op: OP,
-    ) -> Result<(), RocksError>
+    ) -> Result<B, RocksError>
     where
-        OP: Fn(&RocksAccess, &rocksdb::WriteOptions) -> Result<(), rocksdb::Error> + Send + 'static,
+        B: Send + 'static,
+        OP: Fn(&RocksAccess, &rocksdb::WriteOptions, &B) -> Result<(), rocksdb::Error>
+            + Send
+            + 'static,
     {
         //  depending on the IoMode, we decide how to do the write.
         match io_mode {
             IoMode::AllowBlockingIO => {
-                let _x = RocksDbPerfGuard::new(name);
+                let _x = RocksDbWritePerfGuard::new(name);
                 debug!(
                     "Blocking IO is allowed for write_batch, stall detection will not be used in this operation!"
                 );
                 write_options.set_no_slowdown(false);
-                write_op(&self.db, &write_options)?;
+                if let Err(e) = write_op(&self.db, &write_options, &batch) {
+                    return Err(e.into());
+                }
                 counter!(STORAGE_IO_OP,
                     DISPOSITION => DISPOSITION_MAYBE_BLOCKING,
                     OP_TYPE => StorageTaskKind::WriteBatch.as_static_str(),
                     PRIORITY => priority.as_static_str(),
                 )
                 .increment(1);
-                return Ok(());
+                return Ok(batch);
             }
             IoMode::AlwaysBackground => {
                 // Operation will block, dispatch to background.
@@ -229,9 +251,10 @@ impl RocksDb {
                 let task = StorageTask::default()
                     .priority(priority)
                     .kind(StorageTaskKind::WriteBatch)
-                    .op(move || {
-                        let _x = RocksDbPerfGuard::new(name);
-                        write_op(&db.db, &write_options)
+                    .op(move || -> Result<B, rocksdb::Error> {
+                        let _x = RocksDbWritePerfGuard::new(name);
+                        write_op(&db.db, &write_options, &batch)?;
+                        Ok(batch)
                     })
                     .build()
                     .unwrap();
@@ -243,19 +266,21 @@ impl RocksDb {
                 )
                 .increment(1);
 
-                return Ok(self.manager.async_spawn(task).await??);
+                return self.manager.async_spawn(task).await?.map_err(|e| e.into());
             }
             IoMode::OnlyIfNonBlocking => {
-                let _x = RocksDbPerfGuard::new(name);
+                let _x = RocksDbWritePerfGuard::new(name);
                 write_options.set_no_slowdown(true);
-                write_op(&self.db, &write_options)?;
+                if let Err(e) = write_op(&self.db, &write_options, &batch) {
+                    return Err(e.into());
+                }
                 counter!(STORAGE_IO_OP,
                     DISPOSITION => DISPOSITION_NON_BLOCKING,
                     OP_TYPE => StorageTaskKind::WriteBatch.as_static_str(),
                     PRIORITY => priority.as_static_str(),
                 )
                 .increment(1);
-                return Ok(());
+                return Ok(batch);
             }
             _ => {}
         }
@@ -264,8 +289,8 @@ impl RocksDb {
         // First, attempt to write without blocking
         write_options.set_no_slowdown(true);
 
-        let perf_guard = RocksDbPerfGuard::new(name);
-        let result = write_op(&self.db, &write_options);
+        let perf_guard = RocksDbWritePerfGuard::new(name);
+        let result = write_op(&self.db, &write_options, &batch);
         match result {
             Ok(_) => {
                 counter!(STORAGE_IO_OP,
@@ -274,7 +299,7 @@ impl RocksDb {
                     PRIORITY => priority.as_static_str(),
                 )
                 .increment(1);
-                Ok(())
+                Ok(batch)
             }
             Err(e) if is_retryable_error(e.kind()) => {
                 counter!(STORAGE_IO_OP,
@@ -294,14 +319,15 @@ impl RocksDb {
                 let task = StorageTask::default()
                     .priority(priority)
                     .kind(StorageTaskKind::WriteBatch)
-                    .op(move || {
-                        let _x = RocksDbPerfGuard::new(name);
-                        write_op(&db.db, &write_options)
+                    .op(move || -> Result<B, rocksdb::Error> {
+                        let _x = RocksDbWritePerfGuard::new(name);
+                        write_op(&db.db, &write_options, &batch)?;
+                        Ok(batch)
                     })
                     .build()
                     .unwrap();
 
-                return Ok(self.manager.async_spawn(task).await??);
+                self.manager.async_spawn(task).await?.map_err(|e| e.into())
             }
             Err(e) => {
                 counter!(STORAGE_IO_OP,
@@ -335,7 +361,7 @@ impl RocksDb {
             .op(move || {
                 // note: the perf guard's lifetime encapsulates all operations in the iterator and
                 // the total duration includes all the time spent blocking on the tx's capacity.
-                let _x = RocksDbPerfGuard::new(name);
+                let _x = RocksDbReadPerfGuard::new(name);
                 let Some(cf) = self.db.cf_handle(cf.as_str()) else {
                     on_item(Err(RocksError::UnknownColumnFamily(cf)));
                     return;
@@ -371,13 +397,46 @@ impl RocksDb {
         manager.spawn(task)
     }
 
+    /// Runs a blocking read operation on the storage background thread-pool and
+    /// awaits its result.
+    ///
+    /// Unlike [`Self::run_background_iterator`], this is for bounded operations
+    /// that run to completion and produce a single value, rather than streaming
+    /// rows. The op receives the raw RocksDB handle and must not let borrowed
+    /// database values escape its own scope.
+    #[tracing::instrument(skip_all, fields(db = %self.name()))]
+    pub async fn run_background_read_op<OP, R>(
+        self: Arc<Self>,
+        name: &'static str,
+        kind: StorageTaskKind,
+        priority: Priority,
+        op: OP,
+    ) -> Result<R, ShutdownError>
+    where
+        OP: FnOnce(&RawRocksDb) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let manager = self.manager;
+        let task = StorageTask::default()
+            .kind(kind)
+            .priority(priority)
+            .op(move || {
+                let _x = RocksDbReadPerfGuard::new(name);
+                op(self.db.as_raw_db())
+            })
+            .build()
+            .unwrap();
+
+        manager.async_spawn(task).await
+    }
+
     #[tracing::instrument(skip_all, fields(db = %self.name()))]
     pub async fn flush_wal(self: Arc<Self>, sync: bool) -> Result<(), RocksError> {
         let manager = self.manager;
         let task = StorageTask::default()
             .kind(StorageTaskKind::FlushWal)
             .op(move || {
-                let _x = RocksDbPerfGuard::new("flush-wal");
+                let _x = RocksDbReadPerfGuard::new("flush-wal");
                 self.db.flush_wal(sync)
             })
             .build()
@@ -392,7 +451,7 @@ impl RocksDb {
         let task = StorageTask::default()
             .kind(StorageTaskKind::FlushWal)
             .op(move || {
-                let _x = RocksDbPerfGuard::new("bg-wal-sync");
+                let _x = RocksDbReadPerfGuard::new("bg-wal-sync");
                 if let Err(e) = self.db.flush_wal(true) {
                     error!("Failed to flush rocksdb WAL: {}", e);
                 }
@@ -426,7 +485,7 @@ impl RocksDb {
         let task = StorageTask::default()
             .kind(StorageTaskKind::FlushMemtables)
             .op(move || {
-                let _x = RocksDbPerfGuard::new("manual-flush");
+                let _x = RocksDbReadPerfGuard::new("manual-flush");
                 self.db.flush_all()
             })
             .build()
@@ -436,18 +495,22 @@ impl RocksDb {
     }
 
     #[tracing::instrument(skip_all, fields(db = %self.name()))]
-    pub async fn compact_all(self: Arc<Self>) {
+    pub async fn compact_all(
+        self: Arc<Self>,
+        options: ManualCompactionOptions,
+    ) -> Result<(), RocksError> {
         let manager = self.manager;
         let task = StorageTask::default()
             .kind(StorageTaskKind::Compaction)
             .op(move || {
-                let _x = RocksDbPerfGuard::new("manual-compaction");
-                self.db.compact_all();
+                let _x = RocksDbReadPerfGuard::new("manual-compaction");
+                self.db.compact_all(options);
             })
             .build()
             .unwrap();
 
-        let _ = manager.async_spawn_unchecked(task).await;
+        manager.async_spawn_unchecked(task).await?;
+        Ok(())
     }
 
     pub fn get_histogram_data(&self, histogram: Histogram) -> HistogramData {
@@ -488,7 +551,7 @@ impl RocksDb {
             .kind(StorageTaskKind::ImportColumnFamily)
             .priority(Priority::Low)
             .op(move || {
-                let _x = RocksDbPerfGuard::new("import-column-family");
+                let _x = RocksDbReadPerfGuard::new("import-column-family");
                 self.db.import_cf(
                     name,
                     &manager.write_buffer_manager,
@@ -513,7 +576,7 @@ impl RocksDb {
             .kind(StorageTaskKind::ExportColumnFamily)
             .priority(Priority::Low)
             .op(move || {
-                let _x = RocksDbPerfGuard::new("export-column-family");
+                let _x = RocksDbReadPerfGuard::new("export-column-family");
 
                 let checkpoint = Checkpoint::new(self.db.as_raw_db()).unwrap();
 

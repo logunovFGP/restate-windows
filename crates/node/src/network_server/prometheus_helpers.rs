@@ -53,6 +53,7 @@ pub fn format_rocksdb_stat_ticker_for_prometheus(
     labels: &IndexMap<String, String>,
     ticker: Ticker,
 ) {
+    static DUMMY_KEY: Key = const { Key::from_static_name("non-existent") };
     let sanitized_name = format!(
         "{}_{}",
         PREFIX,
@@ -62,8 +63,8 @@ pub fn format_rocksdb_stat_ticker_for_prometheus(
     formatting::write_metric_line::<&str, u64>(
         out,
         &sanitized_name,
-        None,
-        &LabelSet::from_key_and_global(&Key::from_static_name("non-existent"), labels),
+        Some("total"),
+        &LabelSet::from_key_and_global(&DUMMY_KEY, labels),
         None,
         db.get_ticker_count(ticker),
         None,
@@ -98,7 +99,7 @@ pub fn format_rocksdb_property_for_prometheus(
         &LabelSet::from_key_and_global(&Key::from_static_name("non-existent"), labels),
         None,
         property_value,
-        None,
+        Some(unit.normalized_unit()),
     );
     let _ = writeln!(out);
 }
@@ -137,7 +138,7 @@ pub fn format_rocksdb_histogram_for_prometheus(
         &labels,
         Some(("quantile", "0.5")),
         unit.normalize_value(data.median()),
-        None,
+        Some(unit.normalized_unit()),
     );
     formatting::write_metric_line::<&str, f64>(
         out,
@@ -146,7 +147,7 @@ pub fn format_rocksdb_histogram_for_prometheus(
         &labels,
         Some(("quantile", "0.95")),
         unit.normalize_value(data.p95()),
-        None,
+        Some(unit.normalized_unit()),
     );
     formatting::write_metric_line::<&str, f64>(
         out,
@@ -155,7 +156,7 @@ pub fn format_rocksdb_histogram_for_prometheus(
         &labels,
         Some(("quantile", "0.99")),
         unit.normalize_value(data.p99()),
-        None,
+        Some(unit.normalized_unit()),
     );
     formatting::write_metric_line::<&str, f64>(
         out,
@@ -164,7 +165,7 @@ pub fn format_rocksdb_histogram_for_prometheus(
         &labels,
         Some(("quantile", "1.0")),
         unit.normalize_value(data.max()),
-        None,
+        Some(unit.normalized_unit()),
     );
     formatting::write_metric_line::<&str, f64>(
         out,
@@ -173,7 +174,7 @@ pub fn format_rocksdb_histogram_for_prometheus(
         &labels,
         None,
         unit.normalize_value(data.sum() as f64),
-        None,
+        Some(unit.normalized_unit()),
     );
     formatting::write_metric_line::<&str, u64>(
         out,
@@ -182,7 +183,7 @@ pub fn format_rocksdb_histogram_for_prometheus(
         &labels,
         None,
         data.count(),
-        None,
+        Some(unit.normalized_unit()),
     );
     let _ = writeln!(out);
 }

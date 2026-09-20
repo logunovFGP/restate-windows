@@ -10,9 +10,9 @@ publish = false
 [features]
 default = []
 kafka = ["dep:restate-ingress-kafka"]
-test-util = ["restate-partition-store/test-util"]
+expose-internals = []
+test-util = ["expose-internals", "restate-partition-store/test-util"]
 options_schema = [
-  "dep:schemars",
   "restate-ingress-http/options_schema",
   "restate-ingress-kafka?/options_schema",
   "restate-invoker-impl/options_schema",
@@ -29,25 +29,30 @@ restate-clock = { workspace = true, features = ["jiff", "hlc"] }
 restate-core = { workspace = true }
 restate-errors = { workspace = true }
 restate-futures-util = { workspace = true }
+restate-ingestion-client = { workspace = true }
 restate-ingress-http = { workspace = true }
 restate-ingress-kafka = { workspace = true, optional = true }
-restate-ingestion-client = { workspace = true }
-restate-invoker-api = { workspace = true }
 restate-invoker-impl = { workspace = true }
+restate-limiter = { workspace = true, features = ["rule-book"] }
+restate-memory = { workspace = true }
 restate-metadata-server = { workspace = true }
 restate-metadata-store = { workspace = true }
 restate-partition-store = { workspace = true }
+restate-platform = { workspace = true }
 restate-rocksdb = { workspace = true }
 restate-service-protocol = { workspace = true, features = ["codec", "message"] }
 restate-service-protocol-v4 = { workspace = true, features = ["entry-codec"] }
 restate-storage-api = { workspace = true }
 restate-storage-query-datafusion = { workspace = true }
-restate-time-util = { workspace = true }
+restate-util-time = { workspace = true }
 restate-timer = { workspace = true }
 restate-tracing-instrumentation = { workspace = true }
+restate-tracing = { workspace = true }
 restate-types = { workspace = true }
+restate-util-string = { workspace = true }
 restate-vqueues = { workspace = true }
 restate-wal-protocol = { workspace = true }
+restate-worker-api = { workspace = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
@@ -56,17 +61,13 @@ async-channel = { workspace = true }
 bytes = { workspace = true }
 bytestring = { workspace = true }
 codederror = { workspace = true }
-derive_more = { workspace = true }
-enumset = { workspace = true }
+derive_more = { workspace = true, features = ["debug", "display", "from"] }
 futures = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
-pin-project = { workspace = true }
 rand = { workspace = true }
-schemars = { workspace = true, optional = true }
-serde = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -79,16 +80,20 @@ ulid = { workspace = true }
 [dev-dependencies]
 restate-bifrost = { workspace = true, features = ["test-util"] }
 restate-core = { workspace = true, features = ["test-util"] }
-restate-invoker-api = { workspace = true, features = ["test-util"] }
+restate-ingestion-client = { workspace = true, features = ["test-util"] }
 restate-rocksdb = { workspace = true, features = ["test-util"] }
 restate-service-protocol = { workspace = true, features = ["test-util"] }
 restate-storage-api = { workspace = true, features = ["test-util"] }
 restate-test-util = { workspace = true, features = ["prost"] }
 restate-types = { workspace = true, features = ["test-util"] }
+restate-vqueues = { workspace = true, features = ["test-util"] }
+restate-wal-protocol = { workspace = true, features = ["test-util"] }
 
 googletest = { workspace = true }
-mockall = { workspace = true }
 prost = { workspace = true }
 rstest = { workspace = true }
 test-log = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

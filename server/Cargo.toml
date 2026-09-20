@@ -25,7 +25,6 @@ console = [
     "restate-types/console",
 ]
 options_schema = [
-    "dep:schemars",
     "restate-node/options_schema",
     "restate-tracing-instrumentation/options_schema",
     "restate-types/schemars",
@@ -35,7 +34,6 @@ no-trace-logging = ["tracing/max_level_trace", "tracing/release_max_level_debug"
 metadata-api = ["restate-admin/metadata-api"]
 kafka = ["restate-node/kafka"]
 kafka-oidc = ["kafka", "restate-node/kafka-oidc"]
-taskdump = ["restate-core/taskdump"]
 
 [dependencies]
 restate-workspace-hack = { workspace = true }
@@ -61,7 +59,6 @@ http-body-util = { workspace = true }
 octocrab = { workspace = true, features = ["stream"] }
 regex = { workspace = true }
 rustls = { workspace = true, features = ["aws-lc-rs"] }
-schemars = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
@@ -83,6 +80,8 @@ mock-service-endpoint = { workspace = true }
 anyhow = { workspace = true }
 bytestring = { workspace = true}
 googletest = { workspace = true }
+rcgen = { workspace = true }
+restate-util-time = { workspace = true }
 tempfile = { workspace = true }
 test-log = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
@@ -98,8 +97,6 @@ tikv-jemallocator = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rlimit = { workspace = true }
 
-[target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))'.dependencies]
-restate-core = { workspace = true, features = ["taskdump"] }
 
 [build-dependencies]
 vergen = { workspace = true, default-features = false, features = [
@@ -108,3 +105,6 @@ vergen = { workspace = true, default-features = false, features = [
     "gitcl",
     "cargo",
 ] }
+
+[lints]
+workspace = true

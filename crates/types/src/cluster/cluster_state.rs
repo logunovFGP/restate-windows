@@ -12,12 +12,14 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use prost_dto::IntoProst;
-use serde::{Deserialize, Serialize};
 
 use restate_encoding::NetSerde;
+use restate_util_string::ReString;
 
 use crate::identifiers::{LeaderEpoch, PartitionId};
 use crate::logs::Lsn;
+use crate::partitions::features::PersistedFeatures;
+pub use crate::protobuf::cluster::{BrokenReason, DetailedRunMode};
 use crate::time::MillisSinceEpoch;
 use crate::{GenerationalNodeId, PlainNodeId, Version};
 
@@ -137,17 +139,7 @@ pub struct DeadNode {
 }
 
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    Serialize,
-    Deserialize,
-    Eq,
-    PartialEq,
-    IntoProst,
-    strum::Display,
-    bilrost::Enumeration,
-    NetSerde,
+    Debug, Clone, Copy, Eq, PartialEq, IntoProst, strum::Display, bilrost::Enumeration, NetSerde,
 )]
 #[prost(target = "crate::protobuf::cluster::RunMode")]
 #[strum(serialize_all = "snake_case")]
@@ -157,17 +149,7 @@ pub enum RunMode {
 }
 
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    Eq,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    IntoProst,
-    strum::Display,
-    bilrost::Enumeration,
-    NetSerde,
+    Debug, Clone, Copy, Eq, PartialEq, IntoProst, strum::Display, bilrost::Enumeration, NetSerde,
 )]
 #[prost(target = "crate::protobuf::cluster::ReplayStatus")]
 #[strum(serialize_all = "snake_case")]
@@ -179,6 +161,7 @@ pub enum ReplayStatus {
 
 #[derive(Debug, Clone, IntoProst, bilrost::Message, NetSerde)]
 #[prost(target = "crate::protobuf::cluster::PartitionProcessorStatus")]
+#[bilrost(reserved_tags(8, 16))]
 pub struct PartitionProcessorStatus {
     #[prost(required)]
     #[bilrost(1)]
@@ -195,8 +178,6 @@ pub struct PartitionProcessorStatus {
     pub last_applied_log_lsn: Option<Lsn>,
     #[bilrost(7)]
     pub last_record_applied_at: Option<MillisSinceEpoch>,
-    #[bilrost(8)]
-    pub num_skipped_records: u64,
     #[bilrost(9)]
     pub replay_status: ReplayStatus,
     #[bilrost(10)]
@@ -206,6 +187,78 @@ pub struct PartitionProcessorStatus {
     // Set if replay_status is CatchingUp
     #[bilrost(12)]
     pub target_tail_lsn: Option<Lsn>,
+    /// Version of the rule book currently applied by the partition processor.
+    /// `None` until the first rule book is observed (i.e. while the state
+    /// machine still holds `RuleBook::default()` at `Version::INVALID`).
+    #[bilrost(13)]
+    pub last_applied_rule_book_version: Option<Version>,
+    /// Version of the schema currently applied by the partition processor.
+    /// `None` until the first schema is observed.
+    #[bilrost(14)]
+    pub last_applied_schema_version: Option<Version>,
+    /// State-machine features currently enabled on this partition processor.
+    /// Translated to a list of names at the protobuf boundary so older clients
+    /// can render unknown feature names without code changes.
+    #[into_prost(map = "enabled_features_to_proto", map_by_ref)]
+    #[bilrost(15)]
+    pub enabled_features: PersistedFeatures,
+    /// Since v1.7.3 (if Unknown, use effective_mode)
+    #[bilrost(17)]
+    pub detailed_effective_mode: DetailedRunMode,
+    /// Set when the node has parked this partition processor instead of retrying it.
+    /// All other fields carry their defaults in that case.
+    ///
+    /// Since v1.7.3
+    #[bilrost(18)]
+    pub broken_reason: BrokenReason,
+    /// Partition-store on-disk storage features.
+    /// Set once on partition open by `verify_and_run_migrations`.
+    #[into_prost(map = "enabled_storage_features_to_proto")]
+    #[bilrost(19)]
+    pub enabled_storage_features: Vec<ReString>,
+}
+
+impl PartitionProcessorStatus {
+    /// The node running this processor gave up on it and will not retry until an
+    /// operator intervenes.
+    pub fn is_broken(&self) -> bool {
+        self.broken_reason != BrokenReason::NotBroken
+    }
+
+    pub fn effective_mode(&self) -> DetailedRunMode {
+        match self.detailed_effective_mode {
+            DetailedRunMode::Unknown => self.effective_mode.into(),
+            other => other,
+        }
+    }
+}
+
+impl From<RunMode> for DetailedRunMode {
+    fn from(value: RunMode) -> Self {
+        match value {
+            RunMode::Leader => DetailedRunMode::Leader,
+            RunMode::Follower => DetailedRunMode::Follower,
+        }
+    }
+}
+
+impl From<DetailedRunMode> for RunMode {
+    fn from(value: DetailedRunMode) -> Self {
+        match value {
+            DetailedRunMode::Unknown | DetailedRunMode::Follower | DetailedRunMode::Candidate => {
+                RunMode::Follower
+            }
+            DetailedRunMode::Leader | DetailedRunMode::BecomingLeader => RunMode::Leader,
+        }
+    }
+}
+
+fn enabled_features_to_proto(f: &PersistedFeatures) -> Vec<String> {
+    f.enabled_names().map(String::from).collect()
+}
+
+fn enabled_storage_features_to_proto(i: ReString) -> String {
+    i.to_string()
 }
 
 impl Default for PartitionProcessorStatus {
@@ -214,15 +267,20 @@ impl Default for PartitionProcessorStatus {
             updated_at: MillisSinceEpoch::now(),
             planned_mode: RunMode::Follower,
             effective_mode: RunMode::Follower,
+            detailed_effective_mode: DetailedRunMode::Follower,
             last_observed_leader_epoch: None,
             last_observed_leader_node: None,
             last_applied_log_lsn: None,
             last_record_applied_at: None,
-            num_skipped_records: 0,
             replay_status: ReplayStatus::Starting,
             durable_lsn: None,
             last_archived_log_lsn: None,
             target_tail_lsn: None,
+            last_applied_rule_book_version: None,
+            last_applied_schema_version: None,
+            enabled_features: PersistedFeatures::default(),
+            broken_reason: BrokenReason::NotBroken,
+            enabled_storage_features: Vec::new(),
         }
     }
 }

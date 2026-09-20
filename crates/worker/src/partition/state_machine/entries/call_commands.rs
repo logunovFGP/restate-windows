@@ -8,28 +8,33 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
-use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
+use std::collections::VecDeque;
+
 use restate_service_protocol_v4::entry_codec::ServiceProtocolV4Codec;
 use restate_storage_api::fsm_table::WriteFsmTable;
 use restate_storage_api::invocation_status_table::InvocationStatus;
-use restate_storage_api::outbox_table::{OutboxMessage, WriteOutboxTable};
+use restate_storage_api::outbox_table::WriteOutboxTable;
 use restate_types::identifiers::InvocationId;
 use restate_types::invocation::{ServiceInvocation, ServiceInvocationResponseSink, Source};
 use restate_types::journal_v2::command::{CallCommand, CallRequest, OneWayCallCommand};
 use restate_types::journal_v2::raw::RawEntry;
 use restate_types::journal_v2::{CallInvocationIdCompletion, CompletionId, Entry};
 use restate_types::time::MillisSinceEpoch;
-use std::collections::VecDeque;
+use restate_wal_protocol::v2::commands;
+
+use crate::partition::processor::ProcessorContext;
+use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
+use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
 
 pub(super) type ApplyCallCommand<'e> = ApplyJournalCommandEffect<'e, CallCommand>;
 
-impl<'e, 'ctx: 'e, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'e, 'ctx: 'e, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for ApplyJournalCommandEffect<'e, CallCommand>
 where
     S: WriteOutboxTable + WriteFsmTable,
+    P: ProcessorContext,
 {
-    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
+    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S, P>) -> Result<(), Error> {
         _ApplyCallCommand {
             caller_invocation_id: self.invocation_id,
             caller_invocation_status: self.invocation_status,
@@ -46,12 +51,13 @@ where
 
 pub(super) type ApplyOneWayCallCommand<'e> = ApplyJournalCommandEffect<'e, OneWayCallCommand>;
 
-impl<'e, 'ctx: 'e, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'e, 'ctx: 'e, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for ApplyJournalCommandEffect<'e, OneWayCallCommand>
 where
     S: WriteOutboxTable + WriteFsmTable,
+    P: ProcessorContext,
 {
-    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
+    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S, P>) -> Result<(), Error> {
         let execution_time = if self.entry.invoke_time == MillisSinceEpoch::UNIX_EPOCH {
             None
         } else {
@@ -81,12 +87,13 @@ struct _ApplyCallCommand<'e> {
     completions_to_process: &'e mut VecDeque<RawEntry>,
 }
 
-impl<'e, 'ctx: 'e, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'e, 'ctx: 'e, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for _ApplyCallCommand<'e>
 where
     S: WriteOutboxTable + WriteFsmTable,
+    P: ProcessorContext,
 {
-    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
+    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S, P>) -> Result<(), Error> {
         let caller_invocation_metadata = self
             .caller_invocation_status
             .get_invocation_metadata()
@@ -101,6 +108,7 @@ where
             idempotency_key,
             completion_retention_duration,
             journal_retention_duration,
+            limit_key,
         } = self.request;
 
         // Prepare the service invocation to propose
@@ -113,11 +121,12 @@ where
                     notification_idx,
                 )
             }),
-            span_context: span_context.clone(),
+            span_context,
             execution_time: self.execution_time,
             completion_retention_duration,
             journal_retention_duration,
             idempotency_key,
+            limit_key,
             ..ServiceInvocation::initialize(
                 invocation_id,
                 invocation_target,
@@ -128,9 +137,7 @@ where
             )
         };
 
-        ctx.handle_outgoing_message(OutboxMessage::ServiceInvocation(Box::new(
-            service_invocation,
-        )))?;
+        ctx.do_enqueue_into_outbox(commands::InvokeCommand::from(service_invocation))?;
 
         // Notify the invocation id back
         self.completions_to_process.push_back(
@@ -160,10 +167,10 @@ mod tests {
     };
     use restate_types::journal_v2::{
         CallCommand, CallCompletion, CallInvocationIdCompletion, CallRequest, CallResult,
-        CommandType, Entry, EntryMetadata, EntryType, OneWayCallCommand,
+        CommandType, Entry, EntryMetadata, EntryType, NotificationId, OneWayCallCommand,
     };
     use restate_types::time::MillisSinceEpoch;
-    use restate_wal_protocol::Command;
+    use restate_wal_protocol::v2::{Command, commands};
     use rstest::rstest;
     use std::time::{Duration, SystemTime};
 
@@ -193,7 +200,7 @@ mod tests {
         let actions = test_env
             .apply_multiple([
                 invoker_entry_effect(invocation_id, call_command.clone()),
-                Command::InvocationResponse(InvocationResponse {
+                commands::InvocationResponseCommand::test_envelope(InvocationResponse {
                     target: JournalCompletionTarget::from_parts(
                         invocation_id,
                         result_completion_id,
@@ -233,11 +240,13 @@ mod tests {
                 })),
                 contains(matchers::actions::forward_notification(
                     invocation_id,
-                    call_invocation_id_completion.clone()
+                    2,
+                    NotificationId::CompletionId(invocation_id_completion_id),
                 )),
                 contains(matchers::actions::forward_notification(
                     invocation_id,
-                    call_completion.clone()
+                    3,
+                    NotificationId::CompletionId(result_completion_id),
                 ))
             ]
         );
@@ -314,7 +323,8 @@ mod tests {
                 })),
                 contains(matchers::actions::forward_notification(
                     invocation_id,
-                    call_invocation_id_completion.clone()
+                    2,
+                    NotificationId::CompletionId(invocation_id_completion_id),
                 ))
             ]
         );

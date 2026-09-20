@@ -8,41 +8,29 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use tracing::warn;
+
+use restate_storage_api::state_table::WriteStateTable;
+use restate_types::journal_v2::{EntryMetadata, SetStateCommand};
+
 use crate::debug_if_leader;
+use crate::partition::processor::Processor;
 use crate::partition::state_machine::entries::ApplyJournalCommandEffect;
 use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
-use restate_storage_api::state_table::WriteStateTable;
-use restate_tracing_instrumentation as instrumentation;
-use restate_types::journal_v2::{EntryMetadata, SetStateCommand};
-use tracing::warn;
 
 pub(super) type ApplySetStateCommand<'e> = ApplyJournalCommandEffect<'e, SetStateCommand>;
 
-impl<'e, 'ctx: 'e, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'e, 'ctx: 'e, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for ApplySetStateCommand<'e>
 where
     S: WriteStateTable,
+    P: Processor,
 {
-    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
+    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S, P>) -> Result<(), Error> {
         let invocation_metadata = self
             .invocation_status
             .get_invocation_metadata()
             .expect("In-Flight invocation metadata must be present");
-
-        if ctx.is_leader {
-            let _span = instrumentation::info_invocation_span!(
-                relation = invocation_metadata
-                    .journal_metadata
-                    .span_context
-                    .as_parent(),
-                id = self.invocation_id,
-                name = format!("set-state {:?}", self.entry.key),
-                tags = (rpc.service = invocation_metadata
-                    .invocation_target
-                    .service_name()
-                    .to_string())
-            );
-        }
 
         if let Some(service_id) = invocation_metadata.invocation_target.as_keyed_service_id() {
             debug_if_leader!(
@@ -52,7 +40,7 @@ where
             );
 
             ctx.storage
-                .put_user_state(&service_id, self.entry.key, self.entry.value)
+                .put_user_state(&service_id, self.entry.key.as_bytes(), self.entry.value)
                 .map_err(Error::Storage)?;
         } else {
             warn!(

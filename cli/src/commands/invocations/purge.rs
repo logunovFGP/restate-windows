@@ -37,6 +37,7 @@ pub struct Purge {
     /// * `workflowName`
     /// * `workflowName/key`
     /// * `workflowName/key/handler`
+    #[clap(verbatim_doc_comment)]
     query: String,
     /// Limit the number of fetched invocations
     #[clap(long, default_value_t = DEFAULT_BATCH_INVOCATIONS_OPERATION_LIMIT)]
@@ -83,7 +84,7 @@ pub async fn run_purge(State(env): State<CliEnv>, opts: &Purge) -> Result<()> {
     let failed_count = failed_to_purge.len();
 
     c_println!();
-    c_success!("Paused {} invocations", succeeded_count);
+    c_success!("Purged {} invocations", succeeded_count);
 
     // Print failed ones, if any
     if !failed_to_purge.is_empty() {

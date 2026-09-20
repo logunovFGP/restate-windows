@@ -13,23 +13,27 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use codederror::CodedError;
 use tokio::sync::watch;
 use tracing::warn;
 
 use datafusion::catalog::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::TaskContext;
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
 
-use codederror::CodedError;
 use restate_core::{Metadata, TaskCenter};
-use restate_invoker_api::StatusHandle;
+use restate_limiter::rule_book::RuleBookObserver;
+use restate_metadata_store::MetadataStoreClient;
 use restate_partition_store::PartitionStoreManager;
+use restate_sharding::KeyRange;
 use restate_types::cluster::cluster_state::LegacyClusterState;
+use restate_types::config::Configuration;
 use restate_types::config::QueryEngineOptions;
 use restate_types::errors::GenericError;
 use restate_types::identifiers::PartitionId;
@@ -38,17 +42,33 @@ use restate_types::partition_table::Partition;
 use restate_types::partitions::state::PartitionReplicaSetStates;
 use restate_types::schema::deployment::DeploymentResolver;
 use restate_types::schema::service::ServiceMetadataResolver;
+use restate_worker_api::invoker::StatusHandle;
+use restate_worker_api::{SchedulerStatusEntry, UserLimitCounterEntry};
 
-use crate::analyzer;
+use crate::empty_invoker_status_handle::EmptyInvokerStatusHandle;
+use crate::node_fan_out::NodeWarnings;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
+
+type RateLimiter = gardal::SharedTokenBucket<gardal::TokioClock>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum QueryError {
+    #[error("Datafusion error: {0}")]
+    DataFusion(#[from] datafusion::common::DataFusionError),
+    #[error("Rate limited")]
+    RateLimited(#[from] gardal::RateLimited),
+}
 
 const SYS_INVOCATION_VIEW: &str = "CREATE VIEW sys_invocation as SELECT
             ss.id,
+            ss.vqueue_id,
             ss.target,
             ss.target_service_name,
             ss.target_service_key,
             ss.target_handler_name,
             ss.target_service_ty,
+            ss.scope,
+            ss.limit_key,
             ss.idempotency_key,
             ss.invoked_by,
             ss.invoked_by_service_name,
@@ -73,6 +93,7 @@ const SYS_INVOCATION_VIEW: &str = "CREATE VIEW sys_invocation as SELECT
             ss.journal_retention,
             ss.suspended_waiting_for_completions,
             ss.suspended_waiting_for_signals,
+            ss.suspended_waiting_future_json,
 
             sis.retry_count,
             sis.last_start_at,
@@ -87,6 +108,7 @@ const SYS_INVOCATION_VIEW: &str = "CREATE VIEW sys_invocation as SELECT
             sis.last_failure_related_command_index,
             sis.last_failure_related_command_name,
             sis.last_failure_related_command_type,
+            sis.last_awaiting_on_future_json,
 
             arrow_cast(CASE
                 WHEN ss.status = 'inboxed' THEN 'pending'
@@ -127,29 +149,69 @@ pub trait RegisterTable: Send + Sync + 'static {
     fn register(&self, ctx: &QueryContext) -> impl Future<Output = Result<(), BuildError>>;
 }
 
+/// A leader-state introspection handle that extends invoker status queries with
+/// additional query methods for future leader-owned components.
+pub trait PartitionLeaderStatusHandle:
+    StatusHandle + Send + Sync + Debug + Clone + 'static
+{
+    type SchedulerStatus;
+    type SchedulerStatusIterator: Iterator<Item = Self::SchedulerStatus> + Send;
+
+    type UserLimitCounter;
+    type UserLimitCounterIterator: Iterator<Item = Self::UserLimitCounter> + Send;
+
+    fn read_scheduler_status(
+        &self,
+        keys: KeyRange,
+    ) -> impl Future<Output = Self::SchedulerStatusIterator> + Send;
+
+    fn read_user_limit_counters(
+        &self,
+        keys: KeyRange,
+    ) -> impl Future<Output = Self::UserLimitCounterIterator> + Send;
+}
+
+/// A no-op registerer that creates a minimal query context with no tables.
+/// Useful for nodes that only need to serve remote scanner RPCs (e.g.,
+/// log-server-only nodes), where only `task_ctx()` is needed.
+pub struct NoTables;
+
+impl RegisterTable for NoTables {
+    async fn register(&self, _ctx: &QueryContext) -> Result<(), BuildError> {
+        Ok(())
+    }
+}
+
 /// A query context registerer for user tables
 pub struct UserTables<P, S, D> {
     partition_selector: P,
     partition_store_manager: Arc<PartitionStoreManager>,
-    status: Option<S>,
+    partition_leader_status: Option<S>,
     schemas: Live<D>,
     remote_scanner_manager: RemoteScannerManager,
+    metadata_store_client: MetadataStoreClient,
+    rule_book_observer: Option<Arc<dyn RuleBookObserver>>,
 }
 
 impl<P, S, D> UserTables<P, S, D> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         partition_selector: P,
         partition_store_manager: Arc<PartitionStoreManager>,
-        status: Option<S>,
+        partition_leader_status: Option<S>,
         schemas: Live<D>,
         remote_scanner_manager: RemoteScannerManager,
+        metadata_store_client: MetadataStoreClient,
+        rule_book_observer: Option<Arc<dyn RuleBookObserver>>,
     ) -> Self {
         Self {
             partition_selector,
             partition_store_manager,
-            status,
+            partition_leader_status,
             schemas,
             remote_scanner_manager,
+            metadata_store_client,
+            rule_book_observer,
         }
     }
 }
@@ -157,18 +219,40 @@ impl<P, S, D> UserTables<P, S, D> {
 impl<P, S, D> RegisterTable for UserTables<P, S, D>
 where
     P: SelectPartitions + Clone,
-    S: StatusHandle + Send + Sync + Debug + Clone + 'static,
+    S: PartitionLeaderStatusHandle<
+            SchedulerStatus = SchedulerStatusEntry,
+            UserLimitCounter = UserLimitCounterEntry,
+        >,
     D: DeploymentResolver + ServiceMetadataResolver + Send + Sync + Debug + Clone + 'static,
 {
     async fn register(&self, ctx: &QueryContext) -> Result<(), BuildError> {
         // ----- non partitioned tables -----
         crate::deployment::register_self(ctx, self.schemas.clone())?;
         crate::service::register_self(ctx, self.schemas.clone())?;
+        crate::rules::register_self(
+            ctx,
+            self.metadata_store_client.clone(),
+            self.rule_book_observer.clone(),
+        )?;
         // ----- partition-key-based -----
         crate::invocation_state::register_self(
             ctx,
             self.partition_selector.clone(),
-            self.status.clone(),
+            self.partition_leader_status.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::scheduler_status::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_leader_status.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::user_limits::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_leader_status.clone(),
             self.partition_store_manager.clone(),
             &self.remote_scanner_manager,
         )?;
@@ -178,7 +262,7 @@ where
             self.partition_store_manager.clone(),
             &self.remote_scanner_manager,
         )?;
-        crate::keyed_service_status::register_self(
+        crate::locks::register_self(
             ctx,
             self.partition_selector.clone(),
             self.partition_store_manager.clone(),
@@ -208,13 +292,26 @@ where
             self.partition_store_manager.clone(),
             &self.remote_scanner_manager,
         )?;
-        crate::idempotency::register_self(
+        crate::promise::register_self(
             ctx,
             self.partition_selector.clone(),
             self.partition_store_manager.clone(),
             &self.remote_scanner_manager,
         )?;
-        crate::promise::register_self(
+        // VQueues Tables
+        crate::vqueue_meta::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::vqueue_entry_status::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::vqueues::register_self(
             ctx,
             self.partition_selector.clone(),
             self.partition_store_manager.clone(),
@@ -231,19 +328,28 @@ pub struct ClusterTables {
     cluster_state: restate_types::cluster_state::ClusterState,
     replica_set_states: PartitionReplicaSetStates,
     cluster_state_watch: watch::Receiver<Arc<LegacyClusterState>>,
+    remote_scanner_manager: RemoteScannerManager,
 }
 
 impl ClusterTables {
     pub fn new(
         replica_set_states: PartitionReplicaSetStates,
         cluster_state_watch: watch::Receiver<Arc<LegacyClusterState>>,
+        remote_scanner_manager: RemoteScannerManager,
     ) -> Self {
         let cluster_state = TaskCenter::with_current(|tc| tc.cluster_state().clone());
         Self {
             cluster_state,
             replica_set_states,
             cluster_state_watch,
+            remote_scanner_manager,
         }
+    }
+
+    /// Returns a reference to the remote scanner manager. This can be used to
+    /// register node-level scanners (e.g., log-server tables) after construction.
+    pub fn remote_scanner_manager(&self) -> &RemoteScannerManager {
+        &self.remote_scanner_manager
     }
 }
 
@@ -258,8 +364,31 @@ impl RegisterTable for ClusterTables {
             self.cluster_state.clone(),
             self.replica_set_states.clone(),
         )?;
-        crate::log::register_self(ctx, metadata)?;
+        crate::log::register_self(ctx, metadata.clone())?;
         crate::partition_state::register_self(ctx, self.cluster_state_watch.clone())?;
+
+        // Node-fan-out tables
+        crate::loglet_worker::register_self(
+            ctx,
+            metadata.clone(),
+            self.remote_scanner_manager.clone(),
+            None, // local scanner is registered separately if this node is also a log-server
+        )?;
+        crate::bifrost_read_stream::register_self(
+            ctx,
+            metadata.clone(),
+            self.remote_scanner_manager.clone(),
+            None, // local scanner is registered separately by the node
+        )?;
+
+        if !Configuration::pinned().common.disable_config_sql_table {
+            crate::config::register_self(
+                ctx,
+                metadata,
+                self.remote_scanner_manager.clone(),
+                None, // local scanner is registered separately by the node
+            )?;
+        }
 
         ctx.datafusion_context
             .sql(CLUSTER_LOGS_TAIL_SEGMENTS_VIEW)
@@ -269,10 +398,113 @@ impl RegisterTable for ClusterTables {
     }
 }
 
+/// A query context registerer that exposes only the partition-store-backed tables.
+///
+/// Unlike [`UserTables`], it needs neither a schema registry nor a metadata-store client, so it can
+/// run against partition data with no live cluster behind it — e.g. a snapshot restored by an
+/// offline debugging tool. The leader-owned tables (`sys_scheduler_status`, `sys_user_limits`) are
+/// intentionally omitted: that state is ephemeral and never present in a snapshot. The invoker
+/// columns of `sys_invocation_state` are likewise leader-owned and resolve to nulls here, which is
+/// the truthful answer for a snapshot; the table is still registered because the `sys_invocation`
+/// view joins against it.
+pub struct PartitionTables<P> {
+    partition_selector: P,
+    partition_store_manager: Arc<PartitionStoreManager>,
+    remote_scanner_manager: RemoteScannerManager,
+}
+
+impl<P> PartitionTables<P> {
+    pub fn new(
+        partition_selector: P,
+        partition_store_manager: Arc<PartitionStoreManager>,
+        remote_scanner_manager: RemoteScannerManager,
+    ) -> Self {
+        Self {
+            partition_selector,
+            partition_store_manager,
+            remote_scanner_manager,
+        }
+    }
+}
+
+impl<P> RegisterTable for PartitionTables<P>
+where
+    P: SelectPartitions + Clone,
+{
+    async fn register(&self, ctx: &QueryContext) -> Result<(), BuildError> {
+        crate::invocation_state::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            Some(EmptyInvokerStatusHandle),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::invocation_status::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::locks::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::state::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::journal::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::journal_events::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::inbox::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::promise::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::vqueue_meta::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::vqueues::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+
+        ctx.datafusion_context.sql(SYS_INVOCATION_VIEW).await?;
+
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct QueryContext {
     sql_options: SQLOptions,
     datafusion_context: SessionContext,
+    rate_limiter: Option<RateLimiter>,
 }
 
 impl QueryContext {
@@ -285,6 +517,9 @@ impl QueryContext {
             options.tmp_dir.clone(),
             options.query_parallelism(),
             &options.datafusion_options,
+            options.rate_limiting.as_ref().map(|limit| {
+                RateLimiter::new(gardal::Limit::from(limit.clone()), gardal::TokioClock)
+            }),
         )?;
 
         registerer.register(&ctx).await?;
@@ -299,18 +534,27 @@ impl QueryContext {
         options: &QueryEngineOptions,
         partition_selector: impl SelectPartitions + Clone,
         partition_store_manager: Arc<PartitionStoreManager>,
-        status: Option<impl StatusHandle + Send + Sync + Debug + Clone + 'static>,
+        partition_leader_status: Option<
+            impl PartitionLeaderStatusHandle<
+                SchedulerStatus = SchedulerStatusEntry,
+                UserLimitCounter = UserLimitCounterEntry,
+            >,
+        >,
         schemas: Live<
             impl DeploymentResolver + ServiceMetadataResolver + Send + Sync + Debug + Clone + 'static,
         >,
         remote_scanner_manager: RemoteScannerManager,
+        metadata_store_client: MetadataStoreClient,
+        rule_book_observer: Option<Arc<dyn RuleBookObserver>>,
     ) -> Result<QueryContext, BuildError> {
         let tables = UserTables::new(
             partition_selector,
             partition_store_manager,
-            status,
+            partition_leader_status,
             schemas,
             remote_scanner_manager,
+            metadata_store_client,
+            rule_book_observer,
         );
 
         Self::create(options, tables).await
@@ -340,6 +584,7 @@ impl QueryContext {
         temp_folder: Option<String>,
         default_parallelism: Option<usize>,
         datafusion_options: &HashMap<String, String>,
+        rate_limiter: Option<RateLimiter>,
     ) -> Result<Self, DataFusionError> {
         //
         // build the runtime
@@ -371,26 +616,11 @@ impl QueryContext {
         //
         // build the state
         //
-        let mut state_builder = SessionStateBuilder::new()
+        let state = SessionStateBuilder::new()
             .with_config(session_config)
             .with_runtime_env(runtime)
-            .with_default_features();
-
-        // Rewrite the logical plan,  to transparently add a 'partition_key' column to Join's
-        // To tables that have a partition key in their schema.
-        //
-        // For example:
-        // 'SELECT  b.service_key FROM sys_invocation_status a JOIN state b on a.target_service_key = b.service_key'
-        //
-        // Will be rewritten to:
-        // 'SELECT  b.service_key FROM sys_invocation_status a JOIN state b on a.target_service_key = b.service_key AND a.partition_key = b.partition_key'
-        //
-        // This would be used by the SymmetricHashJoin as a watermark.
-        state_builder = state_builder.with_analyzer_rule(Arc::new(
-            analyzer::UseSymmetricHashJoinWhenPartitionKeyIsPresent::new(),
-        ));
-
-        let state = state_builder.build();
+            .with_default_features()
+            .build();
 
         let mut ctx = SessionContext::new_with_state(state);
 
@@ -408,19 +638,37 @@ impl QueryContext {
         Ok(Self {
             sql_options,
             datafusion_context: ctx,
+            rate_limiter,
         })
     }
 
-    pub async fn execute(
-        &self,
-        sql: &str,
-    ) -> datafusion::common::Result<SendableRecordBatchStream> {
+    pub async fn execute(&self, sql: &str) -> Result<QueryResult, QueryError> {
+        if let Some(limiter) = self.rate_limiter.as_ref() {
+            limiter.try_consume_one()?;
+        }
+
         let state = self.datafusion_context.state();
         let statement = state.sql_to_statement(sql, &datafusion::config::Dialect::PostgreSQL)?;
         let plan = state.statement_to_plan(statement).await?;
         self.sql_options.verify_plan(&plan)?;
         let df = self.datafusion_context.execute_logical_plan(plan).await?;
-        df.execute_stream().await
+
+        let task_ctx = Arc::new(df.task_ctx());
+        let physical_plan = df.create_physical_plan().await?;
+
+        // Collect NodeWarnings handles from any NodeFanOutExecutionPlan nodes
+        // in the plan tree before execution begins.
+        let node_warnings = collect_node_warnings(&physical_plan);
+
+        let stream = execute_stream(physical_plan, task_ctx)?;
+        Ok(QueryResult {
+            stream,
+            node_warnings,
+        })
+    }
+
+    pub fn task_ctx(&self) -> Arc<TaskContext> {
+        self.datafusion_context.task_ctx()
     }
 }
 
@@ -428,6 +676,31 @@ impl AsRef<SessionContext> for QueryContext {
     fn as_ref(&self) -> &SessionContext {
         &self.datafusion_context
     }
+}
+
+/// Result of a SQL query execution, containing the record batch stream
+/// and any per-node warning collectors from fan-out execution plans.
+pub struct QueryResult {
+    pub stream: SendableRecordBatchStream,
+    pub node_warnings: Vec<NodeWarnings>,
+}
+
+/// Walks the physical plan tree and collects [`NodeWarnings`] handles from
+/// any [`NodeFanOutExecutionPlan`] nodes found.
+fn collect_node_warnings(plan: &Arc<dyn ExecutionPlan>) -> Vec<NodeWarnings> {
+    use crate::node_fan_out::NodeFanOutExecutionPlan;
+
+    let mut warnings = Vec::new();
+    let mut stack = vec![Arc::clone(plan)];
+    while let Some(node) = stack.pop() {
+        if let Some(fan_out) = node.downcast_ref::<NodeFanOutExecutionPlan>() {
+            warnings.push(fan_out.node_warnings().clone());
+        }
+        for child in node.children() {
+            stack.push(Arc::clone(child));
+        }
+    }
+    warnings
 }
 
 /// Newtype to add debug implementation which is required for [`SelectPartitions`].

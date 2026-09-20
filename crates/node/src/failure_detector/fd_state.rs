@@ -204,6 +204,13 @@ impl FdState {
         self.num_gossip_received >= (opts.gossip_fd_stability_threshold.get() as usize)
     }
 
+    /// Resets elapsed-time tracking when gossip processing becomes active.
+    pub(super) fn reset_gossip_timing(&mut self) {
+        let now = Instant::now();
+        self.last_gossip_received_at = now;
+        self.last_gossip_tick = now;
+    }
+
     /// returns true if there has been at least a gossip interval since the last one.
     pub fn gossip_tick(&mut self, opts: &GossipOptions) -> bool {
         let now = Instant::now();
@@ -622,7 +629,7 @@ impl FdState {
         if msg.instance_ts > msg.sent_at {
             error!(
                 %peer,
-                "Gossip received message with sent_at higher than instance_ts (sent_at: {}, instance_ts: {})",
+                "Gossip received message with sent_at smaller than instance_ts (sent_at: {}, instance_ts: {})",
                 msg.sent_at, msg.instance_ts,
             );
             return false;
@@ -666,7 +673,7 @@ impl FdState {
                 let is_me = node.gen_node_id.as_plain() == self.my_node_id.as_plain();
                 (is_known && has_capacity && !is_me).then_some(node)
             })
-            .choose_multiple(&mut rng, GOSSIP_ATTEMPT_LIMIT);
+            .sample(&mut rng, GOSSIP_ATTEMPT_LIMIT);
         chosen.shuffle(&mut rng);
         chosen
     }
@@ -693,5 +700,70 @@ impl FdState {
     fn my_node_mut(&mut self) -> &mut Node {
         self.node_mut(&self.my_node_id.as_plain())
             .expect("my node must be in FD")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use restate_types::cluster_state::ClusterState;
+    use restate_types::net::address::AdvertisedAddress;
+    use restate_types::nodes_config::{NodeConfig, NodesConfiguration, Role};
+    use restate_types::{GenerationalNodeId, RestateVersion};
+
+    use super::*;
+
+    const A: GenerationalNodeId = GenerationalNodeId::new(1, 1);
+    const B: GenerationalNodeId = GenerationalNodeId::new(2, 1);
+
+    #[tokio::test(start_paused = true)]
+    async fn resetting_gossip_timing_excludes_startup_time() {
+        let opts = GossipOptions::default();
+        let cluster_state = ClusterState::default();
+        let mut state = FdState::new(
+            A,
+            &nodes_config(),
+            PartitionReplicaSetStates::default(),
+            cluster_state.updater(),
+        );
+        state.num_gossip_received = opts.gossip_fd_stability_threshold.get() as usize;
+        for node in state.node_states.values_mut() {
+            node.gossip_age = 0;
+            node.state = NodeState::Alive;
+        }
+
+        tokio::time::advance(
+            *opts.gossip_tick_interval * (opts.gossip_loneliness_threshold.get() + 1),
+        )
+        .await;
+        assert!(state.is_lonely(&opts));
+
+        state.reset_gossip_timing();
+
+        assert!(!state.is_lonely(&opts));
+        assert!(!state.gossip_tick(&opts));
+        state.detect_peer_failures(&opts);
+        assert_eq!(state.node_states[&B.as_plain()].gossip_age, 0);
+        assert_eq!(state.node_states[&B.as_plain()].state, NodeState::Alive);
+
+        tokio::time::advance(*opts.gossip_tick_interval).await;
+        assert!(state.gossip_tick(&opts));
+        assert_eq!(state.node_states[&B.as_plain()].gossip_age, 1);
+        assert!(!state.is_lonely(&opts));
+    }
+
+    fn nodes_config() -> NodesConfiguration {
+        let mut nodes_config = NodesConfiguration::new_for_testing();
+        for node_id in [A, B] {
+            nodes_config.upsert_node(
+                NodeConfig::builder()
+                    .name(format!("node-{node_id}"))
+                    .current_generation(node_id)
+                    .address(AdvertisedAddress::default())
+                    .roles(Role::Admin | Role::Worker)
+                    .binary_version(RestateVersion::current())
+                    .build(),
+            );
+        }
+        nodes_config
     }
 }

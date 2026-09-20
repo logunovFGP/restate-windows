@@ -17,6 +17,7 @@ use tokio_stream::StreamExt;
 use tracing::{debug, info, trace};
 
 use restate_metadata_store::MetadataStoreClient;
+use restate_types::config::Configuration;
 use restate_types::live::Pinned;
 use restate_types::logs::metadata::Logs;
 use restate_types::net::RpcRequest;
@@ -30,10 +31,13 @@ use restate_types::{Version, Versioned};
 
 use super::MetadataBuilder;
 use super::{Metadata, MetadataContainer, MetadataKind, MetadataWriter};
+
+use crate::TaskCenter;
 use crate::cancellation_watcher;
 use crate::metadata::update_task::GlobalMetadataUpdateTask;
 use crate::network::{
-    MessageRouterBuilder, Oneshot, Reciprocal, ServiceMessage, ServiceReceiver, Verdict,
+    BackPressureMode, MessageRouterBuilder, Oneshot, Reciprocal, ServiceMessage, ServiceReceiver,
+    Verdict,
 };
 
 pub(super) type CommandSender = mpsc::UnboundedSender<Command>;
@@ -106,8 +110,14 @@ impl MetadataManager {
     }
 
     pub fn register_in_message_router(&mut self, sr_builder: &mut MessageRouterBuilder) {
-        self.service_op_rx =
-            sr_builder.register_service(10, crate::network::BackPressureMode::Lossy);
+        // Using dedicated memory pool for metadata manager to ensure that metadata sync
+        // messages do not starve the rest of the system.
+        let pool = TaskCenter::with_current(|tc| {
+            tc.memory_controller().create_pool("metadata-manager", || {
+                Configuration::pinned().networking.message_size_limit
+            })
+        });
+        self.service_op_rx = sr_builder.register_service_with_pool(pool, BackPressureMode::Lossy);
     }
 
     pub fn metadata(&self) -> &Metadata {
@@ -340,13 +350,13 @@ mod tests {
     use restate_test_util::assert_eq;
     use restate_types::net::address::AdvertisedAddress;
     use restate_types::nodes_config::{NodeConfig, Role};
-    use restate_types::{GenerationalNodeId, Version};
+    use restate_types::{GenerationalNodeId, RestateVersion, Version};
 
     use crate::metadata::spawn_metadata_manager;
     use crate::{TaskCenter, TaskCenterBuilder};
 
     #[test]
-    fn test_nodes_config_updates() -> Result<()> {
+    fn nodes_config_updates() -> Result<()> {
         test_updates(
             create_mock_nodes_config(),
             MetadataKind::NodesConfiguration,
@@ -356,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_table_updates() -> Result<()> {
+    fn partition_table_updates() -> Result<()> {
         test_updates(
             PartitionTable::with_equally_sized_partitions(Version::MIN, 42),
             MetadataKind::PartitionTable,
@@ -417,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nodes_config_watchers() -> Result<()> {
+    fn nodes_config_watchers() -> Result<()> {
         test_watchers(
             create_mock_nodes_config(),
             MetadataKind::NodesConfiguration,
@@ -427,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_table_watchers() -> Result<()> {
+    fn partition_table_watchers() -> Result<()> {
         test_watchers(
             PartitionTable::with_equally_sized_partitions(Version::MIN, 42),
             MetadataKind::PartitionTable,
@@ -509,6 +519,7 @@ mod tests {
             .current_generation(node_id)
             .address(address)
             .roles(roles)
+            .binary_version(RestateVersion::current())
             .build();
         nodes_config.upsert_node(my_node);
         nodes_config

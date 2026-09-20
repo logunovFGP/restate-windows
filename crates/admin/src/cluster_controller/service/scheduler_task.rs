@@ -12,11 +12,13 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::future::OptionFuture;
-use tracing::{debug, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, trace, warn};
 
 use restate_core::network::TransportConnect;
 use restate_core::{
     Metadata, ShutdownError, TaskCenter, TaskHandle, TaskKind, cancellation_watcher,
+    is_cancellation_requested,
 };
 use restate_metadata_store::MetadataStoreClient;
 use restate_types::cluster::cluster_state::LegacyClusterState;
@@ -27,14 +29,17 @@ use restate_types::metadata_store::keys::partition_processor_epoch_key;
 use restate_types::net::metadata::MetadataKind;
 use restate_types::nodes_config::NodesConfiguration;
 use restate_types::partitions::PartitionTable;
+use restate_types::partitions::state::PartitionReplicaSetStates;
 
 use crate::cluster_controller::cluster_state_refresher::ClusterStateWatcher;
-use crate::cluster_controller::service::scheduler::Scheduler;
+use crate::cluster_controller::service::scheduler::{self, Scheduler};
 
 pub struct SchedulerTask<T> {
     cluster_state_watcher: ClusterStateWatcher,
     metadata_client: MetadataStoreClient,
     scheduler: Scheduler<T>,
+    replica_set_states: PartitionReplicaSetStates,
+    sync_epoch_metadata_rx: mpsc::Receiver<Vec<PartitionId>>,
 }
 
 impl<T> SchedulerTask<T>
@@ -44,12 +49,16 @@ where
     pub fn new(
         cluster_state_watcher: ClusterStateWatcher,
         scheduler: Scheduler<T>,
+        replica_set_states: PartitionReplicaSetStates,
         metadata_client: MetadataStoreClient,
+        sync_epoch_metadata_rx: mpsc::Receiver<Vec<PartitionId>>,
     ) -> Self {
         Self {
             cluster_state_watcher,
             scheduler,
+            replica_set_states,
             metadata_client,
+            sync_epoch_metadata_rx,
         }
     }
 
@@ -69,9 +78,20 @@ where
         let cs = TaskCenter::with_current(|tc| tc.cluster_state().clone());
         let mut cs_changed = std::pin::pin!(cs.changed());
 
-        let mut fetch_epoch_metadata_task = Some(self.spawn_fetch_epoch_metadata_task()?);
+        let replica_set_states = self.replica_set_states.clone();
+        let mut observed_membership_changed =
+            std::pin::pin!(replica_set_states.membership_changed());
+
+        let mut fetch_epoch_metadata_task = Some(self.spawn_fetch_epoch_metadata_task(Vec::new())?);
 
         let mut next_fetch_interval = tokio::time::interval(Duration::from_secs(30));
+        // If we don't drain the ticks for long (e.g. not polling it because of the guard), there's a risk that we
+        // might accumulate a lot of them. The default behavior will burst through them causing back-to-back fetches
+        // until the interval is drained, which might overwhelm the metadata store. Let's change the default behavior
+        // to schedule the next tick from the moment we've consumed the previous one.
+        next_fetch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // We've just scheduled a fetch, let's consume the initial tick from the interval which ticks immediately.
+        next_fetch_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -105,11 +125,12 @@ where
                     self.on_cluster_state_change(&cs, &legacy_cluster_state, nodes_config.live_load(), partition_table.live_load()).await
                 }
                 Some(epoch_metadata) = OptionFuture::from(fetch_epoch_metadata_task.as_mut()) => {
+                    trace!("applying new epoch metadata fetched from the metadata store");
                     match epoch_metadata {
                         Ok(epoch_metadata) => {
                             for (partition_id, epoch_metadata) in epoch_metadata {
-                                let (_, _, current, next) = epoch_metadata.into_inner();
-                                self.scheduler.update_partition_configuration(partition_id, current, next);
+                                let (_, _, current, next, leadership_policy, placement_policy) = epoch_metadata.into_inner();
+                                self.scheduler.update_partition_configuration(partition_id, current, next, leadership_policy, placement_policy);
                             }
 
                             // changed partition configurations might mean that we need to select a new
@@ -123,9 +144,34 @@ where
 
                     fetch_epoch_metadata_task = None;
                 }
-                _ = next_fetch_interval.tick() => {
-                    if fetch_epoch_metadata_task.is_none() {
-                        fetch_epoch_metadata_task = Some(self.spawn_fetch_epoch_metadata_task()?);
+                Some(partition_ids) = self.sync_epoch_metadata_rx.recv() => {
+                    debug!("Received sync epoch metadata signal for {partition_ids:?}");
+                    // Cancel any in-flight fetch and restart with the requested partitions.
+                    if let Some(task) = fetch_epoch_metadata_task.take() {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    match self.spawn_fetch_epoch_metadata_task(partition_ids) {
+                        Ok(task) => fetch_epoch_metadata_task = Some(task),
+                        Err(err) => {
+                            warn!("Failed to spawn fetch epoch metadata task: {err}");
+                        }
+                    }
+                }
+                // Trigger the periodic full epoch metadata fetch if there's no epoch metadata fetch that is already in flight.
+                _ = next_fetch_interval.tick(), if fetch_epoch_metadata_task.is_none() => {
+                    trace!("triggering an epoch metadata fetch as part of the periodic refreshes");
+                    fetch_epoch_metadata_task = Some(self.spawn_fetch_epoch_metadata_task(Vec::new())?);
+                }
+                _ = &mut observed_membership_changed, if fetch_epoch_metadata_task.is_none() => {
+                    observed_membership_changed.set(replica_set_states.membership_changed());
+                    // we observed membership changed, but the scheduler might be already aware of it if, for
+                    // example, it's the one that triggered it. So let's notify it about the change and only
+                    // trigger a refresh if it reports back that it's not aware of it.
+                    let stale_epoch_metadata = self.scheduler.detect_stale_epoch_metadata();
+                    if !stale_epoch_metadata.is_empty() {
+                        trace!("the scheduler detected some partitions ({:?}) with stale epoch metadata, triggering an epoch metadata fetch for those partitions", stale_epoch_metadata);
+                        fetch_epoch_metadata_task = Some(self.spawn_fetch_epoch_metadata_task(stale_epoch_metadata)?);
                     }
                 }
             }
@@ -143,11 +189,12 @@ where
 
     fn spawn_fetch_epoch_metadata_task(
         &mut self,
+        partition_ids: Vec<PartitionId>,
     ) -> Result<TaskHandle<HashMap<PartitionId, EpochMetadata>>, ShutdownError> {
         TaskCenter::spawn_unmanaged(
             TaskKind::Background,
             "fetch-epoch-metadata",
-            FetchEpochMetadataTask::new(self.metadata_client.clone()).run(),
+            FetchEpochMetadataTask::new(self.metadata_client.clone(), partition_ids).run(),
         )
     }
 
@@ -168,26 +215,45 @@ where
             )
             .await
         {
-            warn!(%err, "Failed to react to cluster state changes. This can impair the overall cluster operations");
+            match err {
+                scheduler::Error::Shutdown(_) if is_cancellation_requested() => {
+                    debug!(
+                        "Scheduler is shutting down, possibly due to a leader-to-follower transition"
+                    );
+                }
+                err => {
+                    warn!(%err, "Failed to react to cluster state changes. This can impair the overall cluster operations");
+                }
+            }
         }
     }
 }
 
 struct FetchEpochMetadataTask {
     metadata_client: MetadataStoreClient,
+    /// Partitions to fetch. Empty = all known partitions.
+    partition_ids: Vec<PartitionId>,
 }
 
 impl FetchEpochMetadataTask {
-    pub fn new(metadata_client: MetadataStoreClient) -> Self {
-        Self { metadata_client }
+    pub fn new(metadata_client: MetadataStoreClient, partition_ids: Vec<PartitionId>) -> Self {
+        Self {
+            metadata_client,
+            partition_ids,
+        }
     }
 
     pub async fn run(self) -> HashMap<PartitionId, EpochMetadata> {
         let mut latest_epoch_metadata = HashMap::default();
 
-        let partition_table = Metadata::with_current(|m| m.partition_table_snapshot());
+        let partition_ids: Vec<PartitionId> = if self.partition_ids.is_empty() {
+            let partition_table = Metadata::with_current(|m| m.partition_table_snapshot());
+            partition_table.iter_ids().cloned().collect()
+        } else {
+            self.partition_ids
+        };
 
-        for partition_id in partition_table.iter_ids() {
+        for partition_id in &partition_ids {
             // todo replace with multi get
             match self
                 .metadata_client

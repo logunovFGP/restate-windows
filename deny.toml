@@ -8,13 +8,26 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "crate is unmaintained. We need to migrate to a different crate than `paste`" },
     { id = "RUSTSEC-2024-0437", reason = "protobuf-rs stackoverflow in deep nested messages, not fixed yet" },
     { id = "RUSTSEC-2025-0057", reason = "fxhash is not maintained anymore, currently used only by raft-rs" },
-    { id = "RUSTSEC-2025-0141", reason = "bincode is no longer maintained, it's only used by restate-queue which will soon be removed" }
+    # package proc-macro-error2 is pulled by `raft` -> `getset` -> `proc-macro-error2`
+    { id = "RUSTSEC-2026-0173", reason = "The author of `proc-macro-error2` has [confirmed](https://github.com/GnomedDev/proc-macro-error-2/issues/17#issuecomment-4643215473) that the crate is no longer maintained and recommends that users migrate away from it" },
+    # quick-xml <0.41 DoS advisories (both fixed only in 0.41.0): RUSTSEC-2026-0194 (quadratic-time
+    # `BytesStart::attributes()`) and RUSTSEC-2026-0195 (unbounded namespace-declaration allocation in
+    # `NsReader`). Only pulled transitively: `inferno` (flamegraph SVG generation from self-generated
+    # profiling data, not exploitable) and `object_store` (parses XML from the configured S3/Azure/GCS
+    # endpoint only). No upstream fix yet: latest inferno (0.12.6) pins quick-xml ^0.39 and latest
+    # object_store (0.14.0) pins ^0.40.1, both <0.41. Revisit once object_store/inferno release versions
+    # using quick-xml >=0.41 and datafusion permits the bump.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml <0.41 quadratic-time DoS, only reachable via inferno flamegraph generation and object_store XML parsing; no upstream release uses 0.41 yet" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml <0.41 unbounded namespace-declaration allocation DoS, only reachable via inferno flamegraph generation and object_store XML parsing; no upstream release uses 0.41 yet" },
+    # smartstring is a dependency of rust-rocksdb
+    { id = "RUSTSEC-2026-0249", reason = "The smartstring crate is unmaintained; all versions are affected. The GitHub repository was archived by the owner on 2026-05-03." },
 ]
 
 
 [licenses]
 version = 2
 allow = [
+    # Permissive licenses
     "MIT",
     "MIT-0",
     "Apache-2.0",
@@ -23,33 +36,25 @@ allow = [
     "ISC",
     "BSL-1.0",
     "OpenSSL",
-    "MPL-2.0",
     "CC0-1.0",
     "Zlib",
+    "bzip2-1.0.6",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    # Weak copyleft (file-level) licenses. These only require sharing modifications
+    # to the licensed files themselves. Unmodified use in a "Larger Work" (our
+    # binaries) does not impose any copyleft obligation on the surrounding code.
+    # Current deps: smartstring, option-ext, priority-queue (MPL-2.0);
+    # inferno (CDDL-1.0, only included when heap-flamegraph feature is enabled).
+    "MPL-2.0",
+    "CDDL-1.0",
+    "Apache-2.0 WITH LLVM-exception",
 ]
 # The confidence threshold for detecting a license from license text.
 # The higher the value, the more closely the license text must be to the
 # canonical license text of a valid SPDX license file.
 # [possible values: any between 0.0 and 1.0].
 confidence-threshold = 0.8
-
-[[licenses.exceptions]]
-# Ignore Unicode-DFS-2016 because we don't bundle the generated files from
-# the unicode-ident dependency. See https://github.com/dtolnay/unicode-ident/pull/9/files
-allow = ["Unicode-DFS-2016"]
-name = "unicode-ident"
-version = "1.0.6"
-
-[[licenses.exceptions]]
-# We are using inferno as part of the benchmarks crate that does not get released.
-# Only modifications to inferno would have to made available under the CDDL:
-# See https://fossa.com/blog/open-source-licenses-101-cddl-common-development-distribution-license/ and
-# https://opensource.stackexchange.com/questions/8265/cddl-library-and-closed-source-application.
-allow = ["CDDL-1.0"]
-name = "inferno"
-version = "0.11"
 
 [[licenses.clarify]]
 name = "ring"
@@ -93,33 +98,18 @@ skip = [
     { name = "windows_i686_gnu" },
     { name = "windows_i686_msvc" },
     { name = "windows_aarch64_msvc" },
-    { name = "hermit-abi" },
-
-    # Clash between tonic clap dependency (outdated) and hyper-rustls and prost-reflect
-    { name = "base64" },
 
     # The following is an internal dependency needed by librocksdb-sys
     { name = "syn" },
 
-    # Clash between datafusion async-compression dependency and datafusion zstd dependency
-    { name = "zstd-safe" },
-    { name = "zstd" },
-
     # Clash between datafusion and arrow
     { name = "hashbrown" },
-
-    # Clash between datafusion and invoker
-    { name = "tokio-rustls" },
 
     # Clash between pprof and datafusion :-(
     { name = "quick-xml" },
 
     # Clash with criterion
     { name = "itertools" },
-
-    # clash between prost and otel libraries
-    { name = "prost" },
-    { name = "prost-derive" },
 
     # clash between aws-config and pgwire
     { name = "untrusted" },
@@ -131,10 +121,7 @@ unknown-registry = "deny"
 # in the allow list is encountered
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = [
-    "https://github.com/apache/arrow-rs.git",
-    "https://github.com/tikv/raft-rs.git",
-]
+allow-git = ["https://github.com/apache/arrow-rs.git"]
 
 [sources.allow-org]
 # 1 or more github.com organizations to allow git sources for

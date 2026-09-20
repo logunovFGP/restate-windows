@@ -22,12 +22,11 @@ use pprof::criterion::{Output, PProfProfiler};
 use pprof::flamegraph::Options;
 use prost::Message as _;
 use rand::distr::Alphanumeric;
-use rand::{Rng, RngCore, random};
+use rand::{Rng, RngExt, random};
 
 use restate_bifrost::InputRecord;
 use restate_core::network::protobuf::network::message::Body;
 use restate_core::network::protobuf::network::{Datagram, Message, datagram};
-use restate_invoker_api::{Effect, EffectKind};
 use restate_storage_api::deduplication_table::{DedupInformation, EpochSequenceNumber, ProducerId};
 use restate_types::identifiers::{InvocationId, LeaderEpoch, PartitionProcessorRpcRequestId};
 use restate_types::invocation::{
@@ -43,6 +42,7 @@ use restate_types::net::{RpcRequest, Service};
 use restate_types::time::MillisSinceEpoch;
 use restate_types::{GenerationalNodeId, RestateVersion};
 use restate_wal_protocol::{Command, Destination, Envelope};
+use restate_worker_api::invoker::{Effect, EffectKind};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -81,6 +81,7 @@ fn invoke_cmd() -> Command {
         invocation_target: InvocationTarget::Service {
             name: "AnotherService".into(),
             handler,
+            scope: None,
         },
         argument: "DataSent".to_string().into(),
         source: inv_source,
@@ -93,6 +94,7 @@ fn invoke_cmd() -> Command {
         completion_retention_duration: Duration::from_secs(10),
         journal_retention_duration: Default::default(),
         idempotency_key: Some(idempotency_key),
+        limit_key: Default::default(),
         response_sink: Some(
             restate_types::invocation::ServiceInvocationResponseSink::Ingress { request_id },
         ),
@@ -112,7 +114,7 @@ fn invoker_effect_cmd() -> Command {
 
     Command::InvokerEffect(Box::new(Effect {
         invocation_id: InvocationId::generate(
-            &InvocationTarget::service("MyWonderfulService", handler.clone()),
+            &InvocationTarget::service("MyWonderfulService", handler),
             Some(&idempotency_key),
         ),
         kind: EffectKind::journal_entry(
@@ -134,14 +136,13 @@ where
 
     let header = restate_wal_protocol::Header {
         source: restate_wal_protocol::Source::Processor {
-            partition_id: None,
             partition_key: Some(partition_key),
             leader_epoch,
         },
         dest: Destination::Processor {
             partition_key,
             dedup: Some(DedupInformation {
-                producer_id: ProducerId::self_producer(),
+                producer_id: ProducerId::self_producer().clone(),
                 sequence_number: restate_storage_api::deduplication_table::DedupSequenceNumber::Esn(
                     EpochSequenceNumber {
                         leader_epoch: LeaderEpoch::from(random::<u64>()),

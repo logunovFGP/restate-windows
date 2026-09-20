@@ -8,6 +8,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use crate::partition::processor::ProcessorContext;
 use crate::partition::state_machine::entries::OnJournalEntryCommand;
 use crate::partition::state_machine::{CommandHandler, Error, StateMachineApplyContext};
 use restate_storage_api::fsm_table::WriteFsmTable;
@@ -18,6 +19,7 @@ use restate_storage_api::invocation_status_table::{
 use restate_storage_api::journal_events::WriteJournalEventsTable;
 use restate_storage_api::journal_table;
 use restate_storage_api::journal_table_v2::{ReadJournalTable, WriteJournalTable};
+use restate_storage_api::lock_table::WriteLockTable;
 use restate_storage_api::outbox_table::WriteOutboxTable;
 use restate_storage_api::promise_table::{ReadPromiseTable, WritePromiseTable};
 use restate_storage_api::service_status_table::WriteVirtualObjectStatusTable;
@@ -33,7 +35,7 @@ pub struct OnNotifySignalCommand {
     pub signal: Signal,
 }
 
-impl<'ctx, 's: 'ctx, S> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S>>
+impl<'ctx, 's: 'ctx, S, P> CommandHandler<&'ctx mut StateMachineApplyContext<'s, S, P>>
     for OnNotifySignalCommand
 where
     S: WriteJournalTable
@@ -53,9 +55,11 @@ where
         + WritePromiseTable
         + ReadVQueueTable
         + WriteVQueueTable
+        + WriteLockTable
         + WriteVirtualObjectStatusTable,
+    P: ProcessorContext,
 {
-    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S>) -> Result<(), Error> {
+    async fn apply(self, ctx: &'ctx mut StateMachineApplyContext<'s, S, P>) -> Result<(), Error> {
         let OnNotifySignalCommand {
             invocation_id,
             invocation_status,

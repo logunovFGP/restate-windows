@@ -21,6 +21,7 @@ restate-workspace-hack = { workspace = true }
 restate-bifrost = { workspace = true, features = ["memory-loglet", "local-loglet"] }
 restate-core = { workspace = true, features = ["test-util"] }
 restate-errors = { workspace = true }
+restate-memory = { workspace = true }
 restate-metadata-server = { workspace = true }
 restate-rocksdb = { workspace = true }
 restate-test-util = { workspace = true }
@@ -53,6 +54,9 @@ tracing-subscriber = { workspace = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true, features = ["unprefixed_malloc_on_supported_platforms"] }
+
+[lints]
+workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rlimit = { workspace = true }

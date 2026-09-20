@@ -12,19 +12,6 @@
 
 pub mod client;
 
-use crate::errors::InvocationError;
-use crate::identifiers::{
-    DeploymentId, EntryIndex, IdempotencyId, InvocationId, PartitionKey,
-    PartitionProcessorRpcRequestId, ServiceId, SubscriptionId, WithInvocationId, WithPartitionKey,
-};
-use crate::journal_v2::{CompletionId, GetInvocationOutputResult, Signal};
-use crate::time::MillisSinceEpoch;
-use crate::{GenerationalNodeId, RestateVersion};
-
-use bytes::Bytes;
-use bytestring::ByteString;
-use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceState};
-use serde_with::{DisplayFromStr, FromInto, serde_as};
 use std::borrow::Cow;
 use std::hash::Hash;
 use std::ops::Deref;
@@ -32,16 +19,46 @@ use std::str::FromStr;
 use std::time::Duration;
 use std::{cmp, fmt};
 
+use bytes::Bytes;
+use bytestring::ByteString;
+use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceState};
 // Re-exporting opentelemetry [`TraceId`] to avoid having to import opentelemetry in all crates.
 pub use opentelemetry::trace::TraceId;
+use serde_with::{DisplayFromStr, FromInto, serde_as};
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+use restate_clock::RoughTimestamp;
+use restate_memory::ByteCount;
+use restate_util_string::ReString;
+
+use crate::Scope;
+use crate::errors::InvocationError;
+use crate::identifiers::{
+    DeploymentId, EntryIndex, IdempotencyId, InvocationId, PartitionKey,
+    PartitionProcessorRpcRequestId, ServiceId, SubscriptionId, WithInvocationId, WithPartitionKey,
+};
+use crate::invocation::client::PatchDeploymentId;
+use crate::journal_v2::{CompletionId, GetInvocationOutputResult, Signal};
+use crate::limit_key::LimitKey;
+use crate::time::MillisSinceEpoch;
+use crate::{GenerationalNodeId, LockName, RestateVersion, ServiceName};
+
+#[derive(
+    Eq,
+    Hash,
+    PartialEq,
+    Clone,
+    Copy,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    bilrost::Enumeration,
+)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "utoipa-schema", derive(utoipa::ToSchema))]
 pub enum ServiceType {
-    Service,
-    VirtualObject,
-    Workflow,
+    Service = 0,
+    VirtualObject = 1,
+    Workflow = 2,
 }
 
 impl ServiceType {
@@ -61,13 +78,22 @@ impl fmt::Display for ServiceType {
 }
 
 #[derive(
-    Eq, Hash, PartialEq, Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize,
+    Eq,
+    Hash,
+    PartialEq,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    bilrost::Enumeration,
 )]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum VirtualObjectHandlerType {
     #[default]
-    Exclusive,
-    Shared,
+    Exclusive = 0,
+    Shared = 1,
 }
 
 impl fmt::Display for VirtualObjectHandlerType {
@@ -77,13 +103,22 @@ impl fmt::Display for VirtualObjectHandlerType {
 }
 
 #[derive(
-    Eq, Hash, PartialEq, Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize,
+    Eq,
+    Hash,
+    PartialEq,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    bilrost::Enumeration,
 )]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum WorkflowHandlerType {
     #[default]
-    Workflow,
-    Shared,
+    Workflow = 0,
+    Shared = 1,
 }
 
 impl fmt::Display for WorkflowHandlerType {
@@ -92,11 +127,29 @@ impl fmt::Display for WorkflowHandlerType {
     }
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Eq,
+    Hash,
+    PartialEq,
+    Clone,
+    Copy,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    bilrost::Message,
+    bilrost::Oneof,
+)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+// NOTE: Do not add a variant to InvocationTargetType without skipping a
+// version first. This is a `bilrost::Oneof`, and a node running an older
+// version decodes an unrecognized tag as `Self::Service` instead of
+// failing, so it would silently treat the new target type as a plain
+// service.
 pub enum InvocationTargetType {
     Service,
+    #[bilrost(tag = 1)]
     VirtualObject(VirtualObjectHandlerType),
+    #[bilrost(tag = 2)]
     Workflow(WorkflowHandlerType),
 }
 
@@ -147,23 +200,30 @@ pub enum Short<'a> {
     UnKeyed { name: &'a str, handler: &'a str },
 }
 
+// Note: Don't annotate fields with `#[serde(skip_serializing_if = ...)]`. The invoker spills this
+// type to disk via the `SegmentQueue` which serializes it with bincode, a non-self-describing
+// format that fails to deserialize values with skipped fields.
+// See https://github.com/restatedev/restate/issues/4910.
 #[derive(Eq, Hash, PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum InvocationTarget {
     Service {
         name: ByteString,
         handler: ByteString,
+        scope: Option<Scope>,
     },
     VirtualObject {
         name: ByteString,
         key: ByteString,
         handler: ByteString,
         handler_ty: VirtualObjectHandlerType,
+        scope: Option<Scope>,
     },
     Workflow {
         name: ByteString,
         key: ByteString,
         handler: ByteString,
         handler_ty: WorkflowHandlerType,
+        scope: Option<Scope>,
     },
 }
 
@@ -172,12 +232,25 @@ impl InvocationTarget {
         Self::Service {
             name: name.into(),
             handler: handler.into(),
+            scope: None,
+        }
+    }
+
+    pub fn scoped_service(
+        name: impl Into<ByteString>,
+        handler: impl Into<ByteString>,
+        scope: Scope,
+    ) -> Self {
+        Self::Service {
+            name: name.into(),
+            handler: handler.into(),
+            scope: Some(scope),
         }
     }
 
     pub fn short(&self) -> Short<'_> {
         match self {
-            Self::Service { name, handler } => Short::UnKeyed { name, handler },
+            Self::Service { name, handler, .. } => Short::UnKeyed { name, handler },
             Self::VirtualObject { name, handler, .. } | Self::Workflow { name, handler, .. } => {
                 Short::Keyed { name, handler }
             }
@@ -195,6 +268,23 @@ impl InvocationTarget {
             key: key.into(),
             handler: handler.into(),
             handler_ty,
+            scope: None,
+        }
+    }
+
+    pub fn scoped_virtual_object(
+        name: impl Into<ByteString>,
+        key: impl Into<ByteString>,
+        handler: impl Into<ByteString>,
+        handler_ty: VirtualObjectHandlerType,
+        scope: Scope,
+    ) -> Self {
+        Self::VirtualObject {
+            name: name.into(),
+            key: key.into(),
+            handler: handler.into(),
+            handler_ty,
+            scope: Some(scope),
         }
     }
 
@@ -209,6 +299,41 @@ impl InvocationTarget {
             key: key.into(),
             handler: handler.into(),
             handler_ty,
+            scope: None,
+        }
+    }
+
+    pub fn scoped_workflow(
+        name: impl Into<ByteString>,
+        key: impl Into<ByteString>,
+        handler: impl Into<ByteString>,
+        handler_ty: WorkflowHandlerType,
+        scope: Scope,
+    ) -> Self {
+        Self::Workflow {
+            name: name.into(),
+            key: key.into(),
+            handler: handler.into(),
+            handler_ty,
+            scope: Some(scope),
+        }
+    }
+
+    /// Creates the same target but with a scope attached.
+    pub fn with_scope(mut self, scope: Option<Scope>) -> Self {
+        match &mut self {
+            Self::Service { scope: s, .. }
+            | Self::VirtualObject { scope: s, .. }
+            | Self::Workflow { scope: s, .. } => *s = scope,
+        }
+        self
+    }
+
+    pub fn scope(&self) -> Option<&Scope> {
+        match self {
+            InvocationTarget::Service { scope, .. }
+            | InvocationTarget::VirtualObject { scope, .. }
+            | InvocationTarget::Workflow { scope, .. } => scope.as_ref(),
         }
     }
 
@@ -217,6 +342,30 @@ impl InvocationTarget {
             InvocationTarget::Service { name, .. } => name,
             InvocationTarget::VirtualObject { name, .. } => name,
             InvocationTarget::Workflow { name, .. } => name,
+        }
+    }
+
+    pub fn lock_name(&self) -> Option<LockName> {
+        match self {
+            // Exclusive handler require holding a lock
+            InvocationTarget::VirtualObject {
+                name,
+                key,
+                handler_ty,
+                ..
+            } if handler_ty == &VirtualObjectHandlerType::Exclusive => Some(LockName::new(
+                ServiceName::new(name.as_ref()),
+                ReString::new(key),
+            )),
+            // NOTE: Workflows don't have locks as their invariant (run once per ID) is enforced by
+            // the partition processor at ingestion/creation time (via invocation/entry status)
+            // Therefore, we treat them as normal services when it comes to locking and vqueue
+            // management.
+            //
+            // Also on virtual objects, shared handlers do not require locking.
+            InvocationTarget::VirtualObject { .. }
+            | InvocationTarget::Service { .. }
+            | InvocationTarget::Workflow { .. } => None,
         }
     }
 
@@ -239,12 +388,12 @@ impl InvocationTarget {
     pub fn as_keyed_service_id(&self) -> Option<ServiceId> {
         match self {
             InvocationTarget::Service { .. } => None,
-            InvocationTarget::VirtualObject { name, key, .. } => {
-                Some(ServiceId::new(name.clone(), key.clone()))
-            }
-            InvocationTarget::Workflow { name, key, .. } => {
-                Some(ServiceId::new(name.clone(), key.clone()))
-            }
+            InvocationTarget::VirtualObject {
+                name, key, scope, ..
+            } => Some(ServiceId::new(scope.clone(), name.clone(), key.clone())),
+            InvocationTarget::Workflow {
+                name, key, scope, ..
+            } => Some(ServiceId::new(scope.clone(), name.clone(), key.clone())),
         }
     }
 
@@ -318,6 +467,12 @@ pub struct InvocationRequestHeader {
     /// Time when the request should be executed. If none, it's executed immediately.
     pub execution_time: Option<MillisSinceEpoch>,
 
+    /// Limit key for hierarchical concurrency/rate limiting.
+    /// Invariant: `limit_key != LimitKey::None` requires `target.scope().is_some()`.
+    /// Since v1.7.0
+    #[serde(default, skip_serializing_if = "LimitKey::is_none")]
+    pub limit_key: LimitKey<ReString>,
+
     /// Retention duration of the completed status.
     /// If zero, the completed status is not retained.
     #[serde(default)]
@@ -339,6 +494,7 @@ impl InvocationRequestHeader {
             span_context: ServiceInvocationSpanContext::empty(),
             idempotency_key: None,
             execution_time: None,
+            limit_key: LimitKey::None,
             completion_retention_duration: Duration::ZERO,
             journal_retention_duration: Duration::ZERO,
         }
@@ -395,6 +551,12 @@ impl InvocationRequest {
     }
 }
 
+impl WithPartitionKey for InvocationRequest {
+    fn partition_key(&self) -> PartitionKey {
+        self.header.invocation_id().partition_key()
+    }
+}
+
 impl WithInvocationId for InvocationRequest {
     fn invocation_id(&self) -> InvocationId {
         self.header.invocation_id()
@@ -402,7 +564,7 @@ impl WithInvocationId for InvocationRequest {
 }
 
 /// Struct representing an invocation to a service. This struct is processed by Restate to execute the invocation.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(derive_more::Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(
     from = "serde_hacks::ServiceInvocation",
     into = "serde_hacks::ServiceInvocation"
@@ -410,6 +572,7 @@ impl WithInvocationId for InvocationRequest {
 pub struct ServiceInvocation {
     pub invocation_id: InvocationId,
     pub invocation_target: InvocationTarget,
+    #[debug("Bytes({})", ByteCount::from(argument.len()))]
     pub argument: Bytes,
     pub source: Source,
     pub span_context: ServiceInvocationSpanContext,
@@ -424,6 +587,12 @@ pub struct ServiceInvocation {
     pub journal_retention_duration: Duration,
 
     pub idempotency_key: Option<ByteString>,
+
+    /// Limit key for hierarchical concurrency/rate limiting.
+    /// Invariant: `limit_key != LimitKey::None` requires `invocation_target.scope().is_some()`.
+    /// Since v1.7.0
+    #[serde(default, skip_serializing_if = "LimitKey::is_none")]
+    pub limit_key: LimitKey<ReString>,
 
     // Where to send the response, if any
     pub response_sink: Option<ServiceInvocationResponseSink>,
@@ -463,6 +632,7 @@ impl ServiceInvocation {
                 request.header.completion_retention_duration,
             ),
             idempotency_key: request.header.idempotency_key,
+            limit_key: request.header.limit_key,
             response_sink: None,
             submit_notification_sink: None,
             restate_version: RestateVersion::current(),
@@ -486,6 +656,7 @@ impl ServiceInvocation {
             completion_retention_duration: Duration::ZERO,
             journal_retention_duration: Duration::ZERO,
             idempotency_key: None,
+            limit_key: LimitKey::None,
             submit_notification_sink: None,
             restate_version: RestateVersion::current(),
         }
@@ -558,6 +729,12 @@ impl JournalCompletionTarget {
     }
 }
 
+impl WithPartitionKey for JournalCompletionTarget {
+    fn partition_key(&self) -> PartitionKey {
+        self.caller_id.partition_key()
+    }
+}
+
 impl WithInvocationId for JournalCompletionTarget {
     fn invocation_id(&self) -> InvocationId {
         self.caller_id
@@ -575,15 +752,23 @@ pub struct InvocationResponse {
     pub result: ResponseResult,
 }
 
+impl WithPartitionKey for InvocationResponse {
+    fn partition_key(&self) -> PartitionKey {
+        self.target.invocation_id().partition_key()
+    }
+}
+
 impl WithInvocationId for InvocationResponse {
     fn invocation_id(&self) -> InvocationId {
         self.target.invocation_id()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(derive_more::Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResponseResult {
+    #[debug("Success(<data>)")]
     Success(Bytes),
+    #[debug("Failure({_0})")]
     Failure(InvocationError),
 }
 
@@ -665,6 +850,8 @@ pub enum Source {
     Subscription(SubscriptionId),
     Service(InvocationId, InvocationTarget),
     RestartAsNew(InvocationId),
+    // Since v1.8.0
+    Ingestion,
     /// Internal calls for the non-deterministic built-in services
     Internal,
 }
@@ -700,18 +887,16 @@ impl ServiceInvocationSpanContext {
         }
     }
 
-    /// Create a [`SpanContext`] for this invocation, a [`Span`] which will be created
-    /// when the invocation completes.
+    /// Create a [`SpanContext`] for this invocation.
+    ///
+    /// Valid unsampled contexts are retained for propagation without enabling recording.
     ///
     /// This function is **deterministic**.
     pub fn start(
         invocation_id: &InvocationId,
         related_span: SpanRelation,
     ) -> ServiceInvocationSpanContext {
-        if !related_span.is_sampled() {
-            // don't waste any time or storage space on unsampled traces
-            // sampling based on parent is default otel behaviour; we do the same for the
-            // non-parent background invoke relationship
+        if !related_span.is_valid() {
             return ServiceInvocationSpanContext::empty();
         }
 
@@ -858,6 +1043,12 @@ impl From<ServiceInvocationSpanContext> for SpanContextDef {
     }
 }
 
+impl From<ServiceInvocationSpanContext> for SpanContext {
+    fn from(value: ServiceInvocationSpanContext) -> Self {
+        value.span_context.into()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Header {
     pub name: ByteString,
@@ -907,11 +1098,11 @@ impl SpanRelation {
         Self::Linked(ctx.into())
     }
 
-    fn is_sampled(&self) -> bool {
+    fn is_valid(&self) -> bool {
         match self {
             SpanRelation::None => false,
-            SpanRelation::Parent(span_context) => span_context.is_sampled(),
-            SpanRelation::Linked(span_context) => span_context.is_sampled(),
+            SpanRelation::Parent(span_context) => span_context.is_valid(),
+            SpanRelation::Linked(span_context) => span_context.is_valid(),
         }
     }
 }
@@ -969,8 +1160,30 @@ impl WithInvocationId for PurgeInvocationRequest {
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResumeInvocationRequest {
     pub invocation_id: InvocationId,
+    /// The unresolved deployment patch to apply on resume, resolved and validated by the apply path
+    /// (`OnManualResumeCommand`) against the invocation status as of the command's log position.
+    ///
+    /// Only written on the VQueue path, where vqueues being enabled implies a cluster
+    /// `min_restate_version >= 1.7.0` (so every node understands this field). The non-VQueue path
+    /// keeps writing the already-resolved [`Self::update_pinned_deployment_id`] for compatibility
+    /// with pre-1.7.0 nodes. `None` therefore means "use `update_pinned_deployment_id` instead".
+    ///
+    /// Since *v1.7.0*
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_deployment_id: Option<PatchDeploymentId>,
+    /// Already-resolved deployment id. Written by the non-VQueue path (and by pre-1.7.0 nodes); the
+    /// apply path honors it directly when present. New VQueue-path writes leave this `None` and use
+    /// [`Self::update_deployment_id`] instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_pinned_deployment_id: Option<DeploymentId>,
+    /// When the rescheduled VQueue entry should run. `None` defaults to the entry's `created_at`
+    /// (its original priority position). A value in the past raises priority; the future delays it.
+    /// Uses [`RoughTimestamp`] (second precision) to match the VQueue scheduler's `run_at` key; a
+    /// finer-grained timestamp would only be truncated.
+    ///
+    /// Since *v1.7.0*
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<RoughTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_sink: Option<InvocationMutationResponseSink>,
 }
@@ -1070,10 +1283,6 @@ impl SpanContextDef {
 
     pub fn into_trace_state(self) -> TraceStateDef {
         self.trace_state
-    }
-
-    fn is_sampled(&self) -> bool {
-        self.trace_flags().is_sampled()
     }
 }
 
@@ -1266,6 +1475,7 @@ impl InvocationQuery {
                     handler: Default::default(),
                     // Must be the workflow handler type
                     handler_ty: WorkflowHandlerType::Workflow,
+                    scope: wfid.scope.clone(),
                 },
                 None,
             ),
@@ -1274,6 +1484,7 @@ impl InvocationQuery {
                 service_key,
                 service_handler,
                 idempotency_key,
+                scope,
                 ..
             }) => {
                 let target = match service_key {
@@ -1287,7 +1498,8 @@ impl InvocationQuery {
                         // Doesn't really matter
                         VirtualObjectHandlerType::Exclusive,
                     ),
-                };
+                }
+                .with_scope(scope.clone());
                 InvocationId::generate(&target, Some(idempotency_key.deref()))
             }
         }
@@ -1329,14 +1541,27 @@ pub struct NotifySignalRequest {
     pub signal: Signal,
 }
 
+impl WithPartitionKey for NotifySignalRequest {
+    fn partition_key(&self) -> PartitionKey {
+        self.invocation_id.partition_key()
+    }
+}
+
 impl WithInvocationId for NotifySignalRequest {
     fn invocation_id(&self) -> InvocationId {
         self.invocation_id
     }
 }
 
-/// The invocation epoch represents the restarts count of the invocation, as seen from the Partition processor.
-pub type InvocationEpoch = u32;
+/// Identifies an invoker-task generation, used to fence stale invoker effects.
+///
+/// This is a leader-local, in-memory value: the partition processor's leader keeps a
+/// `fencing_tokens` map, hands the current token to the invoker on (re)invoke, and the invoker
+/// echoes it on every effect. The leader drops effects whose token no longer matches *before*
+/// self-proposing them. It is intentionally **not** persisted and not written to Bifrost -- it is
+/// not part of the invocation lifecycle. Wraps around (a stale straggler never survives 2^32
+/// intervening invokes).
+pub type FencingToken = u32;
 
 mod serde_hacks {
     //! Module where we hide all the hacks to make back-compat working!
@@ -1356,6 +1581,8 @@ mod serde_hacks {
         #[serde(default, skip_serializing_if = "Duration::is_zero")]
         pub journal_retention_duration: Duration,
         pub idempotency_key: Option<ByteString>,
+        #[serde(default, skip_serializing_if = "LimitKey::is_none")]
+        pub limit_key: LimitKey<ReString>,
         pub response_sink: Option<ServiceInvocationResponseSink>,
         pub submit_notification_sink: Option<SubmitNotificationSink>,
 
@@ -1372,6 +1599,7 @@ mod serde_hacks {
         Subscription(SubscriptionId),
         Service(InvocationId, InvocationTarget),
         RestartAsNew(InvocationId),
+        Ingestion,
         /// Internal calls for the non-deterministic built-in services
         Internal,
     }
@@ -1389,6 +1617,7 @@ mod serde_hacks {
                 completion_retention_duration,
                 journal_retention_duration,
                 idempotency_key,
+                limit_key,
                 response_sink,
                 submit_notification_sink,
                 restate_version,
@@ -1405,6 +1634,7 @@ mod serde_hacks {
                 completion_retention_duration: completion_retention_duration.unwrap_or_default(),
                 journal_retention_duration,
                 idempotency_key,
+                limit_key,
                 response_sink: response_sink.map(Into::into),
                 submit_notification_sink: submit_notification_sink.map(Into::into),
                 source: match source {
@@ -1414,6 +1644,7 @@ mod serde_hacks {
                     Source::Subscription(sid) => super::Source::Subscription(sid),
                     Source::Service(id, target) => super::Source::Service(id, target),
                     Source::RestartAsNew(id) => super::Source::RestartAsNew(id),
+                    Source::Ingestion => super::Source::Ingestion,
                     Source::Internal => super::Source::Internal,
                 },
                 restate_version,
@@ -1434,6 +1665,7 @@ mod serde_hacks {
                 completion_retention_duration,
                 journal_retention_duration,
                 idempotency_key,
+                limit_key,
                 response_sink,
                 submit_notification_sink,
                 restate_version,
@@ -1455,6 +1687,7 @@ mod serde_hacks {
                 completion_retention_duration: Some(completion_retention_duration),
                 journal_retention_duration,
                 idempotency_key,
+                limit_key,
                 response_sink: response_sink.map(Into::into),
                 submit_notification_sink: submit_notification_sink.map(Into::into),
                 restate_version,
@@ -1465,6 +1698,7 @@ mod serde_hacks {
                     super::Source::Service(id, target) => Source::Service(id, target),
                     super::Source::Internal => Source::Internal,
                     super::Source::RestartAsNew(id) => Source::RestartAsNew(id),
+                    super::Source::Ingestion => Source::Ingestion,
                 },
             }
         }
@@ -1682,6 +1916,7 @@ mod mocks {
                 completion_retention_duration: Duration::ZERO,
                 journal_retention_duration: Duration::ZERO,
                 idempotency_key: None,
+                limit_key: LimitKey::None,
                 submit_notification_sink: None,
                 restate_version: RestateVersion::current(),
             }
@@ -1706,6 +1941,7 @@ mod mocks {
                 span_context: Default::default(),
                 idempotency_key: None,
                 execution_time: None,
+                limit_key: LimitKey::None,
                 completion_retention_duration: Default::default(),
                 journal_retention_duration: Default::default(),
             }

@@ -80,6 +80,23 @@ pub mod common {
             false
         }
     }
+
+    impl DatabaseKind {
+        /// The canonical RocksDB database name for this kind.
+        ///
+        /// For [`DatabaseKind::PartitionStore`], this returns the base prefix `"db"`.
+        /// Individual partition databases may be named `"db-{partition_id}"` in
+        /// multi-db mode.
+        pub const fn db_name(&self) -> &'static str {
+            match self {
+                DatabaseKind::LogServer => "log-server",
+                DatabaseKind::MetadataServer => "replicated-metadata-server",
+                DatabaseKind::LocalLoglet => "local-loglet",
+                DatabaseKind::PartitionStore => "db",
+                DatabaseKind::Unspecified => "unspecified",
+            }
+        }
+    }
 }
 
 pub mod cluster {
@@ -95,6 +112,31 @@ pub mod cluster {
                 RunMode::Follower => "Follower",
             };
             write!(f, "{o}")
+        }
+    }
+
+    impl From<RunMode> for DetailedRunMode {
+        fn from(value: RunMode) -> Self {
+            match value {
+                RunMode::Leader => DetailedRunMode::Leader,
+                RunMode::Follower => DetailedRunMode::Follower,
+                RunMode::Unknown => DetailedRunMode::Unknown,
+            }
+        }
+    }
+
+    impl PartialEq<RunMode> for DetailedRunMode {
+        fn eq(&self, other: &RunMode) -> bool {
+            match (self, other) {
+                (DetailedRunMode::Unknown, _) => false,
+                (_, RunMode::Unknown) => false,
+                (DetailedRunMode::Leader, RunMode::Leader) => true,
+                (DetailedRunMode::Follower, RunMode::Follower) => true,
+                (DetailedRunMode::Leader, RunMode::Follower)
+                | (DetailedRunMode::Follower, RunMode::Leader) => false,
+                (DetailedRunMode::BecomingLeader, _) => false,
+                (DetailedRunMode::Candidate, _) => false,
+            }
         }
     }
 
@@ -209,9 +251,9 @@ pub mod metadata {
 
         fn try_from(value: Precondition) -> Result<Self, Self::Error> {
             match value.kind() {
-                PreconditionKind::Unknown => {
-                    Err(ConversionError::invalid_data("unknown precondition kind"))
-                }
+                PreconditionKind::Unknown => Err(ConversionError::invalid_data_static(
+                    "unknown precondition kind",
+                )),
                 PreconditionKind::None => Ok(crate::metadata::Precondition::None),
                 PreconditionKind::DoesNotExist => Ok(crate::metadata::Precondition::DoesNotExist),
                 PreconditionKind::MatchesVersion => {

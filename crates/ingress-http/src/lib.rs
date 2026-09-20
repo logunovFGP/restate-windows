@@ -9,26 +9,28 @@
 // by the Apache License, Version 2.0.
 
 mod handler;
+mod ingestion;
 mod layers;
 mod metric_definitions;
 mod rpc_request_dispatcher;
 mod server;
 
-pub use rpc_request_dispatcher::InvocationClientRequestDispatcher;
-pub use server::{HyperServerIngress, IngressServerError};
-
-use bytes::Bytes;
 use std::future::Future;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use restate_types::identifiers::InvocationId;
 use restate_types::invocation::client::{
-    AttachInvocationResponse, GetInvocationOutputResponse, InvocationOutput,
-    SubmittedInvocationNotification,
+    AttachInvocationResponse, GetInvocationOutputResponse, GetInvocationStatusResponse,
+    InvocationOutput, SubmittedInvocationNotification,
 };
 use restate_types::invocation::{InvocationQuery, InvocationRequest, InvocationResponse};
 use restate_types::journal_v2::Signal;
 use restate_types::net::address::SocketAddress;
+
+pub use rpc_request_dispatcher::InvocationClientRequestDispatcher;
+pub use server::{HyperServerIngress, IngressServerError};
 
 /// Client connection information for a given RPC request
 #[derive(Clone, Debug)]
@@ -89,6 +91,12 @@ pub trait RequestDispatcher {
         &self,
         invocation_query: InvocationQuery,
     ) -> impl Future<Output = Result<GetInvocationOutputResponse, RequestDispatcherError>> + Send;
+
+    /// Get invocation status, without blocking when it's still running.
+    fn get_invocation_status(
+        &self,
+        invocation_id: InvocationId,
+    ) -> impl Future<Output = Result<GetInvocationStatusResponse, RequestDispatcherError>> + Send;
 
     /// Send invocation response (for awakeables).
     /// **NOTE:** This works only for targeting invocations using Journal Table V1/Service Protocol <= V3.
@@ -168,6 +176,7 @@ mod mocks {
                         inactivity_timeout: None,
                         abort_timeout: None,
                         enable_lazy_state: None,
+                        state_preload_policy: None,
                         public: true,
                         input_description: "any".to_string(),
                         output_description: "any".to_string(),
@@ -189,6 +198,7 @@ mod mocks {
                 inactivity_timeout: DEFAULT_INACTIVITY_TIMEOUT,
                 abort_timeout: DEFAULT_ABORT_TIMEOUT,
                 enable_lazy_state: false,
+                state_preload_policy: Default::default(),
                 retry_policy: Default::default(),
                 info: vec![],
             });
@@ -320,6 +330,14 @@ mod mocks {
         ) -> impl Future<Output = Result<GetInvocationOutputResponse, RequestDispatcherError>> + Send
         {
             MockRequestDispatcher::get_invocation_output(self, invocation_query)
+        }
+
+        fn get_invocation_status(
+            &self,
+            invocation_id: InvocationId,
+        ) -> impl Future<Output = Result<GetInvocationStatusResponse, RequestDispatcherError>> + Send
+        {
+            MockRequestDispatcher::get_invocation_status(self, invocation_id)
         }
 
         fn send_invocation_response(

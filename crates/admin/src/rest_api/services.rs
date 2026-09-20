@@ -8,27 +8,28 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use tracing::{debug, warn};
-
 use axum::Json;
 use axum::extract::{Path, State};
 use bytes::Bytes;
 use http::StatusCode;
+use tracing::{debug, warn};
 
 use restate_admin_rest_model::services::ListServicesResponse;
 use restate_admin_rest_model::services::*;
 use restate_core::TaskCenter;
 use restate_core::network::TransportConnect;
 use restate_errors::warn_it;
+use restate_ingestion_client::Ingestion;
 use restate_types::config::Configuration;
 use restate_types::identifiers::{ServiceId, WithPartitionKey};
-use restate_types::schema;
+use restate_types::logs::{BodyWithKeys, Keys};
 use restate_types::schema::registry::MetadataService;
 use restate_types::schema::service::ServiceMetadata;
 use restate_types::state_mut::ExternalStateMutation;
-use restate_wal_protocol::{Command, Envelope};
+use restate_types::{Scope, schema};
+use restate_wal_protocol::v2;
+use restate_wal_protocol::v2::commands;
 
-use super::create_envelope_header;
 use super::error::*;
 use crate::state::AdminServiceState;
 
@@ -186,7 +187,7 @@ where
 
 /// Modify service state
 ///
-/// Modifies the K/V state of a Virtual Object. For a detailed description of this API and how to use it, see the [state documentation](https://docs.restate.dev/operate/invocation#modifying-service-state).
+/// Modifies the K/V state of a Virtual Object. For a detailed description of this API and how to use it, see the [state documentation](https://docs.restate.dev/services/introspection#inspecting-application-state).
 #[utoipa::path(
     post,
     path = "/services/{service}/state",
@@ -208,6 +209,7 @@ pub async fn modify_service_state<Metadata, Discovery, Telemetry, Invocations, T
     Json(ModifyServiceStateRequest {
         version,
         object_key,
+        scope,
         new_state,
     }): Json<ModifyServiceStateRequest>,
 ) -> Result<StatusCode, MetaApiError>
@@ -229,7 +231,13 @@ where
         return Err(MetaApiError::ServiceNotFound(service_name));
     }
 
-    let service_id = ServiceId::new(service_name, object_key);
+    let scope = if let Some(scope) = scope {
+        Some(Scope::try_non_interned(&scope).map_err(MetaApiError::BadScope)?)
+    } else {
+        None
+    };
+
+    let service_id = ServiceId::new(scope, service_name, object_key);
 
     let new_state = new_state
         .into_iter()
@@ -243,14 +251,17 @@ where
         state: new_state,
     };
 
-    let envelope = Envelope::new(
-        create_envelope_header(partition_key),
-        Command::PatchState(patch_state),
+    let envelop = v2::Envelope::new(
+        v2::Dedup::None,
+        commands::PatchStateCommand::from(patch_state),
     );
 
     let result = state
         .ingestion_client
-        .ingest(partition_key, envelope)
+        .ingest(
+            partition_key,
+            BodyWithKeys::new(envelop.into_raw(), Keys::Single(partition_key)),
+        )
         .await
         .map_err(|err| {
             warn!("Could not ingest state patching command: {err}");

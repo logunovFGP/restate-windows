@@ -12,7 +12,7 @@ use crate::table_macro::*;
 
 use datafusion::arrow::datatypes::DataType;
 
-define_sort_order!(sys_inbox(partition_key, id));
+define_sort_order!(sys_inbox(partition_key));
 
 define_table!(sys_inbox(
     /// Internal column that is used for partitioning the services invocations. Can be ignored.
@@ -24,7 +24,7 @@ define_table!(sys_inbox(
     /// The key of the virtual object/workflow.
     service_key: DataType::LargeUtf8,
 
-    /// [Invocation ID](/operate/invocation#invocation-identifier).
+    /// [Invocation ID](/services/invocation/managing-invocations#invocation-id).
     id: DataType::LargeUtf8,
 
     /// Sequence number in the inbox.

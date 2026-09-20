@@ -24,7 +24,6 @@ pub use runtime::*;
 pub use task::*;
 pub use task_kind::*;
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -35,7 +34,6 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 #[cfg(debug_assertions)]
 use metrics::counter;
-use parking_lot::Mutex;
 use tokio::sync::oneshot;
 use tokio::task::LocalSet;
 use tokio::task_local;
@@ -46,7 +44,8 @@ use tracing::{debug, error, info, trace, warn};
 #[cfg(debug_assertions)]
 use crate::metric_definitions::{STATUS_COMPLETED, STATUS_FAILED, TC_FINISHED, TC_SPAWN};
 use crate::{Metadata, ShutdownError, ShutdownSourceErr};
-use restate_types::SharedString;
+use restate_memory::MemoryController;
+use restate_platform::prelude::*;
 use restate_types::cluster_state::ClusterState;
 use restate_types::config::Configuration;
 use restate_types::health::{Health, NodeStatus};
@@ -75,7 +74,7 @@ struct GlobalOverrides {
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error("Runtime with name {0} already exists")]
-    AlreadyExists(String),
+    AlreadyExists(ReString),
     #[error(transparent)]
     Shutdown(#[from] ShutdownError),
 }
@@ -162,7 +161,7 @@ impl TaskCenter {
     #[track_caller]
     pub fn spawn<F>(
         kind: TaskKind,
-        name: impl Into<SharedString>,
+        name: impl Into<ReString>,
         future: F,
     ) -> Result<TaskId, ShutdownError>
     where
@@ -181,7 +180,7 @@ impl TaskCenter {
     #[track_caller]
     pub fn spawn_child<F>(
         kind: TaskKind,
-        name: impl Into<SharedString>,
+        name: impl Into<ReString>,
         future: F,
     ) -> Result<TaskId, ShutdownError>
     where
@@ -200,7 +199,7 @@ impl TaskCenter {
     #[track_caller]
     pub fn spawn_unmanaged_child<F, T>(
         kind: TaskKind,
-        name: impl Into<SharedString>,
+        name: impl Into<ReString>,
         future: F,
     ) -> Result<TaskHandle<T>, ShutdownError>
     where
@@ -216,7 +215,7 @@ impl TaskCenter {
     #[track_caller]
     pub fn spawn_unmanaged<F, T>(
         kind: TaskKind,
-        name: impl Into<SharedString>,
+        name: impl Into<ReString>,
         future: F,
     ) -> Result<TaskHandle<T>, ShutdownError>
     where
@@ -330,7 +329,7 @@ struct TaskCenterInner {
     #[cfg(any(test, feature = "test-util"))]
     pause_time: bool,
     default_runtime_handle: tokio::runtime::Handle,
-    managed_runtimes: Mutex<HashMap<SharedString, OwnedRuntimeHandle>>,
+    managed_runtimes: Mutex<HashMap<ReString, OwnedRuntimeHandle>>,
     start_time: Instant,
     /// We hold on to the owned Runtime to ensure it's dropped when task center is dropped. If this
     /// is None, it means that it's the responsibility of the Handle owner to correctly drop
@@ -343,6 +342,7 @@ struct TaskCenterInner {
     managed_tasks: Mutex<HashMap<TaskId, Arc<Task>>>,
     global_metadata: OnceLock<Metadata>,
     address_book: OnceLock<AddressBook>,
+    memory_controller: MemoryController,
     health: Health,
     cluster_state: ClusterState,
     root_task_context: TaskContext,
@@ -377,6 +377,7 @@ impl TaskCenterInner {
             managed_tasks: Mutex::new(HashMap::new()),
             global_metadata: OnceLock::new(),
             address_book: OnceLock::new(),
+            memory_controller: MemoryController::default(),
             managed_runtimes: Mutex::new(HashMap::with_capacity(64)),
             root_task_context,
             #[cfg(any(test, feature = "test-util"))]
@@ -461,7 +462,7 @@ impl TaskCenterInner {
     pub fn spawn<F>(
         self: &Arc<Self>,
         kind: TaskKind,
-        name: impl Into<SharedString>,
+        name: impl Into<ReString>,
         future: F,
     ) -> Result<TaskId, ShutdownError>
     where
@@ -511,7 +512,7 @@ impl TaskCenterInner {
     pub fn spawn_child<F>(
         self: &Arc<Self>,
         kind: TaskKind,
-        name: impl Into<SharedString>,
+        name: impl Into<ReString>,
         future: F,
     ) -> Result<TaskId, ShutdownError>
     where
@@ -564,7 +565,7 @@ impl TaskCenterInner {
     pub fn spawn_unmanaged<F, T>(
         self: &Arc<Self>,
         kind: TaskKind,
-        name: &SharedString,
+        name: &ReString,
         future: F,
     ) -> Result<TaskHandle<T>, ShutdownError>
     where
@@ -604,7 +605,7 @@ impl TaskCenterInner {
     pub fn spawn_unmanaged_child<F, T>(
         self: &Arc<Self>,
         kind: TaskKind,
-        name: &SharedString,
+        name: &ReString,
         future: F,
     ) -> Result<TaskHandle<T>, ShutdownError>
     where
@@ -653,7 +654,7 @@ impl TaskCenterInner {
     pub fn spawn_local<F>(
         self: &Arc<Self>,
         kind: TaskKind,
-        name: &SharedString,
+        name: &ReString,
         future: F,
     ) -> Result<TaskId, ShutdownError>
     where
@@ -702,7 +703,7 @@ impl TaskCenterInner {
     pub fn start_runtime<F, R>(
         self: &Arc<Self>,
         root_task_kind: TaskKind,
-        runtime_name: impl Into<SharedString>,
+        runtime_name: impl Into<ReString>,
         partition_id: Option<PartitionId>,
         root_future: impl FnOnce() -> F + Send + 'static,
     ) -> Result<RuntimeTaskHandle<R>, RuntimeError>
@@ -714,7 +715,7 @@ impl TaskCenterInner {
             return Err(ShutdownError.into());
         }
         let cancel = CancellationToken::new();
-        let runtime_name: SharedString = runtime_name.into();
+        let runtime_name: ReString = runtime_name.into();
 
         // hold a lock while creating the runtime to avoid concurrent runtimes with the same name
         let mut runtimes_guard = self.managed_runtimes.lock();
@@ -723,7 +724,7 @@ impl TaskCenterInner {
                 "Failed to start new runtime, a runtime with name {} already exists",
                 runtime_name
             );
-            return Err(RuntimeError::AlreadyExists(runtime_name.into_owned()));
+            return Err(RuntimeError::AlreadyExists(runtime_name));
         }
 
         // todo: configure the runtime according to a new runtime kind perhaps?
@@ -786,7 +787,7 @@ impl TaskCenterInner {
 
     /// Runs **only** after the inner main thread has completed work and no other owner exists for
     /// the runtime handle.
-    fn drop_runtime(self: &Arc<Self>, name: SharedString) {
+    fn drop_runtime(self: &Arc<Self>, name: ReString) {
         let mut runtimes_guard = self.managed_runtimes.lock();
         if let Some(runtime) = runtimes_guard.remove(&name) {
             // We must be the only owner of runtime at this point.
@@ -799,12 +800,27 @@ impl TaskCenterInner {
         }
     }
 
-    #[cfg(not(feature = "taskdump"))]
+    #[cfg(not(all(
+        feature = "taskdump",
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    )))]
     async fn dump_tasks(self: &Arc<Self>, _: impl std::io::Write) {
-        warn!("Cannot dump tokio tasks; taskdump feature was not enabled at compile time")
+        warn!(
+            "Cannot dump tokio tasks; the taskdump feature was not enabled at compile time. \
+            It is disabled by default because dumping re-polls in-flight futures which can abort \
+            the process, see https://github.com/restatedev/restate/issues/5235"
+        )
     }
 
-    #[cfg(feature = "taskdump")]
+    // TODO(#5235): re-polling live futures is not side-effect free. It can wake tasks from within
+    //  poll which panics on current_thread runtimes (RefCell already borrowed) and can escalate
+    //  into a process abort. Don't enable the taskdump feature until this is fixed.
+    #[cfg(all(
+        feature = "taskdump",
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    ))]
     async fn dump_tasks(self: &Arc<Self>, mut writer: impl std::io::Write) {
         let managed_tasks: HashMap<_, _> = self
             .managed_tasks
@@ -874,7 +890,7 @@ impl TaskCenterInner {
     fn spawn_inner<F>(
         self: &Arc<Self>,
         kind: TaskKind,
-        name: SharedString,
+        name: ReString,
         _parent_id: TaskId,
         partition_id: Option<PartitionId>,
         cancel: CancellationToken,
@@ -1078,6 +1094,8 @@ impl TaskCenterInner {
 
         // Stop log-server role
         self.cancel_tasks(Some(TaskKind::LogServerRole), None).await;
+        self.cancel_tasks(Some(TaskKind::LogStoreWriter), None)
+            .await;
 
         // stop metadata server
         self.cancel_tasks(Some(TaskKind::MetadataServer), None)
@@ -1323,7 +1341,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     #[traced_test]
-    async fn test_basic_lifecycle() -> Result<()> {
+    async fn basic_lifecycle() -> Result<()> {
         let common_opts = CommonOptionsBuilder::default()
             .default_thread_pool_size(3)
             .build()

@@ -258,7 +258,7 @@ impl LogStoreWriter {
 
     async fn commit(&mut self, opts: &LocalLogletOptions, write_batch: WriteBatch) {
         let mut write_opts = rocksdb::WriteOptions::new();
-        write_opts.disable_wal(opts.rocksdb.rocksdb_disable_wal());
+        write_opts.disable_wal(opts.rocksdb_disable_wal());
         write_opts.set_sync(!opts.rocksdb_disable_wal_fsync());
 
         trace!(
@@ -281,13 +281,15 @@ impl LogStoreWriter {
             )
             .await;
 
-        if let Err(e) = result {
-            error!("Failed to commit local loglet write batch: {}", e);
-            self.send_acks(Err(OperationError::terminal(e)));
-            return;
+        match result {
+            Ok(_batch) => {
+                self.send_acks(Ok(()));
+            }
+            Err(e) => {
+                error!("Failed to commit local loglet write batch: {}", e);
+                self.send_acks(Err(OperationError::terminal(e)));
+            }
         }
-
-        self.send_acks(Ok(()));
     }
 
     fn send_acks(&mut self, result: Result<(), OperationError>) {

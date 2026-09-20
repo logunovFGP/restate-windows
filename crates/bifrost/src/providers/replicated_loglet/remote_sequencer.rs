@@ -489,12 +489,13 @@ mod test {
         time::Duration,
     };
 
-    use rand::Rng;
+    use rand::RngExt;
 
     use restate_core::{
         TestCoreEnv, TestCoreEnvBuilder,
-        network::{FailingConnector, Handler, Incoming, RawSvcRpc, Verdict},
+        network::{BackPressureMode, FailingConnector, Handler, Incoming, RawSvcRpc, Verdict},
     };
+    use restate_memory::MemoryPool;
     use restate_types::{
         GenerationalNodeId,
         logs::{LogId, LogletOffset, Record, SequenceNumber, TailOffsetWatch, TailState},
@@ -567,8 +568,8 @@ mod test {
         let builder = TestCoreEnvBuilder::with_incoming_only_connector()
             .add_mock_nodes_config()
             .register_buffered_service(
-                10,
-                restate_core::network::BackPressureMode::PushBack,
+                MemoryPool::unlimited(),
+                BackPressureMode::PushBack,
                 sequencer_handler,
             );
 
@@ -576,7 +577,7 @@ mod test {
     }
 
     #[restate_core::test]
-    async fn test_remote_stream_ok() {
+    async fn remote_stream_ok() {
         let handler = SequencerMockHandler::default();
         let test_env = create_test_env(handler).await;
 
@@ -615,7 +616,7 @@ mod test {
     }
 
     #[restate_core::test]
-    async fn test_remote_stream_sealed() {
+    async fn remote_stream_sealed() {
         let handler = SequencerMockHandler::with_reply_status(Some(SequencerStatus::Sealed));
         let test_env = create_test_env(handler).await;
 
